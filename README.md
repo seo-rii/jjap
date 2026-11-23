@@ -65,6 +65,7 @@ python3 mongo_server.py shell --eval '{"ping": 1}'
 | OpenSearch | `http://127.0.0.1:9200` | [`opensearch_server.py`](opensearch_server.py) |
 | Apache Airflow | `http://127.0.0.1:8080/api/v2` | [`airflow_server.py`](airflow_server.py) |
 | OpenMetadata | `http://127.0.0.1:8585/api/v1` | [`openmetadata_server.py`](openmetadata_server.py) |
+| Apache Kafka | `127.0.0.1:9092` | [`kafka_server.py`](kafka_server.py) |
 
 The servers bind to loopback by default. Use `--port 0` to pick an available port and read it from the startup message. MongoDB, Neo4j, Redis, and Nexus Repository accept `--password-file` for their test accounts. These four servers keep data in memory by default, and the examples use `--db-file` to persist it.
 
@@ -329,6 +330,48 @@ curl -fsS http://127.0.0.1:8585/api/v1/system/version
 ```
 
 Point an OpenMetadata Python SDK client at `http://127.0.0.1:8585/api`. [Python SDK](https://docs.open-metadata.org/v2.0.x/api-reference/sdk/python) · [Lineage API](https://docs.open-metadata.org/v2.0.x/api-reference/lineage/get)
+
+### Apache Kafka
+
+| Area | Supported scope |
+| --- | --- |
+| Broker | Kafka TCP protocol with API version negotiation, topic creation, and partition metadata. One plaintext broker with replication factor 1. `--auto-create-topics` enables topic creation from client metadata requests. |
+| Records | Produce and fetch magic 2 record batches with uncompressed or gzip payloads. Keys, headers, and tombstones are preserved. Non-idempotent producer retries can append duplicates. |
+| Offsets | Partition offset lookup by timestamp, beginning, or end. Assignment and subscription workflows can commit and fetch group offsets. |
+| Consumer groups | Classic group join, sync, heartbeat, leave, and partition reassignment |
+| Persistence | `--db-file` stores topics, partition logs, and committed offsets in SQLite. Consumers rejoin their groups after a broker restart. |
+| Client verification | `kafka-python` 3.0.13 exercised topic creation, gzip batches, seeks, two-member rebalancing, and recovery of records and group offsets after restart |
+
+Start the broker.
+
+```sh
+python3 kafka_server.py --db-file kafka.sqlite3
+```
+
+From another terminal with `kafka-python==3.0.13` installed, create a topic on a fresh broker, send a record, and read it back.
+
+```python
+from kafka import KafkaConsumer, KafkaProducer, TopicPartition
+from kafka.admin import KafkaAdminClient, NewTopic
+
+endpoint = "127.0.0.1:9092"
+admin = KafkaAdminClient(bootstrap_servers=endpoint)
+admin.create_topics([NewTopic("events", num_partitions=1, replication_factor=1)])
+admin.close()
+
+producer = KafkaProducer(bootstrap_servers=endpoint, enable_idempotence=False)
+producer.send("events", partition=0, value=b"hello").get(timeout=5)
+producer.close()
+
+consumer = KafkaConsumer(bootstrap_servers=endpoint, group_id=None, consumer_timeout_ms=5000)
+partition = TopicPartition("events", 0)
+consumer.assign([partition])
+consumer.seek_to_beginning(partition)
+print(next(consumer).value.decode())
+consumer.close()
+```
+
+Set `--advertised-host` when clients connect using a hostname different from the listen address. [Kafka protocol](https://kafka.apache.org/42/design/protocol/) · [Record batch format](https://kafka.apache.org/42/implementation/message-format/)
 
 ## Development
 
