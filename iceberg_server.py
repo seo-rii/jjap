@@ -303,8 +303,9 @@ def _catalog_transaction(db_file, write=False):
 class IcebergCatalog:
     """Persistent local Iceberg v2 catalog using immutable JSON and a SQLite pointer."""
 
-    def __init__(self, warehouse, db_file=None):
+    def __init__(self, warehouse, db_file=None, *, strict_metadata_paths=False):
         self.warehouse = _catalog_local_path(warehouse)
+        self.strict_metadata_paths = strict_metadata_paths
         self.warehouse.mkdir(parents=True, exist_ok=True)
         self.db_file = Path(db_file).resolve() if db_file is not None else self.warehouse / ".iceberg-catalog.sqlite3"
         self.db_file.parent.mkdir(parents=True, exist_ok=True)
@@ -480,6 +481,29 @@ class IcebergCatalog:
             raise IcebergCatalogError("Current snapshot must match the main snapshot reference")
         for ref in refs.values():
             _catalog_snapshot(metadata, _catalog_object(ref, "Snapshot reference").get("snapshot-id"))
+        if self.strict_metadata_paths:
+            self._validate_metadata_paths(metadata)
+
+    def _validate_metadata_paths(self, metadata):
+        def check(location):
+            if not isinstance(location, str) or not (location.startswith("file:") or Path(location).is_absolute()):
+                raise IcebergCatalogError("Metadata file locations must be absolute local paths")
+            self.local_path(location)
+
+        check(metadata.get("location"))
+        properties = _catalog_properties(metadata.get("properties", {}))
+        for name in ("write.data.path", "write.metadata.path", "write.object-storage.path", "write.folder-storage.path"):
+            if name in properties:
+                check(properties[name])
+        for snapshot in metadata.get("snapshots", ()):
+            if "manifest-list" in snapshot:
+                check(snapshot["manifest-list"])
+            for path in _catalog_array(snapshot.get("manifests", []), "Snapshot manifests"):
+                check(path)
+        for field, path_key in (("metadata-log", "metadata-file"), ("statistics", "statistics-path"),
+                                ("partition-statistics", "statistics-path")):
+            for entry in _catalog_array(metadata.get(field, []), field):
+                check(_catalog_object(entry, field).get(path_key))
 
     def load_table(self, namespace, name):
         namespace, name = _catalog_namespace(namespace), _catalog_component(name)
@@ -560,6 +584,8 @@ class IcebergCatalog:
                 "sort-orders": [sort_order], "default-sort-order-id": sort_order["order-id"],
             })
             metadata["properties"].update(properties)
+            if self.strict_metadata_paths:
+                self._validate_metadata_paths(metadata)
             if stage_create:
                 return _catalog_response(metadata, None)
             pointer = self._write_metadata(metadata, 0)
@@ -923,7 +949,7 @@ class _IcebergCatalogHandler(BaseHTTPRequestHandler):
             self._not_found()
         self._catalog_request(catalog, method, parts[1:], query)
 
-    def _catalog_request(self, catalog, method, parts, query):
+    def _catalog_request(self, catalog, method, parts, query, *, commit=None):
         if parts == ["tables", "rename"] and method == "POST":
             body = self._read_json()
             catalog.rename_table(*_catalog_identifier(body.get("source")), *_catalog_identifier(body.get("destination")))
@@ -984,11 +1010,11 @@ class _IcebergCatalogHandler(BaseHTTPRequestHandler):
             else:
                 self._not_found()
         elif tail[0] == "tables" and len(tail) in {2, 3}:
-            self._table_request(catalog, method, namespace, tail[1], tail[2:], query)
+            self._table_request(catalog, method, namespace, tail[1], tail[2:], query, commit=commit)
         else:
             self._not_found()
 
-    def _table_request(self, catalog, method, namespace, name, tail, query):
+    def _table_request(self, catalog, method, namespace, name, tail, query, *, commit=None):
         if tail == ["metrics"] and method == "POST":
             self._read_json()
             self._respond(204)
@@ -1017,7 +1043,7 @@ class _IcebergCatalogHandler(BaseHTTPRequestHandler):
             else:
                 self._respond(200, result, {"ETag": etag})
         elif method == "POST":
-            body = self._read_json()
+            body = self._read_json() if commit is None else commit
             if body.get("identifier") is not None and _catalog_identifier(body["identifier"]) != (namespace, name):
                 raise IcebergCatalogError("Commit identifier does not match its request path")
             self._respond(200, catalog.commit_table(namespace, name, body.get("requirements"), body.get("updates")))
@@ -1170,8 +1196,13 @@ class _PolarisHandler(_IcebergCatalogHandler):
         if len(parts) < 2:
             self._not_found()
         catalog, privileges = state.catalog_access(_polaris_name(parts[0]), identity)
-        _polaris_authorize(privileges, self.command, parts[1:])
-        self._catalog_request(catalog, self.command, parts[1:], query)
+        route = parts[1:]
+        commit = None
+        if (self.command == "POST" and len(route) == 4 and route[0] == "namespaces" and route[2] == "tables"
+                and privileges & {"TABLE_CREATE", "TABLE_FULL_METADATA", "TABLE_WRITE_PROPERTIES"}):
+            commit = self._read_json()
+        _polaris_authorize(privileges, self.command, route, commit=commit)
+        self._catalog_request(catalog, self.command, route, query, commit=commit)
 
     def _management(self, state, connection, parts):
         method = self.command
@@ -1410,7 +1441,7 @@ class _PolarisState:
             path = _catalog_local_path(location)
             if path.as_uri() != location or not path.is_relative_to(self.warehouse):
                 raise IcebergCatalogError("Catalog storage location has changed", 409, "ConflictException")
-            catalog = IcebergCatalog(path)
+            catalog = IcebergCatalog(path, strict_metadata_paths=True)
             self.catalogs[name] = catalog
         return catalog
 
@@ -1469,7 +1500,7 @@ class _PolarisState:
         return self._iceberg(name, payload), privileges
 
 
-def _polaris_authorize(privileges, method, parts):
+def _polaris_authorize(privileges, method, parts, *, commit=None):
     if privileges & {"CATALOG_MANAGE_CONTENT", "CATALOG_MANAGE_METADATA"}:
         return
     if "NAMESPACE_FULL_METADATA" in privileges:
@@ -1494,9 +1525,20 @@ def _polaris_authorize(privileges, method, parts):
             required = {"GET": "TABLE_LIST", "POST": "TABLE_CREATE"}.get(method)
         elif tail[0] == "tables" and len(tail) == 2:
             if method in ("GET", "HEAD"):
-                if privileges & {"TABLE_READ_PROPERTIES", "TABLE_READ_DATA", "TABLE_WRITE_DATA"}:
+                if privileges & {"TABLE_READ_PROPERTIES", "TABLE_WRITE_PROPERTIES", "TABLE_READ_DATA", "TABLE_WRITE_DATA"}:
                     return
-            required = {"POST": "TABLE_FULL_METADATA", "DELETE": "TABLE_DROP"}.get(method)
+            elif method == "POST" and commit is not None:
+                requirements = _catalog_array(commit.get("requirements"), "Requirements")
+                updates = _catalog_array(commit.get("updates"), "Updates")
+                if any(_catalog_object(item, "Requirement").get("type") == "assert-create" for item in requirements):
+                    required = "TABLE_CREATE"
+                elif all(_catalog_object(item, "Update").get("action") in ("set-properties", "remove-properties")
+                         for item in updates):
+                    required = "TABLE_WRITE_PROPERTIES"
+                else:
+                    required = "TABLE_FULL_METADATA"
+            elif method == "DELETE":
+                required = "TABLE_DROP"
         elif tail[0] == "tables" and len(tail) == 3 and method == "POST":
             if tail[2] == "metrics" and privileges & {"TABLE_READ_PROPERTIES", "TABLE_READ_DATA", "TABLE_WRITE_DATA"}:
                 return

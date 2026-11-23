@@ -12,6 +12,12 @@ from urllib.request import Request, urlopen
 from iceberg_server import _PolarisHandler, _PolarisState
 
 
+SCHEMA = {
+    "type": "struct", "schema-id": 0,
+    "fields": [{"id": 1, "name": "id", "type": "long", "required": True}],
+}
+
+
 class PolarisTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -85,6 +91,10 @@ class PolarisTests(unittest.TestCase):
                         {"grant": {"type": "catalog", "privilege": privilege}}, 201)
         return identity["credentials"]
 
+    def catalog_token(self, principal, privileges):
+        credentials = self.assign(principal, "demo", privileges)
+        return self.token(credentials["clientId"], credentials["clientSecret"])
+
     def test_management_oauth_and_iceberg_commit(self):
         self.assertEqual(self.token("root", "wrong", status=401), {"error": "invalid_client"})
         self.request("GET", "/api/catalog/v1/config?warehouse=demo", expected=401)
@@ -102,9 +112,7 @@ class PolarisTests(unittest.TestCase):
         self.request("POST", prefix, {"namespace": ["data"]}, token=writer)
         table = self.request("POST", prefix + "/data/tables", {
             "name": "records",
-            "schema": {"type": "struct", "schema-id": 0, "fields": [
-                {"id": 1, "name": "id", "type": "long", "required": True},
-            ]},
+            "schema": SCHEMA,
         }, token=writer)
         table_path = prefix + "/data/tables/records"
         commit = {
@@ -137,6 +145,86 @@ class PolarisTests(unittest.TestCase):
         self.request("GET", path, token=before, expected=401)
         after = self.token(creds["clientId"], creds["clientSecret"])
         self.assertEqual(self.request("GET", path, token=after)["namespaces"], [["analytics"]])
+
+    def test_table_metadata_paths_stay_in_the_catalog(self):
+        self.catalog("demo")
+        self.catalog("private")
+        writer = self.catalog_token("writer", ["CATALOG_MANAGE_CONTENT"])
+        prefix = "/api/catalog/v1/demo/namespaces"
+        self.request("POST", prefix, {"namespace": ["data"]}, token=writer)
+        tables = prefix + "/data/tables"
+        outside = (self.warehouse / "private" / "data").as_uri()
+        inside = (self.warehouse / "demo" / "data").as_uri()
+        create = {"name": "records", "schema": SCHEMA}
+
+        for key, staged in (("write.data.path", False), ("write.metadata.path", True)):
+            with self.subTest(key=key, staged=staged):
+                self.request("POST", tables, {**create, "stage-create": staged, "properties": {key: outside}},
+                             token=writer, expected=400)
+        self.assertEqual(self.request("GET", tables, token=writer)["identifiers"], [])
+
+        table = self.request("POST", tables, {**create, "properties": {"write.data.path": inside}}, token=writer)
+        table_path = tables + "/records"
+        invalid_updates = [{"action": "set-properties", "updates": {"write.metadata.path": outside, "owner": "new"}}]
+        self.request("POST", table_path, {"requirements": [], "updates": invalid_updates}, token=writer, expected=400)
+        self.assertEqual(self.request("GET", table_path, token=writer), table)
+
+        register = prefix + "/data/register"
+        invalid_fields = {
+            "properties": {"write.data.path": outside},
+            "snapshots": [{"snapshot-id": 1, "manifest-list": outside}],
+            "metadata-log": [{"timestamp-ms": 1, "metadata-file": outside}],
+            "statistics": [{"snapshot-id": 1, "statistics-path": outside}],
+            "partition-statistics": [{"snapshot-id": 1, "statistics-path": outside}],
+        }
+        catalog_dir = self.warehouse / "demo"
+        for field, value in invalid_fields.items():
+            with self.subTest(metadata_field=field):
+                fixture = catalog_dir / f"{field}.metadata.json"
+                fixture.write_text(json.dumps({**table["metadata"], field: value}), encoding="utf-8")
+                self.request("POST", register, {"name": "imported", "metadata-location": fixture.as_uri()},
+                             token=writer, expected=400)
+        self.request("GET", tables + "/imported", token=writer, expected=404)
+        self.request("POST", register, {"name": "imported", "metadata-location": table["metadata-location"]}, token=writer)
+        self.assertEqual(self.request("GET", tables + "/imported", token=writer), table)
+
+    def test_property_writer_and_staged_table_creator_privileges(self):
+        self.catalog("demo")
+        creator = self.catalog_token("creator", ["TABLE_CREATE"])
+        properties = self.catalog_token("properties", ["TABLE_WRITE_PROPERTIES"])
+        data = self.catalog_token("data_writer", ["TABLE_WRITE_DATA"])
+        prefix = "/api/catalog/v1/demo/namespaces"
+        self.request("POST", prefix, {"namespace": ["data"]}, token=self.root)
+        tables = prefix + "/data/tables"
+        path = tables + "/records"
+        staged = self.request("POST", tables, {"name": "records", "schema": SCHEMA, "stage-create": True}, token=creator)
+        metadata = staged["metadata"]
+        changes = {"requirements": [{"type": "assert-create"}], "updates": [
+            {"action": "assign-uuid", "uuid": metadata["table-uuid"]},
+            {"action": "add-schema", "schema": metadata["schemas"][0]},
+            {"action": "add-spec", "spec": metadata["partition-specs"][0]},
+            {"action": "add-sort-order", "sort-order": metadata["sort-orders"][0]},
+        ]}
+        self.request("POST", path, changes, token=properties, expected=403)
+        created = self.request("POST", path, changes, token=creator)
+        self.assertEqual(created["metadata"]["table-uuid"], metadata["table-uuid"])
+        self.request("POST", path, changes, token=creator, expected=409)
+        self.assertEqual(self.request("GET", path, token=properties), created)
+        self.assertEqual(self.request("GET", path, token=data), created)
+
+        property_commit = {"requirements": [], "updates": [{"action": "set-properties", "updates": {"owner": "team"}}]}
+        self.request("POST", path, property_commit, token=creator, expected=403)
+        self.request("POST", path, property_commit, token=data, expected=403)
+        updated = self.request("POST", path, property_commit, token=properties)
+        self.assertEqual(updated["metadata"]["properties"]["owner"], "team")
+        mixed = {"requirements": [], "updates": [
+            {"action": "remove-properties", "removals": ["owner"]},
+            {"action": "set-location", "location": (self.warehouse / "demo" / "moved").as_uri()},
+        ]}
+        self.request("POST", path, mixed, token=properties, expected=403)
+        self.assertEqual(self.request("GET", path, token=properties), updated)
+        removed = self.request("POST", path, {"requirements": [], "updates": mixed["updates"][:1]}, token=properties)
+        self.assertNotIn("owner", removed["metadata"]["properties"])
 
 
 if __name__ == "__main__":
