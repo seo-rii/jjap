@@ -4,6 +4,8 @@
 Run: python3 mongo_test_server.py --port 27017
 URI: mongodb://127.0.0.1:27017
 Add --db-file test.sqlite3 to retain databases between runs. Use a dedicated file.
+Export: python3 mongo_test_server.py export --db-file test.sqlite3 --out dump
+Add --format dbpath to export a WiredTiger directory using mongod and mongorestore.
 The default listener is loopback. Use --password to prompt for a password,
 --password-file to read one from a file, or set MONGO_TEST_PASSWORD. These enable
 one test account with access to every database. The default username and
@@ -46,6 +48,7 @@ import platform
 import random
 import re
 import secrets
+import shutil
 import signal
 import socket
 import socketserver
@@ -53,7 +56,9 @@ import sqlite3
 import ssl
 import stringprep
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zlib
@@ -74,8 +79,8 @@ from enum import Enum
 from functools import cmp_to_key, lru_cache
 from pathlib import Path
 from unicodedata import ucd_3_2_0
-from urllib.parse import parse_qsl, unquote, urlsplit
-from uuid import UUID
+from urllib.parse import parse_qsl, quote, quote_plus, unquote, urlsplit
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 MAX_BSON_SIZE = 16 * 1024 * 1024
@@ -4729,7 +4734,13 @@ def id_index():
 
 
 class Catalog:
-    def __init__(self, filename):
+    def __init__(self, filename, *, readonly=False):
+        if readonly:
+            source = Path(filename).resolve(strict=True)
+            if not source.is_file():
+                raise ValueError(f"Expected a SQLite persistence file: {source}")
+            self.sql = sqlite3.connect(f"{source.as_uri()}?mode=ro", uri=True, isolation_level=None)
+            return
         self.sql = sqlite3.connect(filename or ":memory:", isolation_level=None, check_same_thread=False)
         try:
             self.sql.execute("PRAGMA foreign_keys = ON")
@@ -4779,7 +4790,7 @@ class Catalog:
 
     def create(self, db, name, options=None, indexes=None):
         options = {} if options is None else options
-        identifier = secrets.token_bytes(16)
+        identifier = uuid4().bytes
         self.sql.execute(
             "INSERT INTO mongo_collections (db, name, uuid, options) VALUES (?, ?, ?, ?)",
             (db, name, identifier, encode_bson(options)),
@@ -4816,12 +4827,14 @@ class Catalog:
     def drop(self, db, name):
         return self.sql.execute("DELETE FROM mongo_collections WHERE db=? AND name=?", (db, name)).rowcount
 
-    def records(self, db, name):
-        rows = self.sql.execute(
+    def record_rows(self, db, name):
+        return self.sql.execute(
             "SELECT record, data FROM mongo_documents WHERE db=? AND name=? ORDER BY record",
             (db, name),
         )
-        return {record: (decode_bson(data)[0], len(data)) for record, data in rows}
+
+    def records(self, db, name):
+        return {record: (decode_bson(data)[0], len(data)) for record, data in self.record_rows(db, name)}
 
     def namespaces(self, db=None):
         if db is None:
@@ -7701,9 +7714,11 @@ def ttl_seconds(value):
 
 
 def serve_main(argv):
+    script = Path(sys.argv[0]).name
     parser = argparse.ArgumentParser(
         description="Run a MongoDB-compatible test server (standard library only).",
-        epilog=f"The default URI is mongodb://127.0.0.1:27017. See '{Path(sys.argv[0]).name} shell --help' for the client.",
+        epilog=f"The default URI is mongodb://127.0.0.1:27017. "
+               f"See '{script} shell --help' for the client or '{script} export --help' for snapshot export.",
     )
     parser.add_argument("--host", default="127.0.0.1", help="listen address (default: %(default)s)")
     parser.add_argument("--port", type=port_number, default=27017, help="listen port (0 selects a free port)")
@@ -7767,11 +7782,221 @@ def serve_main(argv):
     return 0
 
 
+# MongoDB dump and native dbPath export
+
+
+def _wait_native_mongod(process, log_path, socket_path):
+    deadline = time.monotonic() + 45
+    last_error = ""
+    with log_path.open("rb") as log:
+        while time.monotonic() < deadline:
+            offset = log.tell()
+            line = log.readline()
+            if line.endswith(b"\n"):
+                try:
+                    event = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if event.get("s") in {"E", "F"}:
+                    last_error = str(event.get("msg", ""))[:200]
+                if (
+                    event.get("id") == 23016
+                    and event.get("attr", {}).get("port") == 0
+                    and socket_path.exists()
+                    and process.poll() is None
+                ):
+                    return
+                continue
+            log.seek(offset)
+            status = process.poll()
+            if status is not None:
+                detail = f": {last_error}" if last_error else ""
+                raise ValueError(f"mongod exited during export startup with status {status}{detail}")
+            time.sleep(0.05)
+    raise ValueError("mongod did not open its export socket within 45 seconds")
+
+
+def _stop_native_mongod(process):
+    if process.poll() is not None:
+        return False
+    process.terminate()
+    try:
+        return process.wait(timeout=45) == 0
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        return False
+
+
+def export_native_dbpath(dump_directory: Path, dbpath_directory: Path, mongod: str, mongorestore: str) -> None:
+    """Restore a dump into an empty staging directory and close WiredTiger before publishing it."""
+    if os.name != "posix":
+        raise ValueError("dbPath export requires mongod support for Unix domain sockets")
+    if not dump_directory.is_dir():
+        raise ValueError("The MongoDB dump directory is missing")
+    if not dbpath_directory.is_dir() or any(dbpath_directory.iterdir()):
+        raise ValueError("Native dbPath staging directory must be empty")
+
+    # Binding just this socket keeps the unauthenticated, temporary MongoDB
+    # process reachable only inside the owner-only directory.
+    with tempfile.TemporaryDirectory(prefix="jjap-mongo-", dir="/tmp") as directory:
+        private = Path(directory)
+        socket_path = private / "mongo.sock"
+        startup_log = private / "mongod.log"
+        with startup_log.open("wb") as log:
+            process = subprocess.Popen([
+                mongod, "--bind_ip", str(socket_path), "--port", "0", "--nounixsocket",
+                "--dbpath", str(dbpath_directory.resolve()), "--storageEngine", "wiredTiger",
+                "--setParameter", "diagnosticDataCollectionEnabled=false",
+                "--setParameter", "ttlMonitorEnabled=false",
+                "--setParameter", "disableLogicalSessionCacheRefresh=true",
+            ], stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        restored = False
+        try:
+            _wait_native_mongod(process, startup_log, socket_path)
+            uri = f"mongodb://{quote(str(socket_path), safe='')}/?directConnection=true&serverSelectionTimeoutMS=10000"
+            with (private / "mongorestore.log").open("wb") as log:
+                restore = subprocess.run([
+                    mongorestore, "--uri", uri, "--dir", str(dump_directory.resolve()),
+                    "--drop", "--preserveUUID", "--stopOnError", "--maintainInsertionOrder",
+                    "--bypassDocumentValidation", "--keepIndexVersion",
+                ], stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, check=False)
+            if restore.returncode:
+                raise ValueError(f"mongorestore failed during dbPath export with status {restore.returncode}")
+            restored = True
+        finally:
+            if not _stop_native_mongod(process) and restored:
+                raise ValueError("mongod did not shut down cleanly after export; dbPath was not published")
+
+
+def _dump_collection_basename(name):
+    escaped = quote_plus(name, safe="")
+    if len(escaped) <= 238:
+        return escaped
+    # mongorestore uses the original collectionName in metadata for truncated paths.
+    digest = hashlib.sha1(name.encode("utf-8"), usedforsecurity=False).digest()
+    suffix = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return f"{escaped[:208]}%24{suffix}"
+
+
+def _dump_collection(catalog, source, destination):
+    stem = _dump_collection_basename(source.name)
+    metadata = {
+        "options": source.options,
+        "indexes": list(source.indexes.values()),
+        "collectionName": source.name,
+        "type": "view" if source.is_view else "collection",
+    }
+    if not source.is_view:
+        if not isinstance(source.uuid, bytes) or len(source.uuid) != 16:
+            raise ValueError(f"Invalid collection UUID for {source.ns!r}")
+        # Older server builds wrote arbitrary 16 bytes. MongoDB requires an RFC 4122 v4 UUID on restore.
+        metadata["uuid"] = UUID(bytes=source.uuid, version=4).hex
+    with (destination / f"{stem}.metadata.json").open("x", encoding="utf-8") as file:
+        file.write(shell_json(metadata, canonical=True) + "\n")
+    count = 0
+    if not source.is_view:
+        with (destination / f"{stem}.bson").open("xb") as file:
+            for record, data in catalog.record_rows(source.database, source.name):
+                if not isinstance(data, bytes) or decode_bson(data)[1] != len(data):
+                    raise ValueError(f"Invalid BSON record {record} in {source.ns!r}")
+                file.write(data)
+                count += 1
+    return count
+
+
+def export_mongo_dump(filename, destination, only_database=None):
+    """Write a mongodump directory from one committed SQLite snapshot."""
+    if only_database is not None:
+        database_name(only_database)
+    catalog = Catalog(filename, readonly=True)
+    try:
+        catalog.sql.execute("BEGIN")
+        # Validate all three tables, including for an empty catalog.
+        for table in ("mongo_collections", "mongo_indexes", "mongo_documents"):
+            if catalog.sql.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is None:
+                raise ValueError("Expected a MongoDB test server SQLite persistence file")
+        namespaces = catalog.namespaces(only_database)
+        if only_database is not None and not namespaces:
+            raise ValueError(f"Database {only_database!r} was not found")
+        destination.mkdir(mode=0o700)
+        databases = {}
+        document_count = 0
+        for db, name in namespaces:
+            database_name(db)
+            collection_name(name)
+            if "$" in name or name.startswith("system.") or ".system." in name or len(f"{db}.{name}".encode()) > 255:
+                raise ValueError(f"MongoDB cannot restore {db}.{name} as an ordinary collection or view")
+            if db not in databases:
+                directory = destination / db
+                directory.mkdir()
+                databases[db] = directory
+            source = catalog.collection(db, name)
+            document_count += _dump_collection(catalog, source, databases[db])
+        return len(databases), len(namespaces), document_count
+    finally:
+        catalog.sql.close()
+
+
+def _publish_mongo_export(staged, destination):
+    if os.name == "nt":
+        # Windows rename refuses an existing destination.
+        staged.rename(destination)
+        return
+    destination.mkdir(mode=0o700)
+    try:
+        staged.replace(destination)
+    except BaseException:
+        destination.rmdir()
+        raise
+
+
+def export_main(argv):
+    parser = argparse.ArgumentParser(description="Export a MongoDB test server SQLite snapshot.")
+    parser.add_argument("--db-file", type=Path, required=True, help="existing SQLite persistence file")
+    parser.add_argument("--db", help="export just one database (default: all databases)")
+    parser.add_argument("--out", type=Path, required=True, help="new output directory")
+    parser.add_argument("--format", choices=("dump", "dbpath"), default="dump",
+                        help="mongorestore directory or native WiredTiger dbPath (default: %(default)s)")
+    parser.add_argument("--mongod", default="mongod", help="mongod executable for dbpath export")
+    parser.add_argument("--mongorestore", default="mongorestore", help="mongorestore executable for dbpath export")
+    args = parser.parse_args(argv)
+    destination = args.out.expanduser().absolute()
+    try:
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Output directory already exists: {destination}")
+        if args.format == "dbpath":
+            if os.name != "posix":
+                raise ValueError("dbPath export requires mongod support for Unix domain sockets")
+            mongod = shutil.which(args.mongod)
+            mongorestore = shutil.which(args.mongorestore)
+            if mongod is None or mongorestore is None:
+                missing = args.mongod if mongod is None else args.mongorestore
+                raise FileNotFoundError(f"MongoDB executable not found: {missing}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".mongo-export-", dir=destination.parent) as temporary:
+            stage = Path(temporary)
+            dump = stage / "dump"
+            databases, collections, documents = export_mongo_dump(args.db_file.expanduser(), dump, args.db)
+            result = dump
+            if args.format == "dbpath":
+                result = stage / "dbpath"
+                result.mkdir(mode=0o700)
+                export_native_dbpath(dump, result, mongod, mongorestore)
+            _publish_mongo_export(result, destination)
+    except (OSError, ValueError, sqlite3.Error, MongoError) as exc:
+        parser.exit(1, f"MongoDB export failed: {exc}\n")
+    print(f"Exported {documents} documents across {collections} collections/views in {databases} databases to {destination}")
+    return 0
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
     try:
         if argv[:1] == ["shell"]:
             return shell_main(argv[1:])
+        if argv[:1] == ["export"]:
+            return export_main(argv[1:])
         return serve_main(argv[1:] if argv[:1] == ["serve"] else argv)
     except KeyboardInterrupt:
         return 130

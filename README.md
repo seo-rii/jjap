@@ -35,6 +35,23 @@ python3 mongo_test_server.py --port 27017
 - Hermes 전체판은 로컬 음성 모델과 전체 Google API 정의 캐시를 포함합니다. 경량판은 로컬 Piper 모델과 사전을 빼고 Google Chat API 정의만 내장합니다. `.py`와 `.pyz`에 같은 실행 옵션을 사용합니다.
 - MongoDB 테스트 서버는 기본적으로 `127.0.0.1`에서 메모리로 동작합니다. `mongodb://127.0.0.1:27017`로 접속하거나 내장 셸에서 `python3 mongo_test_server.py shell --eval '{"ping": 1}'`을 실행할 수 있습니다. `--db-file test.sqlite3`를 지정하면 테스트 데이터를 보존합니다.
 
+### MongoDB 내보내기
+
+`export`는 `--db-file`에 커밋된 SQLite 스냅샷을 읽어서 새 디렉터리에 씁니다. 기본 출력은 컬렉션별 `.bson`과 `.metadata.json`이며, 문서의 BSON 타입과 컬렉션 옵션, 인덱스 정의, 뷰를 보존합니다. `--db`로 데이터베이스 하나를 선택할 수 있습니다. [MongoDB 덤프 형식](https://www.mongodb.com/docs/database-tools/mongodump/mongodump-behavior/)
+
+```sh
+python3 mongo_test_server.py export --db-file test.sqlite3 --out ./dump
+```
+
+Unix 소켓을 지원하는 환경에 `mongod`와 `mongorestore`가 설치되어 있으면 실제 WiredTiger `dbPath`도 만들 수 있습니다. 내보내기에 사용한 `mongod` 버전으로 결과를 엽니다. `--mongod`와 `--mongorestore`로 실행 파일 경로를 지정할 수 있습니다.
+
+```sh
+python3 mongo_test_server.py export --db-file test.sqlite3 --out ./mongo-data --format dbpath
+mongod --dbpath ./mongo-data --bind_ip 127.0.0.1 --port 27018
+```
+
+예전 테스트 서버가 생성한 비표준 컬렉션 UUID는 내보낸 메타데이터에서만 UUID v4로 변환합니다. 기존 UUID v4와 원본 SQLite 데이터는 그대로 보존합니다. 내보내기 대상은 MongoDB에서 복원할 수 있는 일반 컬렉션과 뷰입니다.
+
 ## Neo4j, Redis, Nexus Repository 테스트 서버
 
 각 서버는 Python 3.10 이상의 표준 라이브러리로 실행됩니다. 기본 설정은 루프백 주소와 메모리 저장입니다. `--db-file`에 서버별 파일을 지정하면 재시작 후 데이터를 다시 읽을 수 있고, `--port 0`은 비어 있는 포트를 선택해 시작 메시지에 표시합니다.
