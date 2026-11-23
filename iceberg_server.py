@@ -3,10 +3,12 @@
 
 Start: python3 iceberg_server.py --warehouse ./warehouse serve
 Use create-table, append, scan, delete and snapshots for local file operations.
+Use serve-polaris for a Polaris-compatible catalog with FILE storage.
 
 Protocol references:
 https://iceberg.apache.org/spec/
 https://iceberg.apache.org/rest-catalog-spec/
+https://polaris.apache.org/guides/rest-api/
 https://avro.apache.org/docs/current/specification/
 https://parquet.apache.org/docs/file-format/
 """
@@ -20,6 +22,7 @@ import datetime
 import decimal
 import gzip
 import hashlib
+import hmac
 import importlib
 import io
 import itertools
@@ -33,6 +36,7 @@ import sqlite3
 import struct
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import zlib
@@ -281,6 +285,21 @@ def _catalog_check_requirements(metadata, requirements):
         raise IcebergCatalogError("; ".join(failures), 409, "CommitFailedException")
 
 
+@contextmanager
+def _catalog_transaction(db_file, write=False):
+    connection = sqlite3.connect(db_file, timeout=15, isolation_level=None)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        yield connection
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 class IcebergCatalog:
     """Persistent local Iceberg v2 catalog using immutable JSON and a SQLite pointer."""
 
@@ -300,19 +319,8 @@ class IcebergCatalog:
                 " metadata_location TEXT NOT NULL, version INTEGER NOT NULL, PRIMARY KEY(namespace, name))"
             )
 
-    @contextmanager
     def _transaction(self, write=False):
-        connection = sqlite3.connect(self.db_file, timeout=15, isolation_level=None)
-        try:
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            yield connection
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+        return _catalog_transaction(self.db_file, write)
 
     def local_path(self, location):
         path = _catalog_local_path(location)
@@ -857,7 +865,7 @@ _catalog_endpoints = [
 class _IcebergCatalogHandler(BaseHTTPRequestHandler):
     server_version = "jjap-iceberg/1"
 
-    def _read_json(self):
+    def _read_body(self):
         length = self.headers.get("Content-Length", "")
         if not length or len(length) > 9 or not length.isascii() or not length.isdecimal():
             raise IcebergCatalogError("A valid Content-Length is required")
@@ -867,8 +875,11 @@ class _IcebergCatalogHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(count)
         if len(raw) != count:
             raise IcebergCatalogError("Incomplete request body")
+        return raw
+
+    def _read_json(self):
         try:
-            return _catalog_object(json.loads(raw), "Request body")
+            return _catalog_object(json.loads(self._read_body()), "Request body")
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise IcebergCatalogError("Invalid request JSON") from exc
 
@@ -888,13 +899,17 @@ class _IcebergCatalogHandler(BaseHTTPRequestHandler):
     def _not_found():
         raise IcebergCatalogError("Unknown catalog endpoint", 404, "NoSuchEndpointException")
 
-    def _dispatch(self):
+    def _route(self):
         try:
             url = urlsplit(self.path)
             parts = [unquote(part, errors="strict") for part in url.path.strip("/").split("/")]
             query = parse_qs(url.query, max_num_fields=64, errors="strict")
         except (UnicodeError, ValueError) as exc:
             raise IcebergCatalogError("Invalid request URI") from exc
+        return parts, query
+
+    def _dispatch(self):
+        parts, query = self._route()
         method = self.command
         catalog = self.server.catalog
         if parts == ["v1", "config"] and method == "GET":
@@ -906,7 +921,9 @@ class _IcebergCatalogHandler(BaseHTTPRequestHandler):
             return
         if not parts or parts[0] != "v1":
             self._not_found()
-        parts = parts[1:]
+        self._catalog_request(catalog, method, parts[1:], query)
+
+    def _catalog_request(self, catalog, method, parts, query):
         if parts == ["tables", "rename"] and method == "POST":
             body = self._read_json()
             catalog.rename_table(*_catalog_identifier(body.get("source")), *_catalog_identifier(body.get("destination")))
@@ -1036,6 +1053,464 @@ def iceberg_serve(warehouse, db_file=None, host="127.0.0.1", port=8181):
     with ThreadingHTTPServer((host, port), _IcebergCatalogHandler) as server:
         server.catalog = catalog
         print(f"Iceberg test server listening on http://{host}:{server.server_port}", flush=True)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+
+
+# Polaris management and OAuth2 for local FILE catalogs.
+
+
+_POLARIS_NAMESPACE_PRIVILEGES = {
+    "NAMESPACE_LIST", "NAMESPACE_CREATE", "NAMESPACE_DROP",
+    "NAMESPACE_READ_PROPERTIES", "NAMESPACE_WRITE_PROPERTIES",
+}
+_POLARIS_TABLE_PRIVILEGES = {
+    "TABLE_LIST", "TABLE_CREATE", "TABLE_DROP", "TABLE_READ_PROPERTIES",
+    "TABLE_WRITE_PROPERTIES", "TABLE_READ_DATA", "TABLE_WRITE_DATA",
+}
+_POLARIS_PRIVILEGES = _POLARIS_NAMESPACE_PRIVILEGES | _POLARIS_TABLE_PRIVILEGES | {
+    "CATALOG_MANAGE_CONTENT", "CATALOG_MANAGE_METADATA", "CATALOG_READ_CONFIG",
+    "CATALOG_READ_PROPERTIES", "NAMESPACE_FULL_METADATA", "TABLE_FULL_METADATA",
+}
+_POLARIS_TOP_ENTITIES = {
+    "catalogs": ("catalog", "catalogs", "polaris_catalogs"),
+    "principals": ("principal", "principals", "polaris_principals"),
+    "principal-roles": ("principalRole", "roles", "polaris_principal_roles"),
+}
+_POLARIS_CATALOG_ROLE = ("catalogRole", "roles", "polaris_catalog_roles")
+
+
+def _polaris_name(value):
+    value = _catalog_component(value)
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", value):
+        raise IcebergCatalogError("Invalid Polaris entity name")
+    return value
+
+
+def _polaris_secret(value):
+    return hashlib.sha256(value.encode("utf-8")).digest()
+
+
+def _polaris_denied(message="Insufficient catalog privileges"):
+    return IcebergCatalogError(message, 403, "ForbiddenException")
+
+
+class _PolarisHandler(_IcebergCatalogHandler):
+    server_version = "jjap-polaris/1"
+    timeout = 15
+
+    def _dispatch(self):
+        parts, query = self._route()
+        if self.command == "GET" and parts in (["q", "health"], ["q", "health", "ready"]):
+            self._respond(200, {"status": "UP", "checks": []})
+            return
+        state = self.server.polaris
+        if self.headers.get("Polaris-Realm", state.realm) != state.realm:
+            raise IcebergCatalogError("Unknown Polaris realm", 404, "NotFoundException")
+        # Keep authorization, catalog deletion, and catalog operations ordered on one node.
+        with state.lock:
+            if parts == ["api", "catalog", "v1", "oauth", "tokens"] and self.command == "POST":
+                self._token_request(state)
+            elif parts[:3] == ["api", "management", "v1"]:
+                client, _ = state.authenticate(self.headers.get("Authorization", ""))
+                if client != "root":
+                    raise _polaris_denied("Service administration requires the root principal")
+                with _catalog_transaction(state.db_file, self.command != "GET") as connection:
+                    status, result = self._management(state, connection, parts[3:])
+                self._respond(status, result)
+            elif parts[:3] == ["api", "catalog", "v1"]:
+                identity = state.authenticate(self.headers.get("Authorization", ""))
+                self._polaris_catalog_request(state, identity, parts[3:], query)
+            else:
+                self._not_found()
+
+    def _token_request(self, state):
+        body = self._read_body()
+        try:
+            form = parse_qs(body.decode("utf-8"), max_num_fields=20, errors="strict")
+            scheme, _, value = self.headers.get("Authorization", "").partition(" ")
+            if scheme.lower() == "basic":
+                client, separator, secret = base64.b64decode(value, validate=True).decode().partition(":")
+                if not separator:
+                    raise ValueError("missing credential separator")
+            else:
+                client = form.get("client_id", [""])[0]
+                secret = form.get("client_secret", [""])[0]
+        except ValueError:
+            self._respond(400, {"error": "invalid_request"})
+            return
+        if form.get("grant_type") != ["client_credentials"]:
+            self._respond(400, {"error": "unsupported_grant_type"})
+            return
+        scope = form.get("scope", ["PRINCIPAL_ROLE:ALL"])[0]
+        try:
+            token = state.issue_token(client, secret, scope)
+        except IcebergCatalogError as exc:
+            self._respond(exc.status, {"error": exc.error_type})
+            return
+        self._respond(200, {
+            "access_token": token, "token_type": "Bearer", "expires_in": state.token_lifetime,
+            "scope": scope,
+        }, {"Cache-Control": "no-store"})
+
+    def _polaris_catalog_request(self, state, identity, parts, query):
+        if parts == ["config"] and self.command == "GET":
+            name = _polaris_name(query.get("warehouse", [None])[0])
+            catalog, privileges = state.catalog_access(name, identity)
+            if not privileges:
+                raise _polaris_denied()
+            self._respond(200, {
+                "defaults": {"scan-planning-mode": "client"},
+                "overrides": {"prefix": name, "warehouse": catalog.warehouse.as_uri()},
+                "endpoints": _catalog_endpoints,
+            })
+            return
+        if len(parts) < 2:
+            self._not_found()
+        catalog, privileges = state.catalog_access(_polaris_name(parts[0]), identity)
+        _polaris_authorize(privileges, self.command, parts[1:])
+        self._catalog_request(catalog, self.command, parts[1:], query)
+
+    def _management(self, state, connection, parts):
+        method = self.command
+        if not parts or parts[0] not in _POLARIS_TOP_ENTITIES:
+            self._not_found()
+        kind, *tail = parts
+        if len(tail) < 2:
+            return self._entities(state, connection, _POLARIS_TOP_ENTITIES[kind], tail)
+
+        name = _polaris_name(tail[0])
+        state.entity(connection, _POLARIS_TOP_ENTITIES[kind][2], name)
+        if kind == "catalogs" and tail[1] == "catalog-roles":
+            if len(tail) <= 3:
+                return self._entities(state, connection, _POLARIS_CATALOG_ROLE, tail[2:], catalog=name)
+            if len(tail) == 4 and tail[3] == "grants":
+                return self._grants(state, connection, name, _polaris_name(tail[2]))
+        if kind == "principals" and tail[1] == "principal-roles" and len(tail) <= 3:
+            return self._assign_roles(state, connection, tail[2:], principal=name)
+        if kind == "principal-roles" and tail[1] == "catalog-roles" and 3 <= len(tail) <= 4:
+            catalog = _polaris_name(tail[2])
+            state.entity(connection, "polaris_catalogs", catalog)
+            return self._assign_roles(state, connection, tail[3:], principal_role=name, catalog=catalog)
+        self._not_found()
+
+    def _entities(self, state, connection, info, tail, catalog=None):
+        wrapper, list_key, table = info
+        method = self.command
+        condition, params = ("catalog = ?", (catalog,)) if catalog is not None else ("1 = 1", ())
+        if not tail and method == "GET":
+            rows = connection.execute(f"SELECT payload FROM {table} WHERE {condition} ORDER BY name", params)
+            return 200, {list_key: [json.loads(row[0]) for row in rows]}
+        if not tail and method == "POST":
+            body = self._read_json()
+            return 201, state.create_entity(connection, body, wrapper, catalog)
+        if not tail:
+            self._not_found()
+        name = _polaris_name(tail[0])
+        entity = state.entity(connection, table, name, catalog)
+        if method == "GET":
+            return 200, entity
+        if method == "DELETE":
+            state.delete_entity(connection, table, name, entity, catalog)
+            return 204, None
+        self._not_found()
+
+    def _assign_roles(self, state, connection, tail, *, principal=None, principal_role=None, catalog=None):
+        if catalog is None:
+            table = "polaris_principal_assignments"
+            keys, values = ("principal",), (principal,)
+            wrapper, role_table = "principalRole", "polaris_principal_roles"
+            join = "r.name = a.role"
+        else:
+            table = "polaris_catalog_assignments"
+            keys, values = ("principal_role", "catalog"), (principal_role, catalog)
+            wrapper, role_table = "catalogRole", "polaris_catalog_roles"
+            join = "r.name = a.role AND r.catalog = a.catalog"
+        filter_sql = " AND ".join(f"a.{key} = ?" for key in keys)
+        if not tail and self.command == "GET":
+            rows = connection.execute(
+                f"SELECT r.payload FROM {table} a JOIN {role_table} r ON {join} WHERE {filter_sql} ORDER BY a.role",
+                values,
+            )
+            return 200, {"roles": [json.loads(row[0]) for row in rows]}
+        if not tail and self.command == "PUT":
+            role = _polaris_name(_catalog_object(self._read_json().get(wrapper), wrapper).get("name"))
+            state.entity(connection, role_table, role, catalog)
+            columns = ", ".join((*keys, "role"))
+            placeholders = ", ".join("?" for _ in range(len(keys) + 1))
+            connection.execute(f"INSERT OR IGNORE INTO {table} ({columns}) VALUES ({placeholders})", (*values, role))
+            return 201, None
+        if tail and self.command == "DELETE":
+            connection.execute(f"DELETE FROM {table} AS a WHERE {filter_sql} AND a.role = ?", (*values, _polaris_name(tail[0])))
+            return 204, None
+        self._not_found()
+
+    def _grants(self, state, connection, catalog, role):
+        state.entity(connection, "polaris_catalog_roles", role, catalog)
+        if self.command == "GET":
+            rows = connection.execute(
+                "SELECT privilege FROM polaris_catalog_grants WHERE catalog = ? AND role = ? ORDER BY privilege",
+                (catalog, role),
+            )
+            return 200, {"grants": [{"type": "catalog", "privilege": row[0]} for row in rows]}
+        if self.command in ("PUT", "POST"):
+            grant = _catalog_object(self._read_json().get("grant"), "Grant")
+            privilege = grant.get("privilege")
+            if grant.get("type") != "catalog" or not isinstance(privilege, str) or privilege not in _POLARIS_PRIVILEGES:
+                raise IcebergCatalogError("Unsupported catalog grant")
+            if self.command == "PUT":
+                connection.execute("INSERT OR IGNORE INTO polaris_catalog_grants VALUES (?, ?, ?)", (catalog, role, privilege))
+            else:
+                connection.execute(
+                    "DELETE FROM polaris_catalog_grants WHERE catalog = ? AND role = ? AND privilege = ?",
+                    (catalog, role, privilege),
+                )
+            return 201, None
+        self._not_found()
+
+    do_PUT = _IcebergCatalogHandler._handle
+
+
+class _PolarisState:
+    token_lifetime = 3600
+
+    def __init__(self, warehouse, db_file, password, realm):
+        self.warehouse = _catalog_local_path(warehouse)
+        self.warehouse.mkdir(parents=True, exist_ok=True)
+        self.db_file = Path(db_file).resolve() if db_file else self.warehouse / ".polaris.sqlite3"
+        self.db_file.parent.mkdir(parents=True, exist_ok=True)
+        self.realm = _polaris_name(realm)
+        self.root_secret = _polaris_secret(password)
+        self.lock = threading.Lock()
+        self.tokens = {}
+        self.catalogs = {}
+        with _catalog_transaction(self.db_file, True) as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS polaris_catalogs (
+                    name TEXT PRIMARY KEY, payload TEXT NOT NULL, location TEXT NOT NULL UNIQUE
+                );
+                CREATE TABLE IF NOT EXISTS polaris_principals (
+                    name TEXT PRIMARY KEY, payload TEXT NOT NULL, client_id TEXT NOT NULL UNIQUE,
+                    secret BLOB NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS polaris_principal_roles (name TEXT PRIMARY KEY, payload TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS polaris_catalog_roles (
+                    catalog TEXT REFERENCES polaris_catalogs(name) ON DELETE CASCADE,
+                    name TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (catalog, name)
+                );
+                CREATE TABLE IF NOT EXISTS polaris_principal_assignments (
+                    principal TEXT REFERENCES polaris_principals(name) ON DELETE CASCADE,
+                    role TEXT REFERENCES polaris_principal_roles(name) ON DELETE CASCADE,
+                    PRIMARY KEY (principal, role)
+                );
+                CREATE TABLE IF NOT EXISTS polaris_catalog_assignments (
+                    principal_role TEXT REFERENCES polaris_principal_roles(name) ON DELETE CASCADE,
+                    catalog TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY (principal_role, catalog, role),
+                    FOREIGN KEY (catalog, role) REFERENCES polaris_catalog_roles(catalog, name) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS polaris_catalog_grants (
+                    catalog TEXT NOT NULL, role TEXT NOT NULL, privilege TEXT NOT NULL,
+                    PRIMARY KEY (catalog, role, privilege),
+                    FOREIGN KEY (catalog, role) REFERENCES polaris_catalog_roles(catalog, name) ON DELETE CASCADE
+                );
+            """)
+
+    @staticmethod
+    def entity(connection, table, name, catalog=None):
+        selector = "name = ?" if catalog is None else "name = ? AND catalog = ?"
+        keys = (name,) if catalog is None else (name, catalog)
+        row = connection.execute(f"SELECT payload FROM {table} WHERE {selector}", keys).fetchone()
+        if row is None:
+            raise IcebergCatalogError(f"Unknown Polaris entity {name!r}", 404, "NotFoundException")
+        return json.loads(row[0])
+
+    def create_entity(self, connection, body, wrapper, catalog):
+        data = _catalog_object(body.get(wrapper), wrapper)
+        name = _polaris_name(data.get("name"))
+        properties = _catalog_properties(data.get("properties", {}))
+        now = _catalog_now_ms()
+        payload = {
+            "name": name, "properties": properties, "createTimestamp": now,
+            "lastUpdateTimestamp": now, "entityVersion": 1,
+        }
+        try:
+            if wrapper == "catalog":
+                self._create_catalog(connection, data, payload)
+            elif wrapper == "principal":
+                if name == "root" or body.get("credentialRotationRequired", False):
+                    raise IcebergCatalogError("Reserved principal name or unsupported required credential rotation")
+                client_id, secret = uuid.uuid4().hex, secrets.token_urlsafe(32)
+                payload["clientId"] = client_id
+                connection.execute(
+                    "INSERT INTO polaris_principals VALUES (?, ?, ?, ?)",
+                    (name, json.dumps(payload), client_id, _polaris_secret(secret)),
+                )
+                return {"principal": payload, "credentials": {"clientId": client_id, "clientSecret": secret}}
+            elif wrapper == "principalRole":
+                if data.get("federated", False):
+                    raise IcebergCatalogError("Federated principal roles are unsupported")
+                payload["federated"] = False
+                connection.execute("INSERT INTO polaris_principal_roles VALUES (?, ?)", (name, json.dumps(payload)))
+            else:
+                connection.execute("INSERT INTO polaris_catalog_roles VALUES (?, ?, ?)", (catalog, name, json.dumps(payload)))
+        except sqlite3.IntegrityError as exc:
+            raise IcebergCatalogError(f"Entity {name!r} already exists", 409, "AlreadyExistsException") from exc
+        return payload
+
+    def _create_catalog(self, connection, data, payload):
+        storage = _catalog_object(data.get("storageConfigInfo"), "Storage configuration")
+        if data.get("type") != "INTERNAL" or storage.get("storageType") != "FILE":
+            raise IcebergCatalogError("Only INTERNAL catalogs with FILE storage are supported")
+        name = payload["name"]
+        location = _catalog_local_path(payload["properties"].get("default-base-location", self.warehouse / name))
+        if location == self.warehouse or not location.is_relative_to(self.warehouse) or self.db_file.is_relative_to(location):
+            raise IcebergCatalogError("Catalog location must be a dedicated directory under the Polaris warehouse")
+        for (previous,) in connection.execute("SELECT location FROM polaris_catalogs"):
+            previous = Path(previous)
+            if previous.is_relative_to(location) or location.is_relative_to(previous):
+                raise IcebergCatalogError("Catalog storage locations overlap", 409, "AlreadyExistsException")
+        allowed = _catalog_array(storage.get("allowedLocations", [location]), "Allowed locations")
+        # Storage is rooted at the single default base location for these local catalogs.
+        if {_catalog_local_path(path) for path in allowed} != {location}:
+            raise IcebergCatalogError("FILE allowedLocations must only contain the default base location")
+        payload["properties"]["default-base-location"] = location.as_uri()
+        payload["type"] = "INTERNAL"
+        payload["storageConfigInfo"] = {"storageType": "FILE", "allowedLocations": [location.as_uri()]}
+        connection.execute("INSERT INTO polaris_catalogs VALUES (?, ?, ?)", (name, json.dumps(payload), str(location)))
+        role = {
+            "name": "catalog_admin", "properties": {}, "createTimestamp": payload["createTimestamp"],
+            "lastUpdateTimestamp": payload["lastUpdateTimestamp"], "entityVersion": 1,
+        }
+        connection.execute("INSERT INTO polaris_catalog_roles VALUES (?, ?, ?)", (name, role["name"], json.dumps(role)))
+        connection.execute("INSERT INTO polaris_catalog_grants VALUES (?, ?, ?)", (name, role["name"], "CATALOG_MANAGE_CONTENT"))
+        self._iceberg(name, payload)
+
+    def delete_entity(self, connection, table, name, payload, catalog):
+        if table == "polaris_catalogs":
+            extra = connection.execute(
+                "SELECT 1 FROM polaris_catalog_roles WHERE catalog = ? AND name != 'catalog_admin'", (name,),
+            ).fetchone()
+            if extra or self._iceberg(name, payload).list_namespaces():
+                raise IcebergCatalogError("Catalog is not empty", 409, "CatalogNotEmptyException")
+        if catalog is None:
+            connection.execute(f"DELETE FROM {table} WHERE name = ?", (name,))
+        else:
+            if name == "catalog_admin":
+                raise IcebergCatalogError("The built-in catalog role cannot be deleted")
+            connection.execute(f"DELETE FROM {table} WHERE catalog = ? AND name = ?", (catalog, name))
+        if table == "polaris_catalogs":
+            self.catalogs.pop(name, None)
+
+    def _iceberg(self, name, payload):
+        location = payload["properties"]["default-base-location"]
+        catalog = self.catalogs.get(name)
+        if catalog is None or catalog.warehouse.as_uri() != location:
+            path = _catalog_local_path(location)
+            if path.as_uri() != location or not path.is_relative_to(self.warehouse):
+                raise IcebergCatalogError("Catalog storage location has changed", 409, "ConflictException")
+            catalog = IcebergCatalog(path)
+            self.catalogs[name] = catalog
+        return catalog
+
+    def issue_token(self, client, secret, scope):
+        roles = None
+        if scope not in ("PRINCIPAL_ROLE:ALL", "catalog"):
+            if not scope.startswith("PRINCIPAL_ROLE:"):
+                raise IcebergCatalogError("Unsupported token scope", 400, "invalid_scope")
+            try:
+                roles = {_polaris_name(role) for role in scope.split(":", 1)[1].split(",")}
+            except IcebergCatalogError as exc:
+                raise IcebergCatalogError("Invalid principal role scope", 400, "invalid_scope") from exc
+        if client == "root":
+            expected = self.root_secret
+            if roles not in (None, {"service_admin"}):
+                raise IcebergCatalogError("Unsupported root role scope", 400, "invalid_scope")
+        else:
+            with _catalog_transaction(self.db_file) as connection:
+                row = connection.execute("SELECT secret FROM polaris_principals WHERE client_id = ?", (client,)).fetchone()
+                expected = row[0] if row else b""
+        if not hmac.compare_digest(_polaris_secret(secret), expected):
+            raise IcebergCatalogError("Invalid client credentials", 401, "invalid_client")
+        now = time.monotonic()
+        self.tokens = {key: value for key, value in self.tokens.items() if value[0] > now}
+        if len(self.tokens) >= 4096:
+            raise IcebergCatalogError("Too many active tokens", 429, "temporarily_unavailable")
+        token = secrets.token_urlsafe(32)
+        self.tokens[_polaris_secret(token)] = (now + self.token_lifetime, client, roles)
+        return token
+
+    def authenticate(self, authorization):
+        scheme, _, token = authorization.partition(" ")
+        record = self.tokens.get(_polaris_secret(token)) if scheme.lower() == "bearer" else None
+        if record is None or record[0] <= time.monotonic():
+            raise IcebergCatalogError("Missing or expired bearer token", 401, "NotAuthorizedException")
+        return record[1:]
+
+    def catalog_access(self, name, identity):
+        client, roles = identity
+        with _catalog_transaction(self.db_file) as connection:
+            payload = self.entity(connection, "polaris_catalogs", name)
+            if client == "root":
+                privileges = {"CATALOG_MANAGE_CONTENT"}
+            else:
+                rows = connection.execute("""
+                    SELECT a.role, g.privilege
+                    FROM polaris_principals p
+                    JOIN polaris_principal_assignments a ON a.principal = p.name
+                    JOIN polaris_catalog_assignments c ON c.principal_role = a.role
+                    JOIN polaris_catalog_grants g ON g.catalog = c.catalog AND g.role = c.role
+                    WHERE p.client_id = ? AND c.catalog = ?
+                """, (client, name))
+                privileges = {privilege for role, privilege in rows if roles is None or role in roles}
+        if not privileges:
+            raise _polaris_denied()
+        return self._iceberg(name, payload), privileges
+
+
+def _polaris_authorize(privileges, method, parts):
+    if privileges & {"CATALOG_MANAGE_CONTENT", "CATALOG_MANAGE_METADATA"}:
+        return
+    if "NAMESPACE_FULL_METADATA" in privileges:
+        privileges = privileges | _POLARIS_NAMESPACE_PRIVILEGES | {"TABLE_LIST"}
+    if "TABLE_FULL_METADATA" in privileges:
+        privileges = privileges | (_POLARIS_TABLE_PRIVILEGES - {"TABLE_READ_DATA", "TABLE_WRITE_DATA"})
+    required = None
+    if parts == ["transactions", "commit"] and method == "POST":
+        required = "TABLE_FULL_METADATA"
+    elif parts == ["namespaces"]:
+        required = {"GET": "NAMESPACE_LIST", "POST": "NAMESPACE_CREATE"}.get(method)
+    elif len(parts) >= 2 and parts[0] == "namespaces":
+        tail = parts[2:]
+        if not tail:
+            required = {"GET": "NAMESPACE_READ_PROPERTIES", "HEAD": "NAMESPACE_READ_PROPERTIES",
+                        "DELETE": "NAMESPACE_DROP"}.get(method)
+        elif tail == ["properties"] and method == "POST":
+            required = "NAMESPACE_WRITE_PROPERTIES"
+        elif tail == ["register"] and method == "POST":
+            required = "TABLE_FULL_METADATA"
+        elif tail == ["tables"]:
+            required = {"GET": "TABLE_LIST", "POST": "TABLE_CREATE"}.get(method)
+        elif tail[0] == "tables" and len(tail) == 2:
+            if method in ("GET", "HEAD"):
+                if privileges & {"TABLE_READ_PROPERTIES", "TABLE_READ_DATA", "TABLE_WRITE_DATA"}:
+                    return
+            required = {"POST": "TABLE_FULL_METADATA", "DELETE": "TABLE_DROP"}.get(method)
+        elif tail[0] == "tables" and len(tail) == 3 and method == "POST":
+            if tail[2] == "metrics" and privileges & {"TABLE_READ_PROPERTIES", "TABLE_READ_DATA", "TABLE_WRITE_DATA"}:
+                return
+            if tail[2] == "unregister":
+                required = "TABLE_DROP"
+    if required is None or required not in privileges:
+        raise _polaris_denied()
+
+
+def polaris_serve(warehouse, db_file, host, port, password, realm):
+    state = _PolarisState(warehouse, db_file, password, realm)
+    with ThreadingHTTPServer((host, port), _PolarisHandler) as server:
+        server.polaris = state
+        print(f"Polaris test server listening on http://{host}:{server.server_port}", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
@@ -3048,6 +3523,12 @@ def iceberg_main(argv=None):
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", default=8181, type=int, help="REST port; 0 chooses an available port")
 
+    polaris = commands.add_parser("serve-polaris", help="start the Polaris REST Catalog and Management API")
+    polaris.add_argument("--host", default="127.0.0.1")
+    polaris.add_argument("--port", default=8181, type=int, help="REST port; 0 chooses an available port")
+    polaris.add_argument("--realm", default="POLARIS")
+    polaris.add_argument("--password-file", required=True, type=Path, help="file containing the root client secret")
+
     create = commands.add_parser("create-table", help="create a v2 table from an Iceberg schema JSON file")
     create.add_argument("table", type=_ice_identifier)
     create.add_argument("--schema", required=True)
@@ -3073,10 +3554,16 @@ def iceberg_main(argv=None):
 
     args = parser.parse_args(argv)
     try:
-        if args.command == "serve":
+        if args.command in ("serve", "serve-polaris"):
             if not 0 <= args.port <= 65535:
                 parser.error("--port must be between 0 and 65535")
-            iceberg_serve(args.warehouse, args.db_file, args.host, args.port)
+            if args.command == "serve-polaris":
+                password = args.password_file.read_text(encoding="utf-8").rstrip("\r\n")
+                if not password or len(password) > 4096:
+                    parser.error("--password-file must contain a root secret of 1 to 4096 characters")
+                polaris_serve(args.warehouse, args.db_file, args.host, args.port, password, args.realm)
+            else:
+                iceberg_serve(args.warehouse, args.db_file, args.host, args.port)
             return 0
         namespace, table = args.table
         catalog = IcebergCatalog(args.warehouse, args.db_file)
