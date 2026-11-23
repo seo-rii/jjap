@@ -1,8 +1,38 @@
 # jjap
 
-Single-file test servers for local integration tests, plus standalone builds of Pi, OpenCode, and Hermes. Each test server runs with Python 3.10 or later and the standard library. The standalone builds have their own runtime requirements.
+Single-file builds of Pi, OpenCode, and Hermes, plus Python servers for local integration tests.
 
-## Quick start
+## Standalone downloads
+
+Download a single file for the tool you want to run. [Release v0.1.0](https://github.com/seo-rii/jjap/releases/tag/v0.1.0) · [SHA256SUMS](https://github.com/seo-rii/jjap/releases/download/v0.1.0/SHA256SUMS)
+
+| Build | Download | Runtime |
+| --- | --- | --- |
+| Pi 1.3.0 preview.2 | [pi-standalone.mjs](https://github.com/seo-rii/jjap/releases/download/v0.1.0/pi-standalone.mjs) | Node.js 22.19 or later |
+| OpenCode 2.1.2-standalone.1 | [Full](https://github.com/seo-rii/jjap/releases/download/v0.1.0/opencode-standalone.js) · [Lite](https://github.com/seo-rii/jjap/releases/download/v0.1.0/opencode-standalone-lite.js) | Node.js 26.4 or later |
+| Hermes | [Full .py](https://github.com/seo-rii/jjap/releases/download/v0.1.0/hermes-full.py) · [Lite .py](https://github.com/seo-rii/jjap/releases/download/v0.1.0/hermes-lite.py) · [Full .pyz](https://github.com/seo-rii/jjap/releases/download/v0.1.0/hermes-full.pyz) · [Lite .pyz](https://github.com/seo-rii/jjap/releases/download/v0.1.0/hermes-lite.pyz) | CPython 3.14 or later |
+
+To download Pi and verify its checksum, run the following commands.
+
+```sh
+gh release download v0.1.0 -R seo-rii/jjap -D dist -p pi-standalone.mjs -p SHA256SUMS
+(cd dist && sha256sum --ignore-missing --check SHA256SUMS)
+```
+
+Run the corresponding command from the directory where you downloaded the file.
+
+```sh
+node pi-standalone.mjs
+node opencode-standalone.js
+python3.14 -I -S hermes-lite.py
+```
+
+- The full OpenCode build includes the web UI. The lite build provides the CLI, TUI, and HTTP API.
+- The full Hermes build includes local Piper voice models, dictionaries, and the full Google API discovery cache. The lite build bundles one Google API discovery document for Google Chat. The `.py` and `.pyz` builds accept the same options.
+
+## Server quick start
+
+The servers run with Python 3.10 or later and the standard library.
 
 Clone the repository and start the MongoDB test server on `127.0.0.1:27017`.
 
@@ -118,38 +148,6 @@ python3 iceberg_server.py --warehouse ./warehouse snapshots demo.events
 - **Types and partitions.** File operations cover flat primitive columns with identity, bucket, truncate, year, month, day, and hour partition transforms. JSON uses ISO strings for dates and times, strings for decimals, and Base64 strings for binary and fixed-width values. Dates and timestamps outside Python's calendar range use integer days and microseconds since the Unix epoch, respectively.
 - **Parquet codecs.** The CLI writes uncompressed Parquet and reads uncompressed, Snappy, and GZIP files, as well as ZSTD files on Python 3.14 or later. New catalog tables default to Snappy for client writes. [Parquet file format](https://parquet.apache.org/docs/file-format/) · [Avro specification](https://avro.apache.org/docs/current/specification/)
 
-## Standalone release builds
-
-Download the single-file builds from [v0.1.0](https://github.com/seo-rii/jjap/releases/tag/v0.1.0).
-
-| Build | File | Runtime |
-| --- | --- | --- |
-| Pi 1.3.0 preview.2 | `pi-standalone.mjs` | Node.js 22.19 or later |
-| OpenCode 2.1.2-standalone.1 | `opencode-standalone.js`, `opencode-standalone-lite.js` | Node.js 26.4 or later |
-| Hermes | `hermes-full.py`, `hermes-lite.py`, `hermes-full.pyz`, `hermes-lite.pyz` | CPython 3.14 or later |
-| MongoDB test server, initial release | `mongo_test_server.py` | Python 3.10 or later |
-
-To download Pi and verify its checksum, run the following commands.
-
-```sh
-gh release download v0.1.0 -R seo-rii/jjap -D dist -p pi-standalone.mjs -p SHA256SUMS
-(cd dist && sha256sum --ignore-missing --check SHA256SUMS)
-```
-
-Run the corresponding command from the directory where you downloaded the file.
-
-```sh
-node pi-standalone.mjs
-node opencode-standalone.js
-python3.14 -I -S hermes-lite.py
-python3 mongo_test_server.py --port 27017
-```
-
-- The full OpenCode build includes the web UI. The lite build provides the CLI, TUI, and HTTP API.
-- The full Hermes build includes local Piper voice models, dictionaries, and the full Google API discovery cache. The lite build bundles one Google API discovery document for Google Chat. The `.py` and `.pyz` builds accept the same options.
-
-For MongoDB export support, use the current [`mongo_server.py`](mongo_server.py) from this repository.
-
 ## Development
 
 Run the network, persistence, and file-format tests with the standard library.
@@ -163,4 +161,4 @@ python3 -B -m unittest discover -s tests -v
 - Pi's corresponding source for the DOOM example ships as `doom-corresponding-source.tar.gz`. [Original release](https://github.com/seo-rii/pi-standalone/releases/tag/standalone-v1.3.0-preview.2) · [License and notices](licenses/pi/)
 - OpenCode provides third-party notices for both builds. [Full source](https://github.com/seo-rii/opencode-standalone/tree/9b8be1342f1562aa15ec3b724bbbb8d219cdf696) · [Lite source](https://github.com/seo-rii/opencode-standalone/tree/75325db60f7d6c728fdb65881b515ad4328509ec) · [License and notices](licenses/opencode/)
 - Hermes embeds third-party licenses in each executable file. [Source](https://github.com/seo-rii/hermes-standalone/tree/fe98d0bd3e3628ac5a32c9cda07eb966b9313911) · [License](licenses/hermes/LICENSE)
-- The original MongoDB test server shipped in v0.1.0. [Initial release source](https://github.com/seo-rii/jjap/blob/v0.1.0/mongo_test_server.py)
+- The original MongoDB test server shipped in v0.1.0. [Initial download](https://github.com/seo-rii/jjap/releases/download/v0.1.0/mongo_test_server.py) · [Initial release source](https://github.com/seo-rii/jjap/blob/v0.1.0/mongo_test_server.py)
