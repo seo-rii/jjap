@@ -158,6 +158,15 @@ python3 iceberg_server.py --warehouse ./warehouse snapshots demo.events
 
 ### Apache Polaris
 
+| Area | Supported scope |
+| --- | --- |
+| Authentication | OAuth2 client credentials, expiring bearer tokens, and one configurable realm |
+| Management API | Root can create, list, inspect, and delete internal catalogs, principals, and roles, assign roles, and grant or revoke catalog-wide privileges |
+| Iceberg REST Catalog | Namespace and table operations, staged creation, registration, rename, and atomic commits |
+| Table privileges | `TABLE_CREATE` covers staged creation. `TABLE_WRITE_PROPERTIES` covers property-only commits. General metadata changes require broader grants. |
+| Storage | Dedicated local `FILE` warehouses with direct metadata paths checked against the catalog root. The client and server share `file://` paths. Filesystem permissions govern direct file access. |
+| Client verification | PyIceberg 0.12.0 authenticated, created a table, appended Parquet data, and scanned the result |
+
 Start Polaris mode with a file containing the root OAuth2 client secret.
 
 ```sh
@@ -179,17 +188,34 @@ curl -fsS -H "Authorization: Bearer $POLARIS_TOKEN" \
   http://127.0.0.1:8181/api/management/v1/catalogs
 ```
 
-Configure an Iceberg REST client with the catalog URI from the table, warehouse `demo`, the OAuth2 token endpoint above, and scope `PRINCIPAL_ROLE:ALL`. The management API supports shared catalog grants via principals, principal roles, and catalog roles. The `FILE` warehouse and data files must be accessible to both the server and the client. Catalog grants govern API operations, and filesystem permissions govern direct access to the files. [Polaris REST API guide](https://polaris.apache.org/guides/rest-api/)
+Configure an Iceberg REST client with the catalog URI from the server list, warehouse `demo`, the OAuth2 token endpoint above, and scope `PRINCIPAL_ROLE:ALL`. [Polaris REST API guide](https://polaris.apache.org/guides/rest-api/)
 
 ### OpenLineage
+
+| Area | Supported scope |
+| --- | --- |
+| HTTP ingestion | JSON or gzip run, job, and dataset events at `POST /api/v1/lineage`. Submit an event array at `POST /api/v1/lineage/batch`. |
+| Event storage | Raw events, exact replay deduplication, and run state projected in event-time order. Use `--db-file` for SQLite persistence. |
+| Queries | Namespace, job, and dataset listings, run status and raw events, and a Marquez-style job and dataset graph with `nodeId` and `depth` |
+| Authentication | Optional fixed bearer token via `--password-file` |
+| Client verification | `openlineage-python` 1.54.0 with gzip HTTP transport and Airflow task events from this repository |
 
 ```sh
 python3 openlineage_server.py --db-file lineage.sqlite3
 ```
 
-Point the OpenLineage HTTP transport at `http://127.0.0.1:5000`. Its default `POST /api/v1/lineage` route accepts JSON and gzip. The server keeps raw run, job, and dataset events, deduplicates exact replays, and projects input and output relationships. Fetch a run at `/api/v1/runs/<run-id>` or query the Marquez-style graph at `/api/v1/lineage` with `nodeId` and `depth` parameters. Set `--password-file` to require a bearer token. [HTTP transport configuration](https://openlineage.io/docs/client/python/configuration/) · [Marquez lineage API](https://marquezproject.ai/docs/api/get-lineage/)
+Point the OpenLineage HTTP transport at `http://127.0.0.1:5000`. Fetch a run at `/api/v1/runs/<run-id>` or query a graph at `GET /api/v1/lineage`. [HTTP transport configuration](https://openlineage.io/docs/client/python/configuration/) · [Marquez lineage API](https://marquezproject.ai/docs/api/get-lineage/)
 
 ### LiteLLM
+
+| Area | Supported scope |
+| --- | --- |
+| Inference API | Model listing, Chat Completions and Responses over JSON or SSE, and Embeddings in float or Base64 format |
+| Mock models | `mock-chat` reproduces text and forced function calls. `mock-embedding` generates deterministic vectors. Mock Responses support stored response lookup and function-call follow-ups. |
+| Upstream routing | OpenAI-compatible HTTP endpoints, model aliases, round-robin deployment selection, and fallback on connection refusal or HTTP `429`, `502`, `503`, or `504` |
+| Stateful upstream requests | Requests with `previous_response_id` require a single deployment for that model |
+| Keys and usage | Optional master key via `--password-file`, model-scoped virtual keys with optional expiry, key revocation, and token counts at `/spend/logs`. Use `--db-file` to persist keys and usage. |
+| Client verification | OpenAI Python SDK 3.57.0 exercised streaming, embeddings, and Responses function-call follow-ups against mock models |
 
 ```sh
 python3 litellm_server.py --db-file gateway.sqlite3
@@ -203,7 +229,7 @@ curl -fsS -H 'Content-Type: application/json' \
   http://127.0.0.1:4000/v1/chat/completions
 ```
 
-The built-in `mock-chat` and `mock-embedding` models support Chat Completions, Responses, and Embeddings. The mock Responses API supports stored responses and function-call follow-ups. Pass `--config` with a JSON `model_list` to route an alias to an OpenAI-compatible HTTP upstream.
+Pass `--config` with a JSON `model_list` to route an alias to an OpenAI-compatible HTTP upstream. [LiteLLM Gateway](https://docs.litellm.ai/docs/simple_proxy/)
 
 ```json
 {
@@ -219,9 +245,16 @@ The built-in `mock-chat` and `mock-embedding` models support Chat Completions, R
 }
 ```
 
-The gateway streams SSE and passes upstream Responses requests through. Use a single deployment per model for upstream requests with `previous_response_id`. With `--password-file`, the master key can issue or revoke model-scoped virtual keys with optional expiry and read request token usage at `/spend/logs`. [LiteLLM Gateway](https://docs.litellm.ai/docs/simple_proxy/)
-
 ### OpenSearch
+
+| Area | Supported scope |
+| --- | --- |
+| Indexes | Index creation and deletion, mappings, settings, and filtered and write aliases. Each index has one primary shard. |
+| Documents | CRUD, `_mget`, gzip NDJSON `_bulk` with per-item results, and sequence-number and primary-term concurrency checks |
+| Visibility | Realtime document reads, manual and interval refresh, and `refresh=true` or `refresh=wait_for`. Search reads the last refreshed version. |
+| Search | `_search` and `_count` with common term, range, Boolean, and text queries, sorting, `search_after`, source projection, and basic aggregations. Text analysis and scoring are simplified. |
+| Persistence | `--db-file` stores indexes, live documents, and refreshed search data in SQLite |
+| Client verification | `opensearch-py` 3.2.0 exercised index and alias setup, bulk, optimistic updates, and search |
 
 ```sh
 python3 opensearch_server.py --db-file search.sqlite3
@@ -235,9 +268,18 @@ curl -fsS -X PUT -H 'Content-Type: application/json' \
 curl -fsS 'http://127.0.0.1:9200/notes/_search'
 ```
 
-The server supports document CRUD, NDJSON bulk requests, mappings, filtered and write aliases, refresh, sequence-number concurrency checks, and common Query DSL filters, sorting, pagination, and aggregations. It uses one primary shard per index and simplified scoring and text analysis. Get requests read the latest document, and search queries read the last refreshed version. [Python client](https://docs.opensearch.org/latest/clients/python-low-level/) · [Query DSL](https://docs.opensearch.org/latest/query-dsl/index/)
+Use the OpenSearch Python client with the server endpoint above. [Python client](https://docs.opensearch.org/latest/clients/python-low-level/) · [Query DSL](https://docs.opensearch.org/latest/query-dsl/index/)
 
 ### Apache Airflow
+
+| Area | Supported scope |
+| --- | --- |
+| Airflow 3 REST API | `/api/v2` DAG listing, details and pause, run triggering and status, unmapped task instances, and per-attempt logs |
+| Task execution | One worker runs command arrays registered in local JSON DAGs, with upstream dependencies, retries, and timeouts |
+| Scheduling | Manual runs and fixed-second intervals via `schedule_seconds`. The first scheduled run is due one interval after registration. |
+| State and recovery | `--db-file` stores run, task, and attempt state in SQLite. Interrupted attempts are recorded as failed on restart. |
+| OpenLineage | Per-attempt lifecycle events over HTTP, with retries on delivery failure |
+| Client verification | `apache-airflow-client` 3.1.0 exercised DAG lookup, run triggering and polling, task instances, and logs |
 
 Save a local workflow as `dag.json`.
 
@@ -263,9 +305,18 @@ curl -fsS -H 'Content-Type: application/json' \
 curl -fsS http://127.0.0.1:8080/api/v2/dags/demo/dagRuns/manual__demo
 ```
 
-One worker runs commands registered in local JSON DAGs. Tasks can declare `upstream` dependencies, retries, and timeouts. DAGs can use fixed intervals with `schedule_seconds`. The Airflow 3 API exposes DAGs, runs, task instances, and attempt logs. Pass `--openlineage-url http://127.0.0.1:5000/api/v1/lineage` to send task events to the collector. [Airflow public REST API](https://airflow.apache.org/docs/apache-airflow/stable/stable-rest-api-ref.html)
+Pass `--openlineage-url http://127.0.0.1:5000/api/v1/lineage` to send task events to the collector. [Airflow public REST API](https://airflow.apache.org/docs/apache-airflow/stable/stable-rest-api-ref.html)
 
 ### OpenMetadata
+
+| Area | Supported scope |
+| --- | --- |
+| Catalog entities | Database, pipeline, and messaging services, databases, schemas, tables, pipelines, topics, and users |
+| Entity lifecycle | Create and update, UUID and fully qualified name lookup, cursor pagination, JSON Patch, version history, soft and hard delete, and restore |
+| Search | `/api/v1/search/query` and `/api/v1/search/fieldQuery` with basic text and wildcard matching |
+| Lineage | Create, read, and delete edges, optionally with column mappings. Traverse up to three hops per direction. |
+| Authentication and persistence | Optional fixed bearer token via `--password-file`. `--db-file` stores catalog entities and lineage in SQLite. |
+| Client verification | The Python SDK from `openmetadata-ingestion` 2.0.9.0 exercised catalog writes, pagination, search, patch, and lineage |
 
 ```sh
 python3 openmetadata_server.py --db-file metadata.sqlite3
@@ -277,7 +328,7 @@ Check the API version from another terminal.
 curl -fsS http://127.0.0.1:8585/api/v1/system/version
 ```
 
-The catalog stores database service, database, schema, table, pipeline, and messaging entities. The API supports UUID and fully qualified name lookups, cursor pagination, JSON Patch, change history, search, and directional lineage queries with optional column-level details. Point an OpenMetadata Python SDK client at `http://127.0.0.1:8585/api` and use `--password-file` to require a bearer token. [Python SDK](https://docs.open-metadata.org/v2.0.x/api-reference/sdk/python) · [Lineage API](https://docs.open-metadata.org/v2.0.x/api-reference/lineage/get)
+Point an OpenMetadata Python SDK client at `http://127.0.0.1:8585/api`. [Python SDK](https://docs.open-metadata.org/v2.0.x/api-reference/sdk/python) · [Lineage API](https://docs.open-metadata.org/v2.0.x/api-reference/lineage/get)
 
 ## Development
 
