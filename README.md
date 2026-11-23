@@ -66,6 +66,7 @@ python3 mongo_server.py shell --eval '{"ping": 1}'
 | Apache Airflow | `http://127.0.0.1:8080/api/v2` | [`airflow_server.py`](airflow_server.py) |
 | OpenMetadata | `http://127.0.0.1:8585/api/v1` | [`openmetadata_server.py`](openmetadata_server.py) |
 | Apache Kafka | `127.0.0.1:9092` | [`kafka_server.py`](kafka_server.py) |
+| Apache Spark Standalone | `http://127.0.0.1:6066` | [`spark_server.py`](spark_server.py) |
 
 The servers bind to loopback by default. Use `--port 0` to pick an available port and read it from the startup message. MongoDB, Neo4j, Redis, and Nexus Repository accept `--password-file` for their test accounts. These four servers keep data in memory by default, and the examples use `--db-file` to persist it.
 
@@ -372,6 +373,65 @@ consumer.close()
 ```
 
 Set `--advertised-host` when clients connect using a hostname different from the listen address. [Kafka protocol](https://kafka.apache.org/42/design/protocol/) · [Record batch format](https://kafka.apache.org/42/implementation/message-format/)
+
+### Apache Spark Standalone
+
+| Area | Supported scope |
+| --- | --- |
+| Submission API | Submit, inspect, and cancel jobs through `/v1/submissions`. Set `appResource` to a configured job name and `mainClass` to `jjap.LocalSqlJob`. Jobs can be canceled until output publication starts. |
+| SQL | One worker runs read-only SQLite queries over registered tables, including filters, joins, grouping, and aggregation. Queries, destinations, and `timeout_seconds` come from the local config. |
+| Files | Typed CSV and JSON Lines with `string`, `int`, `long`, `double`, and `boolean` columns. Relative paths resolve against the config directory. Set `overwrite: true` on a file output to replace an existing file atomically. |
+| Iceberg | Read snapshots and append to existing local Iceberg v2 tables using the optional `iceberg_server.py` CLI companion. Set `--iceberg-cli` to select the companion path. |
+| State and access | `--db-file` persists submission state. Queued jobs resume with the same configuration, and interrupted active jobs are marked `ERROR`. Set `--password-file` to require a bearer token. |
+
+Save this job as `jobs.json`.
+
+```json
+{
+  "jobs": {
+    "daily-total": {
+      "inputs": {
+        "events": {
+          "format": "csv",
+          "path": "events.csv",
+          "schema": {"label": "string", "amount": "long"}
+        }
+      },
+      "sql": "SELECT label, sum(amount) AS total FROM events GROUP BY label",
+      "output": {
+        "format": "jsonl",
+        "path": "totals.jsonl",
+        "schema": {"label": "string", "total": "long"}
+      }
+    }
+  }
+}
+```
+
+Create the input beside `jobs.json` and start the server.
+
+```sh
+printf 'label,amount\nbooks,2\nbooks,3\n' > events.csv
+python3 spark_server.py --config jobs.json --db-file spark.sqlite3
+```
+
+Submit the job from another terminal.
+
+```sh
+curl -fsS -H 'Content-Type: application/json' \
+  -d '{
+    "action": "CreateSubmissionRequest",
+    "appResource": "daily-total",
+    "mainClass": "jjap.LocalSqlJob",
+    "clientSparkVersion": "4.1.1",
+    "sparkProperties": {},
+    "environmentVariables": {},
+    "appArgs": []
+  }' \
+  http://127.0.0.1:6066/v1/submissions/create
+```
+
+Use the returned `submissionId` in `GET /v1/submissions/status/<id>` to inspect the job or `POST /v1/submissions/kill/<id>` to cancel it. The completed job writes `totals.jsonl`. [Spark Standalone REST API](https://spark.apache.org/docs/latest/spark-standalone.html#rest-api)
 
 ## Development
 
