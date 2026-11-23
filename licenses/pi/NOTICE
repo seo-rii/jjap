@@ -1,0 +1,36 @@
+pi-standalone
+
+Independent fork of Pi v1.3.0 by Mario Zechner and contributors.
+Upstream: https://github.com/earendil-works/pi
+Baseline commit: 71023aec1546d6d677a65669c5665c0927ce0dd0
+The upstream MIT copyright and permission notice are retained in LICENSE.
+
+Changes for pi-standalone include single-file Node packaging, embedded resources
+and workers, in-memory Photon/Babel decompression, a private Jiti extension
+module graph, a TypeBox constructor guard adjustment for minified classes,
+Rust/WASM search integration, and native-platform adapters. Dependency JavaScript
+is bundled and minified while function and class names are preserved.
+
+Third-party software retains its original licenses and attribution notices.
+The generated search WASM includes its Rust dependency/toolchain notices in
+packages/tui/src/standalone-search-wasm-data.ts. Additional prebuilt-component
+notices and reviewed package-license supplements are in
+scripts/standalone-notices/. The builder includes these and installed package
+notices in the single JavaScript artifact; these notices are not replaced by
+this project's MIT license.
+
+The independent DOOM overlay demonstration includes a separately packaged
+GPLv3-or-later engine (its input files retain their GPLv2-or-later and
+GPLv3-or-later notices). Pi's core and packaging code retain their own licenses.
+Complete corresponding source for the rebuilt DOOM component is provided in
+scripts/standalone-notices/doom-corresponding-source.tar.gz and as the same-named
+asset beside pi-standalone.mjs at:
+https://github.com/seo-rii/pi-standalone/releases/tag/standalone-v1.3.0-preview.1
+The archive also identifies the public historical sources and original build
+files associated with the inherited upstream example binaries. A third party
+redistributing those binaries must preserve the applicable license notices and
+provide the corresponding source under the component's license terms.
+
+The published upstream records do not reconstruct a complete build inventory
+for every prebuilt component. See PUBLICATION.md and the notice manifests for
+the exact available evidence and the remaining provenance limitations.
