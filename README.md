@@ -124,4 +124,4 @@ python3 iceberg_test_server.py --warehouse ./warehouse snapshots demo.events
 - Pi의 DOOM 예제 대응 소스 `doom-corresponding-source.tar.gz`는 실행 파일과 같은 릴리스에 있습니다. [원본 릴리스](https://github.com/seo-rii/pi-standalone/releases/tag/standalone-v1.3.0-preview.2) · [라이선스 및 고지](licenses/pi/)
 - OpenCode는 전체판과 경량판의 제삼자 고지를 각각 제공합니다. [전체판 소스](https://github.com/seo-rii/opencode-standalone/tree/9b8be1342f1562aa15ec3b724bbbb8d219cdf696) · [경량판 소스](https://github.com/seo-rii/opencode-standalone/tree/75325db60f7d6c728fdb65881b515ad4328509ec) · [라이선스 및 고지](licenses/opencode/)
 - Hermes의 제삼자 라이선스는 각 실행 파일에 포함되어 있습니다. [원본 소스](https://github.com/seo-rii/hermes-standalone/tree/fe98d0bd3e3628ac5a32c9cda07eb966b9313911) · [라이선스](licenses/hermes/LICENSE)
-- MongoDB 테스트 서버는 기존 단일 파일을 그대로 가져왔습니다. [원본 소스](https://github.com/seo-rii/mongo-test-server/tree/207ddeefc8098bd694803cc2f5aeb9e06edd39b5)
+- MongoDB 테스트 서버의 초기 배포 파일은 `v0.1.0` 태그에서 확인할 수 있습니다. [초기 배포 소스](https://github.com/seo-rii/jjap/blob/v0.1.0/mongo_test_server.py)
