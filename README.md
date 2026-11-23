@@ -1,10 +1,10 @@
 # jjap
 
-Pi, OpenCode, Hermes와 MongoDB 호환 테스트 서버의 단일 파일 실행 버전을 모았습니다. 필요한 파일 하나를 받아 해당 런타임으로 실행할 수 있습니다.
+Pi, OpenCode, Hermes의 단일 파일 실행 버전과 MongoDB, Neo4j, Redis, Nexus Repository 호환 테스트 서버를 모았습니다. 필요한 파일 하나를 받아 해당 런타임으로 실행할 수 있습니다.
 
 ## 다운로드
 
-모든 실행 파일은 [GitHub Releases v0.1.0](https://github.com/seo-rii/jjap/releases/tag/v0.1.0)에서 받을 수 있습니다. MongoDB 테스트 서버의 Python 파일은 [저장소](mongo_test_server.py)에도 있습니다.
+아래 실행 파일은 [GitHub Releases v0.1.0](https://github.com/seo-rii/jjap/releases/tag/v0.1.0)에서 받을 수 있습니다. Python 테스트 서버는 저장소에서도 받을 수 있습니다.
 
 | 도구 | 파일 | 런타임 |
 | --- | --- | --- |
@@ -34,6 +34,41 @@ python3 mongo_test_server.py --port 27017
 - OpenCode 전체판은 웹 UI를 포함합니다. 경량판은 CLI, TUI, HTTP API를 제공합니다.
 - Hermes 전체판은 로컬 음성 모델과 전체 Google API 정의 캐시를 포함합니다. 경량판은 로컬 Piper 모델과 사전을 빼고 Google Chat API 정의만 내장합니다. `.py`와 `.pyz`에 같은 실행 옵션을 사용합니다.
 - MongoDB 테스트 서버는 기본적으로 `127.0.0.1`에서 메모리로 동작합니다. `mongodb://127.0.0.1:27017`로 접속하거나 내장 셸에서 `python3 mongo_test_server.py shell --eval '{"ping": 1}'`을 실행할 수 있습니다. `--db-file test.sqlite3`를 지정하면 테스트 데이터를 보존합니다.
+
+## Neo4j, Redis, Nexus Repository 테스트 서버
+
+각 서버는 Python 3.10 이상의 표준 라이브러리로 실행됩니다. 기본 설정은 루프백 주소와 메모리 저장입니다. `--db-file`에 서버별 파일을 지정하면 재시작 후 데이터를 다시 읽을 수 있고, `--port 0`은 비어 있는 포트를 선택해 시작 메시지에 표시합니다.
+
+| 서버 | 기본 주소 | 실행 파일 |
+| --- | --- | --- |
+| Neo4j | `bolt://127.0.0.1:7687` | [`neo4j_test_server.py`](neo4j_test_server.py) |
+| Redis | `redis://127.0.0.1:6379` | [`redis_test_server.py`](redis_test_server.py) |
+| Nexus Repository | `http://127.0.0.1:8081` | [`nexus_test_server.py`](nexus_test_server.py) |
+
+```sh
+python3 neo4j_test_server.py --db-file graph.sqlite3
+python3 redis_test_server.py --db-file redis.json
+python3 nexus_test_server.py --db-file nexus.sqlite3
+```
+
+서버는 각각 별도 터미널에서 시작합니다. `--password-file`로 테스트 계정의 암호를 지정할 수 있습니다.
+
+- **Neo4j**는 Bolt 4.4와 5.0~5.4, 노드·관계 생성 및 조회, 파라미터, 경로 검색, 집계, 트랜잭션, 일부 인덱스·제약조건 명령을 지원합니다. `bolt://`로 직접 접속하거나 `neo4j://`로 같은 노드에 라우팅할 수 있습니다. 스키마 인덱스는 메타데이터로 기록하며 조회는 그래프를 순회합니다. Cypher 전체 문법, APOC, 분산 클러스터는 지원 범위 밖입니다. [Bolt 명세](https://neo4j.com/docs/bolt/current/bolt/handshake/)
+- **Redis**는 RESP2와 RESP3, 문자열·해시·리스트·집합·정렬 집합·스트림, TTL, 스캔, 트랜잭션과 `WATCH`, Pub/Sub를 지원합니다. `--cluster`는 모든 슬롯을 단일 노드에 배정해 Redis Cluster 클라이언트로 연결할 수 있게 합니다. `--db-file` 사용 시 `SAVE` 또는 정상 종료로 JSON 스냅샷을 기록합니다. 복제, Sentinel, Lua, 모듈은 지원 범위 밖입니다. [RESP 명세](https://redis.io/docs/latest/develop/reference/protocol-spec/)
+- **Nexus Repository**는 Raw, Maven, PyPI, npm의 호스티드 저장소와 그룹, Raw·Maven HTTP 프록시 캐시, Docker/OCI 레지스트리, 저장소·컴포넌트·에셋 REST API를 제공합니다. 기본 저장소는 `raw-hosted`, `maven-releases`, `maven-snapshots`, `maven-public`, `pypi-hosted`, `npm-hosted`, `docker-hosted`입니다. Nexus 관리 UI, 역할 기반 권한 관리, 백그라운드 작업 스케줄링은 지원 범위 밖입니다. [Nexus Repository API](https://help.sonatype.com/en/api-reference.html) · [OCI Distribution 명세](https://github.com/opencontainers/distribution-spec/blob/main/spec.md)
+
+Nexus의 기본 `raw-hosted` 저장소는 `curl`로 확인할 수 있습니다. PyPI 인덱스는 `/repository/pypi-hosted/simple/`, npm 레지스트리는 `/repository/npm-hosted/`, Docker/OCI 이미지 주소는 `127.0.0.1:8081/docker-hosted/<이미지>:<태그>`를 사용합니다. HTTPS를 요구하는 클라이언트에는 `--tls-cert`와 `--tls-key`를 지정합니다.
+
+```sh
+curl --fail --upload-file fixture.bin http://127.0.0.1:8081/repository/raw-hosted/fixture.bin
+curl --fail http://127.0.0.1:8081/repository/raw-hosted/fixture.bin
+```
+
+네트워크와 재시작 통합 테스트도 별도 패키지 없이 실행됩니다.
+
+```sh
+python3 -B -m unittest discover -s tests -v
+```
 
 ## 원본과 라이선스
 
