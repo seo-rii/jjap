@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A single-node Neo4j-compatible test server for Python 3.10+.
 
-Run: python3 neo4j_test_server.py --port 7687
+Run: python3 neo4j_server.py --port 7687
 Connect over bolt://127.0.0.1:7687 or neo4j://127.0.0.1:7687.
 Data is in memory unless --db-file graph.sqlite3 is supplied. If
 --password-file is supplied, use basic authentication with --username
@@ -2331,7 +2331,7 @@ def main():
         finally:
             store.close()
     except (OSError, ProtocolError, sqlite3.Error) as exc:
-        parser.exit(1, f"neo4j_test_server: {exc}\n")
+        parser.exit(1, f"{parser.prog}: {exc}\n")
 
 
 if __name__ == "__main__":

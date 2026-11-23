@@ -14,7 +14,7 @@ import threading
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "iceberg_test_server.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "iceberg_server.py"
 NAMESPACE = ("sample",)
 TABLE = "events"
 IDENTIFIER = ".".join((*NAMESPACE, TABLE))

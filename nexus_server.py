@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Single-file Nexus Repository-compatible test server for Python 3.10+.
 
-Run: python3 nexus_test_server.py --port 8081
+Run: python3 nexus_server.py --port 8081
 REST: http://127.0.0.1:8081/service/rest/v1/repositories
 Raw upload: curl -T example.bin http://127.0.0.1:8081/repository/raw-hosted/example.bin
 OCI registry: 127.0.0.1:8081/docker-hosted/example/image:tag

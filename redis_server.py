@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A single-file, standard-library Redis-compatible test server for Python 3.10+.
 
-Run: python3 redis_test_server.py --port 6379
+Run: python3 redis_server.py --port 6379
 Use --port 0 for an ephemeral port. Data is in memory by default. With
 --db-file, SAVE and orderly shutdown write an atomic JSON snapshot.
 Set REDIS_TEST_PASSWORD or use --password-file to require AUTH.

@@ -145,7 +145,7 @@ class StandaloneServerTests(unittest.TestCase):
         return running_server(script, self.directory, "--db-file", self.db_file)
 
     def test_redis_pipeline_binary_watch_and_restart(self):
-        script = "redis_test_server.py"
+        script = "redis_server.py"
         with self.server(script) as port:
             with (
                 socket.create_connection((HOST, port), timeout=5) as first,
@@ -175,7 +175,7 @@ class StandaloneServerTests(unittest.TestCase):
                 self.assertEqual(reply.read(8), b"$2\r\n10\r\n")
 
     def test_redis_single_node_cluster_enforces_hash_slots(self):
-        script = "redis_test_server.py"
+        script = "redis_server.py"
         with running_server(script, self.directory, "--cluster") as port:
             with socket.create_connection((HOST, port), timeout=5) as sock, sock.makefile("rb") as reply:
                 sock.sendall(
@@ -191,7 +191,7 @@ class StandaloneServerTests(unittest.TestCase):
                 self.assertTrue(reply.readline().startswith(b"-CROSSSLOT "))
 
     def test_neo4j_graph_rollback_and_restart(self):
-        script = "neo4j_test_server.py"
+        script = "neo4j_server.py"
         with self.server(script) as port, bolt_session(port) as bolt:
             records = bolt.execute("CREATE (n:Example {name: 'kept'}) RETURN n.name AS name")
             self.assertEqual(records, [b"\x91\x84kept"])
@@ -211,7 +211,7 @@ class StandaloneServerTests(unittest.TestCase):
             self.assertEqual(records, [b"\x91\x84kept"])
 
     def test_nexus_raw_content_search_and_restart(self):
-        script = "nexus_test_server.py"
+        script = "nexus_server.py"
         path = "/repository/raw-hosted/jjap/fixture.bin"
         content = b"\x00nexus\r\n\xff"
         with self.server(script) as port:
@@ -227,7 +227,7 @@ class StandaloneServerTests(unittest.TestCase):
             self.assertEqual((status, body), (200, content))
 
     def test_nexus_oci_digest_chunked_upload_and_pull(self):
-        script = "nexus_test_server.py"
+        script = "nexus_server.py"
         image = "/v2/docker-hosted/jjap/example"
         content = b"{}"
         digest = "sha256:" + hashlib.sha256(content).hexdigest()

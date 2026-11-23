@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """A standalone MongoDB test server using only the Python 3.10+ standard library.
 
-Run: python3 mongo_test_server.py --port 27017
+Run: python3 mongo_server.py --port 27017
 URI: mongodb://127.0.0.1:27017
 Add --db-file test.sqlite3 to retain databases between runs. Use a dedicated file.
-Export: python3 mongo_test_server.py export --db-file test.sqlite3 --out dump
+Export: python3 mongo_server.py export --db-file test.sqlite3 --out dump
 Add --format dbpath to export a WiredTiger directory using mongod and mongorestore.
 The default listener is loopback. Use --password to prompt for a password,
 --password-file to read one from a file, or set MONGO_TEST_PASSWORD. These enable
@@ -12,8 +12,8 @@ one test account with access to every database. The default username and
 authentication database are both admin. See --username and --auth-db to change
 them. --tls-cert accepts a PEM certificate and an optional separate --tls-key.
 
-Connect: python3 mongo_test_server.py shell -u admin -p -d test
-Run a command: python3 mongo_test_server.py shell --eval '{"ping": 1}'
+Connect: python3 mongo_server.py shell -u admin -p -d test
+Run a command: python3 mongo_server.py shell --eval '{"ping": 1}'
 The shell accepts MongoDB Extended JSON, simple commands, and piped input.
 
 Supports the MongoDB 8.0 wire interface for CRUD, cursors, collection and client
@@ -5835,7 +5835,7 @@ class MongoEngine:
 
     def cmd_cmd_line_opts(self, _db, _command, _connection):
         return {
-            "argv": ["mongo_test_server.py"],
+            "argv": ["mongo_server.py"],
             "parsed": {
                 "net": {
                     "bindIp": self.settings.get("host", "127.0.0.1"),

@@ -9,24 +9,24 @@ Clone the repository and start the MongoDB test server on `127.0.0.1:27017`.
 ```sh
 git clone https://github.com/seo-rii/jjap.git
 cd jjap
-python3 mongo_test_server.py --db-file test.sqlite3
+python3 mongo_server.py --db-file test.sqlite3
 ```
 
 In a second terminal, run a ping from the repository directory.
 
 ```sh
-python3 mongo_test_server.py shell --eval '{"ping": 1}'
+python3 mongo_server.py shell --eval '{"ping": 1}'
 ```
 
 ## Test servers
 
 | Server | Default endpoint | Source |
 | --- | --- | --- |
-| MongoDB | `mongodb://127.0.0.1:27017` | [`mongo_test_server.py`](mongo_test_server.py) |
-| Neo4j | `bolt://127.0.0.1:7687` | [`neo4j_test_server.py`](neo4j_test_server.py) |
-| Redis | `redis://127.0.0.1:6379` | [`redis_test_server.py`](redis_test_server.py) |
-| Nexus Repository | `http://127.0.0.1:8081` | [`nexus_test_server.py`](nexus_test_server.py) |
-| Apache Iceberg | `http://127.0.0.1:8181` | [`iceberg_test_server.py`](iceberg_test_server.py) |
+| MongoDB | `mongodb://127.0.0.1:27017` | [`mongo_server.py`](mongo_server.py) |
+| Neo4j | `bolt://127.0.0.1:7687` | [`neo4j_server.py`](neo4j_server.py) |
+| Redis | `redis://127.0.0.1:6379` | [`redis_server.py`](redis_server.py) |
+| Nexus Repository | `http://127.0.0.1:8081` | [`nexus_server.py`](nexus_server.py) |
+| Apache Iceberg | `http://127.0.0.1:8181` | [`iceberg_server.py`](iceberg_server.py) |
 
 The servers bind to loopback by default. Use `--port 0` to pick an available port and read it from the startup message. MongoDB, Neo4j, Redis, and Nexus Repository accept `--password-file` for their test accounts. These four servers keep data in memory by default, and the examples use `--db-file` to persist it.
 
@@ -37,13 +37,13 @@ Connect with a MongoDB client or use the built-in `shell` command.
 Run `export` to capture a committed SQLite snapshot. It writes `.bson` and `.metadata.json` files into a new directory for `mongorestore`. The dump preserves BSON types, collection options, index definitions, and views. Use `--db` to select one database. [MongoDB dump format](https://www.mongodb.com/docs/database-tools/mongodump/mongodump-behavior/)
 
 ```sh
-python3 mongo_test_server.py export --db-file test.sqlite3 --out ./dump
+python3 mongo_server.py export --db-file test.sqlite3 --out ./dump
 ```
 
 To export a WiredTiger `dbPath`, install `mongod` and `mongorestore` on a system with Unix domain sockets. Open the result with the same version of `mongod` that created it. Use `--mongod` and `--mongorestore` to specify executable paths.
 
 ```sh
-python3 mongo_test_server.py export --db-file test.sqlite3 --out ./mongo-data --format dbpath
+python3 mongo_server.py export --db-file test.sqlite3 --out ./mongo-data --format dbpath
 mongod --dbpath ./mongo-data --bind_ip 127.0.0.1 --port 27018
 ```
 
@@ -52,7 +52,7 @@ Exports cover ordinary collections and views. The exporter converts nonstandard 
 ### Neo4j
 
 ```sh
-python3 neo4j_test_server.py --db-file graph.sqlite3
+python3 neo4j_server.py --db-file graph.sqlite3
 ```
 
 The server supports Bolt 4.4 and 5.0–5.4. Use `bolt://` for a direct connection or `neo4j://` for routing to the same node. The Cypher subset covers node and relationship operations, parameters, path matching, aggregation, transactions, and selected index and constraint commands. Index definitions are stored as metadata and queries scan the graph. Tests that rely on full Cypher, APOC, or distributed clustering require Neo4j. [Bolt protocol specification](https://neo4j.com/docs/bolt/current/bolt/handshake/)
@@ -60,7 +60,7 @@ The server supports Bolt 4.4 and 5.0–5.4. Use `bolt://` for a direct connectio
 ### Redis
 
 ```sh
-python3 redis_test_server.py --db-file redis.json
+python3 redis_server.py --db-file redis.json
 ```
 
 The server supports RESP2 and RESP3, strings, hashes, lists, sets, sorted sets, streams, key expiration, scans, transactions with `WATCH`, and Pub/Sub. Pass `--cluster` to assign all slots to a single node for Redis Cluster clients. With `--db-file`, `SAVE` and clean shutdown write a JSON snapshot. Tests that rely on replication, Sentinel, Lua, or modules require Redis. [RESP specification](https://redis.io/docs/latest/develop/reference/protocol-spec/)
@@ -68,7 +68,7 @@ The server supports RESP2 and RESP3, strings, hashes, lists, sets, sorted sets, 
 ### Nexus Repository
 
 ```sh
-python3 nexus_test_server.py --db-file nexus.sqlite3
+python3 nexus_server.py --db-file nexus.sqlite3
 ```
 
 The server provides hosted and group repositories for Raw, Maven, PyPI, and npm, HTTP proxy caching for Raw and Maven, a Docker/OCI registry, and REST endpoints for repositories, components, and assets. UI, role-based access control, and scheduled jobs require Nexus Repository. [Nexus Repository API](https://help.sonatype.com/en/api-reference.html) · [OCI Distribution Specification](https://github.com/opencontainers/distribution-spec/blob/main/spec.md)
@@ -91,7 +91,7 @@ curl --fail http://127.0.0.1:8081/repository/raw-hosted/fixture.bin
 ### Apache Iceberg
 
 ```sh
-python3 iceberg_test_server.py --warehouse ./warehouse serve
+python3 iceberg_server.py --warehouse ./warehouse serve
 ```
 
 The server exposes an Iceberg v2 REST catalog and provides CLI commands for local file operations. SQLite tracks the current metadata location. The warehouse holds versioned JSON metadata, Avro manifests and manifest lists, and Parquet data files. The catalog and its clients need access to the same local `file://` paths. The server returns HTTP `409` when a commit requirement fails. [Iceberg table specification](https://iceberg.apache.org/spec/) · [REST catalog specification](https://iceberg.apache.org/rest-catalog-spec/)
@@ -106,12 +106,12 @@ Use the same warehouse for the CLI and the REST server. If you pass `--db-file`,
 ```
 
 ```sh
-python3 iceberg_test_server.py --warehouse ./warehouse create-table demo.events --schema schema.json
+python3 iceberg_server.py --warehouse ./warehouse create-table demo.events --schema schema.json
 printf '%s\n' '{"id":1,"label":"first"}' '{"id":2,"label":"second"}' |
-  python3 iceberg_test_server.py --warehouse ./warehouse append demo.events -
-python3 iceberg_test_server.py --warehouse ./warehouse scan demo.events --columns id,label
-python3 iceberg_test_server.py --warehouse ./warehouse delete demo.events --where '{"id":1}'
-python3 iceberg_test_server.py --warehouse ./warehouse snapshots demo.events
+  python3 iceberg_server.py --warehouse ./warehouse append demo.events -
+python3 iceberg_server.py --warehouse ./warehouse scan demo.events --columns id,label
+python3 iceberg_server.py --warehouse ./warehouse delete demo.events --where '{"id":1}'
+python3 iceberg_server.py --warehouse ./warehouse snapshots demo.events
 ```
 
 - **Snapshots and deletes.** Read an earlier snapshot with `scan --snapshot-id`. Pass column-value equality predicates as JSON with `--where`. The `delete` command rewrites live data into new files and keeps the files referenced by earlier snapshots. Scans also apply Iceberg v2 position and equality delete files.
@@ -148,7 +148,7 @@ python3 mongo_test_server.py --port 27017
 - The full OpenCode build includes the web UI. The lite build provides the CLI, TUI, and HTTP API.
 - The full Hermes build includes local Piper voice models, dictionaries, and the full Google API discovery cache. The lite build bundles one Google API discovery document for Google Chat. The `.py` and `.pyz` builds accept the same options.
 
-For MongoDB export support, use the current [`mongo_test_server.py`](mongo_test_server.py) from this repository.
+For MongoDB export support, use the current [`mongo_server.py`](mongo_server.py) from this repository.
 
 ## Development
 

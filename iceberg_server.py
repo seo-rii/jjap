@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Standalone Apache Iceberg v2 REST catalog and local file tools (Python 3.10+).
 
-Start: python3 iceberg_test_server.py --warehouse ./warehouse serve
+Start: python3 iceberg_server.py --warehouse ./warehouse serve
 Use create-table, append, scan, delete and snapshots for local file operations.
 
 Protocol references:

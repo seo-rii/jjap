@@ -16,7 +16,7 @@ from urllib.parse import quote_plus
 from uuid import UUID
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "mongo_test_server.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "mongo_server.py"
 
 
 class MongoExportTests(unittest.TestCase):
