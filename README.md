@@ -1,6 +1,6 @@
 # jjap
 
-Pi, OpenCode, Hermes의 단일 파일 실행 버전과 MongoDB, Neo4j, Redis, Nexus Repository 호환 테스트 서버를 모았습니다. 필요한 파일 하나를 받아 해당 런타임으로 실행할 수 있습니다.
+Pi, OpenCode, Hermes의 단일 파일 실행 버전과 MongoDB, Neo4j, Redis, Nexus Repository, Apache Iceberg 호환 테스트 서버를 모았습니다. 필요한 파일 하나를 받아 해당 런타임으로 실행할 수 있습니다.
 
 ## 다운로드
 
@@ -69,6 +69,38 @@ curl --fail http://127.0.0.1:8081/repository/raw-hosted/fixture.bin
 ```sh
 python3 -B -m unittest discover -s tests -v
 ```
+
+## Apache Iceberg 테스트 서버
+
+[`iceberg_test_server.py`](iceberg_test_server.py)는 Python 3.10 이상 표준 라이브러리로 Iceberg v2 REST 카탈로그와 로컬 파일 처리를 제공합니다. SQLite로 현재 메타데이터를 관리하고, 웨어하우스에 버전별 JSON 메타데이터, Avro 매니페스트·매니페스트 목록, Parquet 데이터 파일을 저장합니다. 카탈로그와 클라이언트는 같은 로컬 `file://` 경로에 접근해야 합니다. [Iceberg 테이블 명세](https://iceberg.apache.org/spec/) · [REST 카탈로그 명세](https://iceberg.apache.org/rest-catalog-spec/)
+
+```sh
+python3 iceberg_test_server.py --warehouse ./warehouse serve
+```
+
+REST 카탈로그 주소는 `http://127.0.0.1:8181`입니다. 같은 웨어하우스에 CLI로 직접 쓸 수 있고, `--db-file`을 지정했다면 양쪽에 같은 경로를 사용합니다. 커밋 전제 조건이 맞지 않으면 HTTP `409`를 반환해 이전 커밋을 보호합니다.
+
+아래 필드 배열을 `schema.json`에 저장합니다.
+
+```json
+[
+  {"id": 1, "name": "id", "required": true, "type": "long"},
+  {"id": 2, "name": "label", "required": false, "type": "string"}
+]
+```
+
+```sh
+python3 iceberg_test_server.py --warehouse ./warehouse create-table demo.events --schema schema.json
+printf '%s\n' '{"id":1,"label":"first"}' '{"id":2,"label":"second"}' |
+  python3 iceberg_test_server.py --warehouse ./warehouse append demo.events -
+python3 iceberg_test_server.py --warehouse ./warehouse scan demo.events --columns id,label
+python3 iceberg_test_server.py --warehouse ./warehouse delete demo.events --where '{"id":1}'
+python3 iceberg_test_server.py --warehouse ./warehouse snapshots demo.events
+```
+
+- `scan --snapshot-id`로 과거 스냅샷을 읽을 수 있습니다. `--where`는 컬럼별 동등 조건을 받습니다. `delete`는 현재 데이터를 새 파일로 다시 쓰고 기존 스냅샷의 파일을 보존합니다. 스캔할 때 v2 position delete와 equality delete 파일도 적용합니다.
+- 파일 처리는 평면 기본 타입과 identity·bucket·truncate·year·month·day·hour 파티션을 지원합니다. JSON에서 날짜·시간은 ISO 문자열, decimal은 문자열, binary·fixed는 Base64 문자열을 사용합니다. Python 달력 범위를 벗어난 날짜와 타임스탬프는 각각 Unix epoch 기준 일수와 마이크로초 정수로 보존합니다.
+- Parquet 쓰기는 비압축을 사용합니다. 읽기는 비압축·Snappy·GZIP과 Python 3.14 이상의 ZSTD를 지원합니다. 카탈로그가 만드는 테이블은 외부 클라이언트의 기본 쓰기 코덱을 Snappy로 설정합니다. 파일 처리 범위는 로컬 웨어하우스의 평면 Parquet와 Avro 매니페스트입니다. [Parquet 파일 포맷](https://parquet.apache.org/docs/file-format/) · [Avro 명세](https://avro.apache.org/docs/current/specification/)
 
 ## 원본과 라이선스
 
