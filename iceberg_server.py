@@ -4,6 +4,7 @@
 Start: python3 iceberg_server.py --warehouse ./warehouse serve
 Use create-table, append, scan, delete and snapshots for local file operations.
 Use serve-polaris for a Polaris-compatible catalog with FILE storage.
+Use export (SQL catalog database) or migrate (any REST catalog) to hand the tables to real catalogs.
 
 Protocol references:
 https://iceberg.apache.org/spec/
@@ -43,8 +44,9 @@ import zlib
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
-from urllib.request import url2pathname
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
+from urllib.request import Request, url2pathname, urlopen
 
 
 # Iceberg v2 table metadata and REST catalog.
@@ -226,6 +228,20 @@ def _catalog_metadata(location):
         "metadata-log": [],
         "refs": {},
     }
+
+
+def _catalog_metadata_file(path):
+    try:
+        opener = gzip.open if path.name.endswith((".gz", ".gz.metadata.json")) else open
+        with opener(path, "rb") as source:
+            raw = source.read(32 * 1024 * 1024 + 1)
+        if len(raw) > 32 * 1024 * 1024:
+            raise IcebergCatalogError("Table metadata exceeds the 32 MiB limit")
+        return _catalog_object(json.loads(raw), "Table metadata")
+    except (ValueError, OSError, EOFError) as exc:
+        if isinstance(exc, IcebergCatalogError):
+            raise
+        raise IcebergCatalogError(f"Could not read metadata file {path.name!r}") from exc
 
 
 def _catalog_response(metadata, location):
@@ -435,18 +451,7 @@ class IcebergCatalog:
             ]
 
     def _read_metadata(self, location):
-        path = self.local_path(location)
-        try:
-            opener = gzip.open if path.name.endswith((".gz", ".gz.metadata.json")) else open
-            with opener(path, "rb") as source:
-                raw = source.read(32 * 1024 * 1024 + 1)
-            if len(raw) > 32 * 1024 * 1024:
-                raise IcebergCatalogError("Table metadata exceeds the 32 MiB limit")
-            metadata = _catalog_object(json.loads(raw), "Table metadata")
-        except (ValueError, OSError, EOFError) as exc:
-            if isinstance(exc, IcebergCatalogError):
-                raise
-            raise IcebergCatalogError(f"Could not read metadata file {path.name!r}") from exc
+        metadata = _catalog_metadata_file(self.local_path(location))
         self._validate_metadata(metadata)
         return metadata
 
@@ -3555,6 +3560,320 @@ def _ice_json_rows(stream):
                 raise IcebergFileError(f"Invalid JSON on line {line_number}: {exc}") from exc
 
 
+# SQL catalog export and REST catalog migration.
+
+
+# Schema V1 shared by Iceberg Java JdbcCatalog and PyIceberg SqlCatalog; iceberg_type marks tables vs views.
+_SQL_CATALOG_SCHEMA = (
+    "CREATE TABLE iceberg_tables (catalog_name VARCHAR(255) NOT NULL, table_namespace VARCHAR(255) NOT NULL, "
+    "table_name VARCHAR(255) NOT NULL, metadata_location VARCHAR(1000), previous_metadata_location VARCHAR(1000), "
+    "iceberg_type VARCHAR(5), PRIMARY KEY (catalog_name, table_namespace, table_name))",
+    "CREATE TABLE iceberg_namespace_properties (catalog_name VARCHAR(255) NOT NULL, namespace VARCHAR(255) NOT NULL, "
+    "property_key VARCHAR(255) NOT NULL, property_value VARCHAR(1000) NOT NULL, "
+    "PRIMARY KEY (catalog_name, namespace, property_key))",
+)
+_ICE_CATALOG_COLUMNS = {
+    "iceberg_namespaces": {"namespace", "properties"},
+    "iceberg_tables": {"namespace", "name", "metadata_location", "version"},
+}
+_ICE_REGISTER_ENDPOINT = "POST /v1/{prefix}/namespaces/{namespace}/register"
+
+
+@contextmanager
+def _ice_read_snapshot(db_file, columns, kind, hint=""):
+    """Open an existing SQLite file read-only and keep one read transaction for a consistent snapshot."""
+    path = Path(db_file).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"{kind} not found: {path}{hint}")
+    connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, isolation_level=None)
+    try:
+        try:
+            connection.execute("BEGIN")
+            for table, required in columns.items():
+                if not required <= {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}:
+                    raise ValueError
+        except (ValueError, sqlite3.DatabaseError) as exc:
+            raise ValueError(f"{path} is not {kind}{hint}") from exc
+        yield connection
+    finally:
+        connection.close()
+
+
+def _ice_catalog_source(warehouse, db_file, polaris_catalog=None):
+    """Return the catalog warehouse, namespaces (parents first) and table pointers of a local catalog."""
+    warehouse = _catalog_local_path(warehouse)
+    hint = ""
+    if polaris_catalog is not None:
+        name = _polaris_name(polaris_catalog)
+        state = db_file or warehouse / ".polaris.sqlite3"
+        columns = {"polaris_catalogs": {"name", "payload", "location"}}
+        with _ice_read_snapshot(state, columns, "a Polaris test server SQLite persistence file") as connection:
+            row = connection.execute("SELECT payload FROM polaris_catalogs WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            raise ValueError(f"Polaris catalog {name!r} was not found")
+        warehouse = _catalog_local_path(json.loads(row[0])["properties"]["default-base-location"])
+        db_file = warehouse / ".iceberg-catalog.sqlite3"
+    elif db_file is None and (warehouse / ".polaris.sqlite3").is_file():
+        hint = " (use --polaris-catalog NAME for a serve-polaris warehouse)"
+    db_file = db_file or warehouse / ".iceberg-catalog.sqlite3"
+    with _ice_read_snapshot(db_file, _ICE_CATALOG_COLUMNS, "an Iceberg test server SQLite catalog", hint) as connection:
+        namespaces = [
+            (_catalog_namespace(json.loads(key)), _catalog_properties(json.loads(properties)))
+            for key, properties in connection.execute("SELECT namespace, properties FROM iceberg_namespaces")
+        ]
+        tables = [
+            (_catalog_namespace(json.loads(key)), _catalog_component(name), location)
+            for key, name, location in connection.execute("SELECT namespace, name, metadata_location FROM iceberg_tables")
+        ]
+    if any(not isinstance(location, str) or not location for *_, location in tables):
+        raise ValueError("A table has no metadata location")
+    namespaces.sort(key=lambda item: (len(item[0]), item[0]))
+    return warehouse, namespaces, sorted(tables)
+
+
+def _ice_warn_escaped(command, tables):
+    for namespace, name, location in tables:
+        if location.startswith("file:") and "%" in location:
+            print(f"Iceberg {command}: warning: table {'.'.join((*namespace, name))} has percent-encoded file URIs, "
+                  "which Iceberg Java and PyIceberg open without decoding", file=sys.stderr)
+
+
+def _ice_sql_namespace(namespace):
+    if any("." in part for part in namespace):
+        raise ValueError(f"Namespace {list(namespace)!r} has a level containing '.', which SQL catalogs split into levels")
+    return ".".join(namespace)
+
+
+def _ice_previous_metadata(location):
+    metadata = _catalog_metadata_file(_catalog_local_path(location))
+    log = _catalog_array(metadata.get("metadata-log", []), "metadata-log")
+    if not log:
+        return None
+    previous = _catalog_object(log[-1], "metadata-log entry").get("metadata-file")
+    if not isinstance(previous, str) or not previous:
+        raise IcebergCatalogError("Invalid metadata-log entry")
+    return previous
+
+
+def export_sql_catalog(namespaces, tables, catalog_name, destination):
+    """Write a new SQLite database in the JDBC/SQL catalog schema used by Iceberg Java and PyIceberg."""
+    connection = sqlite3.connect(destination, isolation_level=None)
+    try:
+        connection.execute("BEGIN")
+        for statement in _SQL_CATALOG_SCHEMA:
+            connection.execute(statement)
+        for namespace, properties in namespaces:
+            if properties.get("exists", "true") != "true":
+                raise ValueError(f"Namespace {'.'.join(namespace)!r} sets 'exists', which SQL catalogs reserve")
+            # Iceberg Java always stores the exists marker so a namespace survives removing all its properties.
+            rows = {"exists": "true", **properties}
+            connection.executemany(
+                "INSERT INTO iceberg_namespace_properties VALUES (?, ?, ?, ?)",
+                [(catalog_name, _ice_sql_namespace(namespace), key, value) for key, value in rows.items()],
+            )
+        for namespace, name, location in tables:
+            try:
+                previous = _ice_previous_metadata(location)
+            except IcebergCatalogError as exc:
+                raise ValueError(f"Table {'.'.join((*namespace, name))!r}: {exc}") from exc
+            connection.execute(
+                "INSERT INTO iceberg_tables VALUES (?, ?, ?, ?, ?, 'TABLE')",
+                (catalog_name, _ice_sql_namespace(namespace), name, location, previous),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _ice_export(args):
+    destination = args.out.expanduser().absolute()
+    if os.path.lexists(destination):
+        raise FileExistsError(f"Output file already exists: {destination}")
+    name = args.catalog_name or args.polaris_catalog or "default"
+    if not 0 < len(name) <= 255:
+        raise ValueError("--catalog-name must have 1 to 255 characters")
+    warehouse, namespaces, tables = _ice_catalog_source(args.warehouse, args.db_file, args.polaris_catalog)
+    _ice_warn_escaped("export", tables)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".iceberg-export-", dir=destination.parent) as temporary:
+        staged = Path(temporary) / "catalog.sqlite3"
+        export_sql_catalog(namespaces, tables, name, staged)
+        # A hard link publishes the complete file and, unlike rename, refuses an existing destination.
+        (os.rename if os.name == "nt" else os.link)(staged, destination)
+    print(f"Exported {len(tables)} tables in {len(namespaces)} namespaces to {destination} "
+          f"as SQL catalog {name!r} (warehouse {warehouse.as_uri()})")
+    return 0
+
+
+def _ice_secret_file(path, option):
+    value = path.expanduser().read_text(encoding="utf-8").rstrip("\r\n")
+    if not value or "\n" in value or "\r" in value or len(value) > 16384:
+        raise ValueError(f"{option} must contain one nonempty line")
+    return value
+
+
+def _ice_rest_error(status, data):
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict):
+        return f"HTTP {status} {error.get('type', 'error')}: {error.get('message', '')}"
+    if isinstance(error, str):
+        return f"HTTP {status} {error}"
+    return f"HTTP {status}"
+
+
+def _ice_location_key(location):
+    if isinstance(location, str) and location.startswith("file:"):
+        parts = urlsplit(location)
+        if parts.netloc in ("", "localhost") and not parts.query and not parts.fragment:
+            return unquote(parts.path)
+    return location
+
+
+class _IcebergRestTarget:
+    """Minimal Iceberg REST client: every response is returned as (status, JSON or None)."""
+
+    def __init__(self, url, timeout=60):
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.netloc or parts.query or parts.fragment:
+            raise ValueError("--target must be an http:// or https:// REST catalog base URL")
+        self.url = url.rstrip("/")
+        self.timeout = timeout
+        self.headers = {"Accept": "application/json"}
+        self.prefix = ""
+        self.separator = "%1F"
+
+    def path(self, *parts):
+        return "/".join(("/v1", *((self.prefix,) if self.prefix else ()), *parts))
+
+    def namespace(self, namespace):
+        # The separator arrives URL-encoded; each level is encoded on its own, as Iceberg's RESTUtil does.
+        return self.separator.join(quote(part, safe="") for part in namespace)
+
+    def call(self, method, path, body=None, *, form=None, url=None):
+        headers, data = dict(self.headers), None
+        if form is not None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            data = urlencode(form).encode("utf-8")
+        elif body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        target = url or self.url + path
+        try:
+            with urlopen(Request(target, data=data, method=method, headers=headers), timeout=self.timeout) as response:
+                status, payload = response.status, response.read()
+        except HTTPError as exc:
+            with exc:
+                status, payload = exc.code, exc.read()
+        except URLError as exc:
+            raise OSError(f"{method} {target}: {exc.reason}") from exc
+        try:
+            return status, json.loads(payload) if payload else None
+        except ValueError:
+            return status, None
+
+
+def _ice_connect(args):
+    target = _IcebergRestTarget(args.target)
+    if args.token_file is not None:
+        target.headers["Authorization"] = "Bearer " + _ice_secret_file(args.token_file, "--token-file")
+    elif args.credential_file is not None:
+        client, separator, secret = _ice_secret_file(args.credential_file, "--credential-file").partition(":")
+        if not client or not separator or not secret:
+            raise ValueError("--credential-file must contain client_id:client_secret")
+        status, data = target.call("POST", None, url=args.oauth2_server_uri or target.url + "/v1/oauth/tokens", form={
+            "grant_type": "client_credentials", "client_id": client, "client_secret": secret, "scope": args.scope,
+        })
+        token = data.get("access_token") if isinstance(data, dict) else None
+        if status != 200 or not isinstance(token, str) or not token:
+            raise ValueError(f"OAuth2 token request failed: {_ice_rest_error(status, data)}")
+        target.headers["Authorization"] = "Bearer " + token
+    query = "?" + urlencode({"warehouse": args.target_warehouse}) if args.target_warehouse is not None else ""
+    status, config = target.call("GET", "/v1/config" + query)
+    if status != 200 or not isinstance(config, dict):
+        raise ValueError(f"GET /v1/config failed: {_ice_rest_error(status, config)}")
+    merged = {**(config.get("defaults") or {}), **(config.get("overrides") or {})}
+    prefix = args.prefix if args.prefix is not None else merged.get("prefix") or ""
+    target.prefix = quote(str(prefix).strip("/"), safe="/%:@!$&'()*+,;=")
+    separator = merged.get("namespace-separator")
+    if isinstance(separator, str) and separator:
+        target.separator = separator
+    endpoints = config.get("endpoints")
+    if isinstance(endpoints, list) and _ICE_REGISTER_ENDPOINT not in endpoints:
+        raise ValueError("The target catalog does not advertise table registration (" + _ICE_REGISTER_ENDPOINT + ")")
+    return target
+
+
+def _ice_migrate(args):
+    _, namespaces, tables = _ice_catalog_source(args.warehouse, args.db_file, args.polaris_catalog)
+    _ice_warn_escaped("migrate", tables)
+    target = _ice_connect(args)
+    counts = dict.fromkeys(("created", "existing", "registered", "present", "failed"), 0)
+    failed = set()
+
+    def fail(kind, label, message):
+        counts["failed"] += 1
+        print(f"Iceberg migrate: {kind} {label}: {message}", file=sys.stderr)
+
+    for namespace, properties in namespaces:
+        label = ".".join(namespace)
+        if namespace[:-1] in failed:
+            failed.add(namespace)
+            fail("namespace", label, "skipped because its parent namespace failed")
+            continue
+        path = target.path("namespaces", target.namespace(namespace))
+        status, data = target.call("GET", path)
+        if status == 404:
+            status, data = target.call("POST", target.path("namespaces"), {
+                "namespace": list(namespace), "properties": properties,
+            })
+            if 200 <= status < 300:
+                counts["created"] += 1
+                continue
+            if status == 409:
+                status, data = target.call("GET", path)
+        if status != 200:
+            failed.add(namespace)
+            fail("namespace", label, _ice_rest_error(status, data))
+            continue
+        counts["existing"] += 1
+        existing = (data.get("properties") if isinstance(data, dict) else None) or {}
+        differing = sorted(key for key, value in properties.items() if existing.get(key) != value)
+        if differing:
+            print(f"Iceberg migrate: warning: namespace {label} already exists with different properties: "
+                  f"{', '.join(differing)}", file=sys.stderr)
+
+    for namespace, name, location in tables:
+        label = ".".join((*namespace, name))
+        if namespace in failed:
+            fail("table", label, "skipped because its namespace failed")
+            continue
+        encoded = target.namespace(namespace)
+        table_path = target.path("namespaces", encoded, "tables", quote(name, safe=""))
+        status, data = target.call("GET", table_path + "?snapshots=refs")
+        if status == 200:
+            current = data.get("metadata-location") if isinstance(data, dict) else None
+            if _ice_location_key(current) == _ice_location_key(location):
+                counts["present"] += 1
+            else:
+                fail("table", label, f"conflict: the target table points at {current!r}, not {location!r}")
+            continue
+        if status == 404:
+            status, data = target.call("POST", target.path("namespaces", encoded, "register"), {
+                "name": name, "metadata-location": location,
+            })
+            if 200 <= status < 300:
+                counts["registered"] += 1
+                continue
+        fail("table", label, ("conflict: " if status == 409 else "") + _ice_rest_error(status, data))
+
+    print(f"Migrated to {target.url}: created {counts['created']} namespaces and registered {counts['registered']} "
+          f"tables; {counts['existing']} namespaces and {counts['present']} tables were already present; "
+          f"{counts['failed']} failed")
+    if counts["failed"]:
+        raise ValueError(f"{counts['failed']} of {len(namespaces) + len(tables)} namespaces and tables failed")
+    return 0
+
+
 def iceberg_main(argv=None):
     parser = argparse.ArgumentParser(description="Iceberg v2 REST catalog and local Parquet/Avro table tools")
     parser.add_argument("--warehouse", default="iceberg-warehouse", help="local warehouse directory or file URI")
@@ -3594,7 +3913,38 @@ def iceberg_main(argv=None):
     snapshots = commands.add_parser("snapshots", help="list snapshot metadata as JSON")
     snapshots.add_argument("table", type=_ice_identifier)
 
+    export = commands.add_parser("export", help="write the catalog as an Iceberg JDBC / PyIceberg SQL catalog database")
+    export.add_argument("--format", choices=("sql-catalog",), default="sql-catalog",
+                        help="SQLite database for JdbcCatalog and SqlCatalog (default: %(default)s)")
+    export.add_argument("--out", type=Path, required=True, help="new SQLite database file")
+    export.add_argument("--catalog-name", help="catalog_name to store (default: the Polaris catalog name or 'default')")
+
+    migrate = commands.add_parser("migrate", help="create namespaces and register tables in a running REST catalog")
+    migrate.add_argument("--target", required=True,
+                         help="REST catalog base URL, e.g. http://host:8181 or http://host:8181/api/catalog for Polaris")
+    location = migrate.add_mutually_exclusive_group()
+    location.add_argument("--prefix", help="URL prefix to use instead of the one returned by /v1/config")
+    location.add_argument("--warehouse", dest="target_warehouse",
+                          help="warehouse to request from the target's /v1/config (Polaris: the catalog name)")
+    credentials = migrate.add_mutually_exclusive_group()
+    credentials.add_argument("--token-file", type=Path, help="file containing a bearer token")
+    credentials.add_argument("--credential-file", type=Path,
+                             help="file containing client_id:client_secret for OAuth2 client credentials")
+    migrate.add_argument("--scope", default="PRINCIPAL_ROLE:ALL", help="OAuth2 scope (default: %(default)s)")
+    migrate.add_argument("--oauth2-server-uri", help="OAuth2 token endpoint (default: TARGET/v1/oauth/tokens)")
+
+    for command in (export, migrate):
+        command.add_argument("--polaris-catalog", metavar="NAME",
+                             help="read this catalog of a serve-polaris warehouse (--db-file is the Polaris database)")
+
     args = parser.parse_args(argv)
+    if args.command in ("export", "migrate"):
+        try:
+            return (_ice_export if args.command == "export" else _ice_migrate)(args)
+        except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
+            parser.exit(1, f"Iceberg {args.command} failed: {exc}\n")
+        except KeyboardInterrupt:
+            return 130
     try:
         if args.command in ("serve", "serve-polaris"):
             if not 0 <= args.port <= 65535:
