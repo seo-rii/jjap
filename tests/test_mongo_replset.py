@@ -547,6 +547,37 @@ class ReplicaSetTests(unittest.TestCase):
         lost = self.watch(client, "feed", "orders", {"resumeAfter": token})
         self.assertCode(lost, 286)
 
+    def test_test_controls_work_in_replica_set_mode(self):
+        port, _ = self.server("--db-file", str(self.db_file), "--enable-test-commands")
+        client = self.client(port)
+        client("app", {"insert": "items", "documents": [{"_id": 1}]})
+        stream = self.watch(client, "app", "items")["cursor"]["id"]
+        client("app", {"insert": "items", "documents": [{"_id": 2}]})
+        token = self.events(client, "app", stream, "items")["postBatchResumeToken"]
+
+        failure = {"configureFailPoint": "failCommand", "mode": {"times": 1},
+                   "data": {"failCommands": ["insert"], "errorCode": 112}}
+        self.assertEqual(client("admin", failure)["ok"], 1.0)
+        session = self.lsid()
+        reply = client("app", {"insert": "items", "documents": [{"_id": 3}],
+                               **self.txn(session, 1, startTransaction=True)})
+        self.assertCode(reply, 112)
+        self.assertEqual(reply["errorLabels"], ["TransientTransactionError"])
+
+        open_session = self.lsid()
+        reply = client("app", {"insert": "items", "documents": [{"_id": 4}],
+                               **self.txn(open_session, 1, startTransaction=True)})
+        self.assertEqual(reply["ok"], 1.0, reply)
+        self.assertEqual(client("admin", {"jjapReset": 1})["reset"], True)
+        self.assertCode(client("admin", {"commitTransaction": 1, **self.txn(open_session, 1)}), 251,
+                        "TransientTransactionError")
+        self.assertEqual(client("app", {"find": "items"})["cursor"]["firstBatch"], [])
+        self.assertCode(self.watch(client, "app", "items", {"resumeAfter": token}), 286)
+        fresh = self.watch(client, "app", "items")["cursor"]["id"]
+        client("app", {"insert": "items", "documents": [{"_id": 5}]})
+        events = self.events(client, "app", fresh, "items", wait=2000)["nextBatch"]
+        self.assertEqual([event["documentKey"] for event in events], [{"_id": 5}])
+
     def test_standalone_mode_still_rejects_replica_set_features(self):
         port, _ = self.server(replica_set=False)
         client = self.client(port)
