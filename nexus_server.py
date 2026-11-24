@@ -7,6 +7,8 @@ Raw upload: curl -T example.bin http://127.0.0.1:8081/repository/raw-hosted/exam
 OCI registry: 127.0.0.1:8081/docker-hosted/example/image:tag
 Use --db-file test.sqlite3 to persist repository configuration and artifacts.
 Set NEXUS_TEST_PASSWORD or --password-file to require a single test account.
+Export: python3 nexus_server.py export --db-file test.sqlite3 --out nexus-export
+Migrate: python3 nexus_server.py migrate --db-file test.sqlite3 --target http://nexus:8081 --password-file pw
 
 Protocol references:
 https://help.sonatype.com/en/api-reference.html
@@ -15,6 +17,7 @@ https://packaging.python.org/en/latest/specifications/simple-repository-api/
 https://docs.pypi.org/api/upload/
 https://docs.npmjs.com/cli/commands/npm-publish/
 https://github.com/opencontainers/distribution-spec/blob/main/spec.md
+https://github.com/opencontainers/image-spec/blob/main/image-layout.md
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ import getpass
 import hashlib
 import hmac
 import html
+import http.client
 import io
 import json
 import logging
@@ -36,7 +40,9 @@ import re
 import secrets
 import sqlite3
 import ssl
+import sys
 import tarfile
+import tempfile
 import threading
 import time
 import urllib.error
@@ -1458,7 +1464,803 @@ class Server(ThreadingHTTPServer):
         return request, address
 
 
+# Export to native layouts and migration into Nexus Repository
+
+
+SNAPSHOT_TABLES = {"repositories", "components", "assets", "npm_tags", "settings"}
+API_FORMATS = {"maven2": "maven"}
+CHECKSUM_SUFFIXES = tuple("." + method for method in HASHES)
+OCI_RESERVED = {"blobs", "index.json", "oci-layout"}
+OCI_REF_NAME = "org.opencontainers.image.ref.name"
+OCI_INDEX = "application/vnd.oci.image.index.v1+json"
+PYPI_FIELDS = (("Summary", "summary"), ("Home-page", "home_page"), ("Author", "author"),
+               ("Author-email", "author_email"), ("License", "license"), ("Keywords", "keywords"))
+SIMPLE_HEAD = '<!doctype html><meta name="pypi:repository-version" content="1.0"><body>\n'
+
+
+class MigrationError(Exception):
+    pass
+
+
+def warn(message):
+    print(f"warning: {message}", file=sys.stderr)
+
+
+def json_bytes(value):
+    return (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode()
+
+
+class Snapshot:
+    """A read-only view of a persistence file inside one read transaction."""
+
+    def __init__(self, path):
+        source = Path(path).expanduser().resolve(strict=True)
+        if not source.is_file():
+            raise ValueError(f"Expected a SQLite persistence file: {source}")
+        self.db = sqlite3.connect(f"{source.as_uri()}?mode=ro", uri=True, isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+        try:
+            self.db.execute("BEGIN")
+            tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            valid = SNAPSHOT_TABLES <= tables and self.db.execute(
+                "SELECT 1 FROM settings WHERE name = 'initialized'").fetchone() is not None
+            if valid:
+                self.repositories = {row["name"]: {**dict(row), "config": json.loads(row["config"])}
+                                     for row in self.db.execute("SELECT * FROM repositories ORDER BY name")}
+                self.tags = {}
+                for row in self.db.execute("SELECT * FROM npm_tags ORDER BY repository, name, tag"):
+                    self.tags.setdefault((row["repository"], row["name"]), {})[row["tag"]] = row["version"]
+        except (sqlite3.DatabaseError, ValueError):
+            valid = False
+        if not valid:
+            self.db.close()
+            raise ValueError(f"Not a Nexus test server SQLite persistence file: {source}")
+
+    def close(self):
+        self.db.close()
+
+    def count(self, repository):
+        return self.db.execute("SELECT COUNT(*) FROM assets WHERE repository = ?", (repository,)).fetchone()[0]
+
+    def listing(self, repository):
+        rows = self.db.execute("""
+            SELECT assets.id, assets.path, assets.media_type, assets.size, assets.checksum, assets.modified,
+                   assets.metadata, components.name AS component, components.version
+            FROM assets JOIN components ON components.id = assets.component_id
+            WHERE assets.repository = ? ORDER BY assets.path
+        """, (repository,))
+        return [{**dict(row), "repository": repository, "checksum": json.loads(row["checksum"]),
+                 "metadata": json.loads(row["metadata"])} for row in rows]
+
+    def read(self, asset):
+        content = self.db.execute("SELECT content FROM assets WHERE id = ?", (asset["id"],)).fetchone()[0]
+        recorded = asset["checksum"]
+        if not isinstance(content, bytes) or len(content) != asset["size"] or any(
+                hashlib.new(method, content, usedforsecurity=False).hexdigest() != recorded.get(method)
+                for method in ("sha1", "sha256")):
+            raise ValueError(f"{asset['repository']}/{asset['path']} does not match its recorded size and checksums")
+        return content
+
+
+def repository_request(repository, known):
+    """The Nexus REST create request (path and JSON body) for one repository."""
+    name, format_name, kind, config = (repository[key] for key in ("name", "format", "kind", "config"))
+    storage = {"blobStoreName": "default", "strictContentTypeValidation": False, "writePolicy": "ALLOW",
+               **config.get("storage", {})}
+    if kind != "hosted":
+        storage.pop("writePolicy", None)
+    body = {"name": name, "online": config.get("online", True), "storage": storage}
+    if format_name == "raw":
+        body["raw"] = {"contentDisposition": "INLINE"}
+    if format_name == "maven2" and kind != "group":
+        body["maven"] = {"versionPolicy": "MIXED", "layoutPolicy": "PERMISSIVE", "contentDisposition": "INLINE",
+                         **config.get("maven", {})}
+    if format_name == "docker":
+        body["docker"] = {"v1Enabled": False, "forceBasicAuth": True}
+    if kind == "proxy":
+        proxy = config.get("proxy", {})
+        body["proxy"] = {"contentMaxAge": 1440, "metadataMaxAge": proxy.get("contentMaxAge", 1440), **proxy}
+        # Mirrors the test server, which keeps no negative cache and never blocks an upstream.
+        body["negativeCache"] = {"enabled": False, "timeToLive": 1440}
+        body["httpClient"] = {"blocked": False, "autoBlock": False}
+    if kind == "group":
+        members = config.get("group", {}).get("memberNames", [])
+        missing = [member for member in members if member not in known]
+        if missing:
+            warn(f"{name}: dropping group members that do not exist: {', '.join(missing)}")
+        body["group"] = {"memberNames": [member for member in members if member in known]}
+    return {"name": name, "format": format_name, "type": kind,
+            "path": f"{REST}repositories/{API_FORMATS.get(format_name, format_name)}/{kind}", "body": body}
+
+
+def creation_order(repositories):
+    order = [name for kind in ("hosted", "proxy") for name, repository in repositories.items()
+             if repository["kind"] == kind]
+    placed = set(order)
+
+    def place(name, trail):
+        repository = repositories.get(name)
+        if repository is None or name in placed or name in trail:
+            return
+        for member in repository["config"].get("group", {}).get("memberNames", []):
+            place(member, trail | {name})
+        placed.add(name)
+        order.append(name)
+
+    for name in repositories:
+        place(name, frozenset())
+    return order
+
+
+def npm_dist_tags(snapshot, repository, package, versions):
+    tags = {tag: version for tag, version in snapshot.tags.get((repository, package), {}).items()
+            if version in versions}
+    if versions:
+        tags.setdefault("latest", max(versions, key=version_key))
+    return tags
+
+
+def npm_dist(asset, tarball):
+    checksum = asset["checksum"]
+    return {"tarball": tarball, "shasum": checksum["sha1"],
+            "integrity": "sha512-" + base64.b64encode(bytes.fromhex(checksum["sha512"])).decode()}
+
+
+def docker_images(snapshot, repository, assets):
+    """Group registry assets by image: blobs and manifests by digest, tags, push order and problems."""
+    images = {}
+    for asset in assets:
+        parts = asset["path"].rsplit("/", 2)
+        image = parts[0].removeprefix("v2/") if len(parts) == 3 and parts[0].startswith("v2/") else ""
+        kind, reference = parts[1:] if len(parts) == 3 else ("", "")
+        digest = "sha256:" + asset["checksum"]["sha256"]
+        tag = kind == "manifests" and OCI_TAG.fullmatch(reference) and not OCI_DIGEST.fullmatch(reference)
+        if kind not in {"blobs", "manifests"} or not OCI_IMAGE.fullmatch(image) or not (
+                tag or OCI_DIGEST.fullmatch(reference)):
+            warn(f"{repository}: skipping {asset['path']}: not a Docker registry path")
+            continue
+        entry = images.setdefault(image, {"blobs": {}, "manifests": {}, "tags": {}, "problems": []})
+        if tag:
+            entry["tags"][reference] = digest
+            entry.setdefault("tagged", {})[digest] = asset
+            continue
+        if reference != digest:
+            entry["problems"].append(f"{repository}/{asset['path']} does not match its digest")
+        entry[kind][reference] = asset
+    for image, entry in images.items():
+        for digest, asset in entry.pop("tagged", {}).items():
+            entry["manifests"].setdefault(digest, asset)
+        children = {}
+        for digest, asset in entry["manifests"].items():
+            index = asset["media_type"].endswith((".index.v1+json", ".list.v2+json"))
+            pool = entry["manifests"] if index else entry["blobs"]
+            try:
+                manifest = json_object(json.loads(snapshot.read(asset)))
+                descriptors = manifest["manifests"] if index else [manifest["config"], *manifest["layers"]]
+                references = [(item["digest"], item["size"]) for item in descriptors]
+            except (ValueError, KeyError, TypeError, RequestError) as exc:
+                entry["problems"].append(f"{repository}/{image}@{digest}: unreadable manifest ({exc})")
+                continue
+            for reference, size in references:
+                if reference not in pool or pool[reference]["size"] != size:
+                    entry["problems"].append(f"{repository}/{image}@{digest} references missing content {reference}")
+            children[digest] = [reference for reference, _ in references if index and reference in pool]
+        order = []
+
+        def visit(digest):
+            if digest not in order:
+                for child in children.get(digest, ()):
+                    visit(child)
+                order.append(digest)
+
+        for digest in sorted(entry["manifests"]):
+            visit(digest)
+        nested = {child for values in children.values() for child in values}
+        entry["order"] = order
+        entry["untagged"] = [digest for digest in order
+                             if digest not in nested and digest not in entry["tags"].values()]
+    return images
+
+
+def write_export_file(folder, relative, content, modified=None):
+    try:
+        asset_path(relative)
+    except RequestError as exc:
+        raise ValueError(f"Invalid asset path: {relative!r}") from exc
+    target = folder.joinpath(*relative.split("/"))
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "xb") as file:
+            file.write(content)
+    except (FileExistsError, NotADirectoryError) as exc:
+        raise ValueError(f"{folder.name}/{relative} collides with another exported path") from exc
+    if modified:
+        stamp = datetime.fromisoformat(modified.replace("Z", "+00:00")).timestamp()
+        os.utime(target, (stamp, stamp))
+
+
+def export_files(snapshot, repository, folder):
+    name, format_name = repository["name"], repository["format"]
+    packages, projects = {}, {}
+    assets = snapshot.listing(name)
+    for asset in assets:
+        write_export_file(folder, asset["path"], snapshot.read(asset), asset["modified"])
+        if format_name == "npm":
+            packages.setdefault(asset["component"], {})[asset["version"]] = asset
+        elif format_name == "pypi":
+            projects.setdefault(asset["component"], []).append(asset)
+    for package, versions in packages.items():
+        ordered = sorted(versions, key=version_key)
+        document = {"_id": package, "name": package, "dist-tags": npm_dist_tags(snapshot, name, package, versions),
+                    "versions": {version: {**versions[version]["metadata"], "name": package, "version": version,
+                                           "_id": f"{package}@{version}",
+                                           "dist": npm_dist(versions[version], versions[version]["path"])}
+                                 for version in ordered},
+                    "time": {version: versions[version]["modified"] for version in ordered}}
+        write_export_file(folder, f"{package}/packument.json", json_bytes(document))
+    if projects:
+        links = [f'<a href="{html.escape(project)}/">{html.escape(project)}</a>' for project in sorted(projects)]
+        write_export_file(folder, "simple/index.html", (SIMPLE_HEAD + "\n".join(links)).encode())
+    for project, files in projects.items():
+        links = []
+        for asset in files:
+            url = html.escape(f"../../{encoded_path(asset['path'])}#sha256={asset['checksum']['sha256']}", quote=True)
+            python = asset["metadata"].get("requires-python")
+            requires = f' data-requires-python="{html.escape(python, quote=True)}"' if python else ""
+            links.append(f'<a href="{url}"{requires}>{html.escape(asset["path"].rsplit("/", 1)[-1])}</a>')
+        write_export_file(folder, f"simple/{project}/index.html", (SIMPLE_HEAD + "\n".join(links)).encode())
+    return len(assets)
+
+
+def export_docker(snapshot, repository, folder):
+    name = repository["name"]
+    images = docker_images(snapshot, name, snapshot.listing(name))
+    for image, entry in images.items():
+        if entry["problems"]:
+            raise ValueError(entry["problems"][0])
+        segments = image.split("/")
+        for index in range(1, len(segments)):
+            if "/".join(segments[:index]) in images and segments[index] in OCI_RESERVED:
+                raise ValueError(f"{name}/{image} would be written inside the OCI layout of another image")
+    count = 0
+    for image, entry in images.items():
+        target = folder.joinpath(*image.split("/"))
+        write_export_file(target, "oci-layout", b'{"imageLayoutVersion": "1.0.0"}\n')
+        for digest, asset in sorted({**entry["blobs"], **entry["manifests"]}.items()):
+            write_export_file(target, "blobs/sha256/" + digest.removeprefix("sha256:"), snapshot.read(asset),
+                              asset["modified"])
+        manifests = entry["manifests"]
+        descriptors = [{"mediaType": manifests[digest]["media_type"], "digest": digest,
+                        "size": manifests[digest]["size"], "annotations": {OCI_REF_NAME: tag}}
+                       for tag, digest in sorted(entry["tags"].items())]
+        descriptors += [{"mediaType": manifests[digest]["media_type"], "digest": digest,
+                         "size": manifests[digest]["size"]} for digest in entry["untagged"]]
+        write_export_file(target, "index.json", json_bytes(
+            {"schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": descriptors}))
+        count += len(entry["blobs"]) + len(manifests) + len(entry["tags"])
+    return len(images), count
+
+
+def export_nexus(source, destination, include_proxy_cache=False):
+    snapshot = Snapshot(source)
+    try:
+        repositories = snapshot.repositories
+        requests = [repository_request(repositories[name], repositories) for name in creation_order(repositories)]
+        destination.mkdir()
+        write_export_file(destination, "repositories.json", json_bytes(requests))
+        counts = {"repositories": len(requests), "assets": 0, "images": 0, "cached": 0}
+        for request in requests:
+            repository = repositories[request["name"]]
+            if repository["kind"] == "group" or (repository["kind"] == "proxy" and not include_proxy_cache):
+                counts["cached"] += snapshot.count(repository["name"])
+                continue
+            folder = destination / "content" / repository["name"]
+            try:
+                folder.mkdir(parents=True)
+            except FileExistsError as exc:
+                raise ValueError(f"Repository names collide on this file system: {repository['name']}") from exc
+            if repository["format"] == "docker":
+                images, assets = export_docker(snapshot, repository, folder)
+                counts["images"] += images
+            else:
+                assets = export_files(snapshot, repository, folder)
+            counts["assets"] += assets
+        return counts
+    finally:
+        snapshot.close()
+
+
+def publish_export(staged, destination):
+    if os.name == "nt":
+        # Windows rename refuses an existing destination.
+        staged.rename(destination)
+        return
+    destination.mkdir(mode=0o700)
+    try:
+        staged.replace(destination)
+    except BaseException:
+        destination.rmdir()
+        raise
+
+
+def export_main(argv):
+    parser = argparse.ArgumentParser(
+        prog=f"{Path(sys.argv[0]).name} export",
+        description="Export a Nexus test server SQLite snapshot as Nexus REST repository requests and native layouts.")
+    parser.add_argument("--db-file", type=Path, required=True, help="existing SQLite persistence file")
+    parser.add_argument("--out", type=Path, required=True, help="new output directory")
+    parser.add_argument("--include-proxy-cache", action="store_true",
+                        help="also export the content cached by proxy repositories")
+    args = parser.parse_args(argv)
+    destination = args.out.expanduser().absolute()
+    try:
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Output directory already exists: {destination}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".nexus-export-", dir=destination.parent) as temporary:
+            staged = Path(temporary) / "export"
+            counts = export_nexus(args.db_file, staged, args.include_proxy_cache)
+            publish_export(staged, destination)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        parser.exit(1, f"Nexus export failed: {exc}\n")
+    skipped = f"; {counts['cached']} cached proxy assets not exported" if counts["cached"] else ""
+    print(f"Exported {counts['repositories']} repositories, {counts['assets']} assets and {counts['images']} "
+          f"Docker images to {destination}{skipped}")
+    return 0
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def http_failure(method, url, status, data):
+    detail = " ".join(data[:300].decode("utf-8", "replace").split())
+    return f"{method} {url} returned HTTP {status}" + (f": {detail}" if detail else "")
+
+
+def registry_api(endpoint):
+    """Registry API root for an endpoint; a URL without a /v2 segment gets one appended."""
+    endpoint = endpoint.rstrip("/")
+    return endpoint if "v2" in urllib.parse.urlsplit(endpoint).path.split("/") else endpoint + "/v2"
+
+
+def registry_root(api):
+    """The /v2/ base URL of a registry API URL and the path in front of it."""
+    parts = urllib.parse.urlsplit(api)
+    segments = parts.path.split("/")
+    prefix = "/".join(segments[:len(segments) - 1 - segments[::-1].index("v2")])
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, prefix + "/v2/", "", "")), prefix
+
+
+def registry_location(api, location):
+    prefix = registry_root(api)[1]
+    # Nexus answers uploads under /repository/<name>/v2 with a Location relative to its connector root.
+    if prefix and location.startswith("/v2/") and not location.startswith(prefix + "/v2/"):
+        location = prefix + location
+    return urllib.parse.urljoin(api + "/", location)
+
+
+def multipart_body(fields, field, filename, content):
+    boundary = secrets.token_hex(16)
+    while boundary.encode() in content or any(boundary in value for _, value in fields):
+        boundary = secrets.token_hex(16)
+    parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode()
+             for key, value in fields]
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'
+                 f'Content-Type: application/octet-stream\r\n\r\n'.encode() + content)
+    return b"".join(parts) + f"\r\n--{boundary}--\r\n".encode(), f"multipart/form-data; boundary={boundary}"
+
+
+def pypi_fields(asset, content):
+    filename = asset["path"].rsplit("/", 1)[-1]
+    try:
+        metadata = package_metadata(filename, content)
+    except Exception:  # Best effort: streamed sdists can fail in package_metadata.
+        metadata = {}
+    project = str(metadata.get("Name") or "")
+    if normalize_project(project) != asset["component"]:
+        project = asset["component"]
+    wheel = filename.endswith(".whl")
+    fields = [(":action", "file_upload"), ("protocol_version", "1"),
+              ("metadata_version", str(metadata.get("Metadata-Version") or "2.1")), ("name", project),
+              ("version", asset["version"]), ("filetype", "bdist_wheel" if wheel else "sdist"),
+              ("pyversion", filename[:-4].split("-")[-3] if wheel and filename.count("-") >= 4 else "source"),
+              ("md5_digest", asset["checksum"]["md5"]), ("sha256_digest", asset["checksum"]["sha256"])]
+    fields += [(field, str(metadata[header])) for header, field in PYPI_FIELDS if metadata.get(header)]
+    if asset["metadata"].get("requires-python"):
+        fields.append(("requires_python", asset["metadata"]["requires-python"]))
+    return fields
+
+
+def upload_rank(asset):
+    path = asset["path"]
+    if path.endswith(CHECKSUM_SUFFIXES):
+        return 2, path
+    return int(path.rsplit("/", 1)[-1] == "maven-metadata.xml"), path
+
+
+class NexusClient:
+    def __init__(self, target, username, password, timeout):
+        self.target = target
+        self.basic = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
+        self.timeout = timeout
+        self.opener = urllib.request.build_opener(NoRedirect)
+        self.tokens = {}
+
+    def request(self, method, url, body=None, headers=None, authorization=None):
+        headers = {"User-Agent": "nexus-test-server-migrate", **(headers or {}),
+                   "Authorization": authorization or self.basic}
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with self.opener.open(request, timeout=self.timeout) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as exc:
+            try:
+                return exc.code, exc.headers, exc.read()
+            finally:
+                exc.close()
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            raise MigrationError(f"{method} {url} failed: {getattr(exc, 'reason', exc)}") from exc
+
+    def call(self, method, url, body=None, headers=None, expect=(200, 201, 204)):
+        status, response_headers, data = self.request(method, url, body, headers)
+        if status not in expect:
+            raise MigrationError(http_failure(method, url, status, data))
+        return response_headers, data
+
+    def registry(self, method, url, body=None, headers=None):
+        host = urllib.parse.urlsplit(url).netloc
+        status, response_headers, data = self.request(method, url, body, headers, self.tokens.get(host))
+        if status == 401 and self.tokens.pop(host, None):
+            status, response_headers, data = self.request(method, url, body, headers)
+        challenge = response_headers.get("WWW-Authenticate", "") if status == 401 else ""
+        if challenge[:7].lower() == "bearer ":
+            self.tokens[host] = "Bearer " + self.bearer_token(url, challenge)
+            status, response_headers, data = self.request(method, url, body, headers, self.tokens[host])
+        return status, response_headers, data
+
+    def bearer_token(self, url, challenge):
+        params = dict(re.findall(r'(\w+)="([^"]*)"', challenge))
+        realm = params.pop("realm", "")
+        allowed = {urllib.parse.urlsplit(address).hostname for address in (url, self.target)}
+        if urllib.parse.urlsplit(realm).scheme not in {"http", "https"} or (
+                urllib.parse.urlsplit(realm).hostname not in allowed):
+            raise MigrationError(f"Refusing to send credentials to registry token realm {realm!r}")
+        _, data = self.call("GET", realm + ("&" if "?" in realm else "?") + urllib.parse.urlencode(params),
+                            expect=(200,))
+        try:
+            document = json_object(json.loads(data))
+        except (ValueError, RequestError) as exc:
+            raise MigrationError("Registry token endpoint returned invalid JSON") from exc
+        token = document.get("token") or document.get("access_token")
+        if not isinstance(token, str) or not token:
+            raise MigrationError("Registry token endpoint returned no token")
+        return token
+
+
+class Migration:
+    def __init__(self, snapshot, client, endpoints):
+        self.snapshot, self.client, self.endpoints = snapshot, client, endpoints
+        self.failures = []
+        self.counts = {"created": 0, "existing": 0, "uploaded": 0, "skipped": 0}
+
+    def fail(self, message):
+        self.failures.append(message)
+        print(f"error: {message}", file=sys.stderr)
+
+    def attempt(self, label, action, *args):
+        try:
+            action(*args)
+        except (MigrationError, ValueError, RequestError) as exc:
+            self.fail(f"{label}: {exc}")
+
+    def run(self, names):
+        target = self.client.target
+        _, data = self.client.call("GET", f"{target}{REST}repositories", expect=(200,))
+        try:
+            remote = {item["name"]: (item["format"], item["type"]) for item in json.loads(data)}
+        except (ValueError, KeyError, TypeError) as exc:
+            raise MigrationError(f"{target} did not return a Nexus repository list") from exc
+        ready, final = [], []
+        for name in names:
+            repository = self.snapshot.repositories[name]
+            request = repository_request(repository, self.snapshot.repositories)
+            if name in remote:
+                if remote[name] != (repository["format"], repository["kind"]):
+                    self.fail(f"{name}: conflict: the target repository is {'/'.join(remote[name])}, "
+                              f"the source is {repository['format']}/{repository['kind']}")
+                    continue
+                self.counts["existing"] += 1
+            elif not self.create(request, final):
+                continue
+            ready.append(name)
+            if repository["kind"] == "proxy" and self.snapshot.count(name):
+                warn(f"{name}: {self.snapshot.count(name)} cached proxy assets are not migrated; "
+                     "the target proxy fetches them from its remote")
+        for name in ready:
+            if self.snapshot.repositories[name]["kind"] == "hosted":
+                self.upload(name)
+        for request in final:
+            self.attempt(request["name"], self.client.call, "PUT", f"{target}{request['path']}/{request['name']}",
+                         json_bytes(request["body"]), {"Content-Type": "application/json"})
+        return len(ready)
+
+    def create(self, request, final):
+        body = request["body"]
+        endpoint = urllib.parse.urlsplit(self.endpoints.get(request["name"], ""))
+        target = urllib.parse.urlsplit(self.client.target)
+        if endpoint.port and endpoint.path.strip("/") == "" and endpoint.netloc != target.netloc:
+            body["docker"]["httpsPort" if endpoint.scheme == "https" else "httpPort"] = endpoint.port
+        staged = body
+        if request["type"] == "hosted" and (not body["online"] or body["storage"].get("writePolicy") == "DENY"):
+            # Upload into a writable repository, then apply the read-only or offline state.
+            staged = {**body, "online": True, "storage": {**body["storage"], "writePolicy": "ALLOW"}}
+            final.append(request)
+        try:
+            self.client.call("POST", self.client.target + request["path"], json_bytes(staged),
+                             {"Content-Type": "application/json"})
+        except MigrationError as exc:
+            self.fail(f"{request['name']}: {exc}")
+            return False
+        self.counts["created"] += 1
+        return True
+
+    def remote_assets(self, name):
+        found, token = {}, None
+        while True:
+            query = urllib.parse.urlencode({"repository": name, **({"continuationToken": token} if token else {})})
+            _, data = self.client.call("GET", f"{self.client.target}{REST}assets?{query}", expect=(200,))
+            try:
+                listing = json_object(json.loads(data))
+                for item in listing["items"]:
+                    found[item["path"].lstrip("/")] = item.get("checksum") or {}
+            except (ValueError, KeyError, TypeError, AttributeError, RequestError) as exc:
+                raise MigrationError(f"{name}: the target returned an invalid asset listing") from exc
+            token = listing.get("continuationToken")
+            if not token:
+                return found
+
+    def compare(self, label, asset, checksum):
+        """Return "missing", "same" or "conflict" (reported) for an asset already looked up on the target."""
+        if checksum is None:
+            return "missing"
+        methods = [method for method in ("sha256", "sha1") if checksum.get(method)]
+        if methods and all(checksum[method] == asset["checksum"][method] for method in methods):
+            self.counts["skipped"] += 1
+            return "same"
+        self.fail(f"{label}: conflict: the target already holds different content")
+        return "conflict"
+
+    def upload(self, name):
+        repository = self.snapshot.repositories[name]
+        assets = self.snapshot.listing(name)
+        if repository["format"] == "docker":
+            return self.upload_docker(name, assets)
+        try:
+            remote = self.remote_assets(name)
+        except MigrationError as exc:
+            return self.fail(str(exc))
+        if repository["format"] == "npm":
+            return self.upload_npm(name, assets, remote)
+        pypi = repository["format"] == "pypi"
+        if pypi:
+            remote = {path.rsplit("/", 1)[-1]: checksum for path, checksum in remote.items()
+                      if path.startswith("packages/")}
+        for asset in sorted(assets, key=upload_rank):
+            label = f"{name}/{asset['path']}"
+            key = asset["path"].rsplit("/", 1)[-1] if pypi else asset["path"]
+            if self.compare(label, asset, remote.get(key)) == "missing":
+                self.attempt(label, self.upload_pypi if pypi else self.upload_file, name, asset)
+
+    def upload_file(self, name, asset):
+        self.client.call("PUT", f"{self.client.target}/repository/{name}/{encoded_path(asset['path'])}",
+                         self.snapshot.read(asset), {"Content-Type": asset["media_type"]})
+        self.counts["uploaded"] += 1
+
+    def upload_pypi(self, name, asset):
+        content = self.snapshot.read(asset)
+        body, media_type = multipart_body(pypi_fields(asset, content), "content",
+                                          asset["path"].rsplit("/", 1)[-1], content)
+        self.client.call("POST", f"{self.client.target}/repository/{name}/", body, {"Content-Type": media_type})
+        self.counts["uploaded"] += 1
+
+    def upload_npm(self, name, assets, remote):
+        packages = {}
+        for asset in assets:
+            packages.setdefault(asset["component"], {})[asset["version"]] = asset
+        for package, versions in sorted(packages.items()):
+            tags = npm_dist_tags(self.snapshot, name, package, versions)
+            present = set()
+            for version in sorted(versions, key=version_key):
+                label = f"{name}/{package}@{version}"
+                state = self.compare(label, versions[version], remote.get(versions[version]["path"]))
+                if state == "missing":
+                    try:
+                        self.publish_npm(name, package, version, versions[version], tags)
+                    except (MigrationError, ValueError) as exc:
+                        self.fail(f"{label}: {exc}")
+                        continue
+                if state != "conflict":
+                    present.add(version)
+            tags = {tag: version for tag, version in tags.items() if version in present}
+            if tags:
+                self.attempt(f"{name}/{package}", self.sync_npm_tags, name, package, tags)
+
+    def publish_npm(self, name, package, version, asset, tags):
+        content = self.snapshot.read(asset)
+        base = f"{self.client.target}/repository/{name}"
+        attachment = f"{package}-{version}.tgz"
+        manifest = {**asset["metadata"], "name": package, "version": version, "_id": f"{package}@{version}",
+                    "dist": npm_dist(asset, f"{base}/{package}/-/{attachment}")}
+        # Nexus rejects a publish without dist-tags; the final tag sync restores the source tags.
+        document = {"_id": package, "name": package, "versions": {version: manifest},
+                    "dist-tags": {tag: value for tag, value in tags.items() if value == version} or {"latest": version},
+                    "_attachments": {attachment: {"content_type": "application/octet-stream", "length": len(content),
+                                                  "data": base64.b64encode(content).decode()}}}
+        for key in ("description", "readme"):
+            if isinstance(manifest.get(key), str):
+                document[key] = manifest[key]
+        self.client.call("PUT", f"{base}/{urllib.parse.quote(package, safe='@')}", json_bytes(document),
+                         {"Content-Type": "application/json"})
+        self.counts["uploaded"] += 1
+
+    def sync_npm_tags(self, name, package, tags):
+        url = f"{self.client.target}/repository/{name}/-/package/{urllib.parse.quote(package, safe='@')}/dist-tags"
+        _, data = self.client.call("GET", url, expect=(200,))
+        current = json_object(json.loads(data))
+        for tag, version in sorted(tags.items()):
+            if current.get(tag) != version:
+                self.client.call("PUT", f"{url}/{urllib.parse.quote(tag, safe='')}", json.dumps(version).encode(),
+                                 {"Content-Type": "application/json"})
+
+    def upload_docker(self, name, assets):
+        api = registry_api(self.endpoints[name]) if name in self.endpoints else (
+            f"{self.client.target}/repository/{name}/v2")
+        images = docker_images(self.snapshot, name, assets)
+        if images:
+            ping = registry_root(api)[0]
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    status, _, data = self.client.registry("GET", ping)
+                    break
+                except MigrationError as exc:
+                    # A newly created Docker connector opens its port asynchronously.
+                    if time.monotonic() > deadline:
+                        return self.fail(f"{name}: {exc}")
+                    time.sleep(0.5)
+            if status != 200:
+                return self.fail(f"{name}: {http_failure('GET', ping, status, data)}")
+        for image, entry in sorted(images.items()):
+            for problem in entry["problems"]:
+                self.fail(problem)
+            if entry["problems"]:
+                continue
+            for digest, asset in sorted(entry["blobs"].items()):
+                self.attempt(f"{name}/{image}@{digest}", self.push_blob, api, image, digest, asset)
+            references = [(digest, digest) for digest in entry["order"]] + sorted(entry["tags"].items())
+            for reference, digest in references:
+                label = f"{name}/{image}{'@' if reference == digest else ':'}{reference}"
+                self.attempt(label, self.push_manifest, api, image, reference, entry["manifests"][digest])
+
+    def push_blob(self, api, image, digest, asset):
+        url = f"{api}/{image}/blobs/{digest}"
+        status, headers, data = self.client.registry("HEAD", url)
+        if status == 200:
+            if headers.get("Content-Length") != str(asset["size"]):
+                raise MigrationError("conflict: the target holds this digest with a different size")
+            self.counts["skipped"] += 1
+            return
+        if status != 404:
+            raise MigrationError(http_failure("HEAD", url, status, data))
+        content = self.snapshot.read(asset)
+        status, headers, data = self.client.registry("POST", f"{api}/{image}/blobs/uploads/", b"")
+        if status != 202 or not headers.get("Location"):
+            raise MigrationError(http_failure("POST", f"{api}/{image}/blobs/uploads/", status, data))
+        location = registry_location(api, headers["Location"])
+        upload = location + ("&" if "?" in location else "?") + urllib.parse.urlencode({"digest": digest})
+        status, headers, data = self.client.registry("PUT", upload, content,
+                                                     {"Content-Type": "application/octet-stream"})
+        if status != 201:
+            raise MigrationError(http_failure("PUT", upload, status, data))
+        status, headers, _ = self.client.registry("HEAD", url)
+        if status != 200 or headers.get("Docker-Content-Digest", digest) != digest or (
+                headers.get("Content-Length") != str(asset["size"])):
+            raise MigrationError(f"uploaded blob did not verify (HEAD returned HTTP {status})")
+        self.counts["uploaded"] += 1
+
+    def push_manifest(self, api, image, reference, asset):
+        url = f"{api}/{image}/manifests/{reference}"
+        digest = "sha256:" + asset["checksum"]["sha256"]
+        accept = {"Accept": ", ".join(sorted(OCI_MEDIA_TYPES))}
+        status, headers, data = self.client.registry("HEAD", url, headers=accept)
+        if status == 200:
+            current = headers.get("Docker-Content-Digest", reference if OCI_DIGEST.fullmatch(reference) else None)
+            if current != digest:
+                raise MigrationError(f"conflict: the target tag points to {current or 'other content'}")
+            self.counts["skipped"] += 1
+            return
+        if status != 404:
+            raise MigrationError(http_failure("HEAD", url, status, data))
+        status, headers, data = self.client.registry("PUT", url, self.snapshot.read(asset),
+                                                     {"Content-Type": asset["media_type"]})
+        if status != 201:
+            raise MigrationError(http_failure("PUT", url, status, data))
+        if headers.get("Docker-Content-Digest", digest) != digest:
+            raise MigrationError(f"the target stored the manifest as {headers['Docker-Content-Digest']}")
+        self.counts["uploaded"] += 1
+
+
+def http_url(value, option):
+    parts = urllib.parse.urlsplit(value)
+    try:
+        parts.port
+    except ValueError as exc:
+        raise ValueError(f"{option} has an invalid port: {value}") from exc
+    if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.query or parts.fragment:
+        raise ValueError(f"{option} must be an http(s) URL without credentials or query: {value}")
+    return value.rstrip("/")
+
+
+def migrate_main(argv):
+    parser = argparse.ArgumentParser(
+        prog=f"{Path(sys.argv[0]).name} migrate",
+        description="Create the repositories of a Nexus test server SQLite snapshot in a running Nexus Repository "
+                    "and upload their content through the REST, format and Docker registry APIs.")
+    parser.add_argument("--db-file", type=Path, required=True, help="existing SQLite persistence file")
+    parser.add_argument("--target", required=True, help="Nexus base URL, for example http://nexus:8081")
+    parser.add_argument("--username", default="admin", help="Nexus user (default: %(default)s)")
+    parser.add_argument("--password-file", type=Path, required=True, help="file holding the Nexus password")
+    parser.add_argument("--repository", action="extend", nargs="+", default=[], metavar="NAME",
+                        help="migrate only these repositories (default: all)")
+    parser.add_argument("--docker-endpoint", action="extend", nargs="+", default=[], metavar="REPO=URL",
+                        help="registry URL of a Docker repository: a connector such as http://nexus:8082 (set as "
+                             "its HTTP port when the repository is created) or a URL containing /v2 "
+                             "(default: TARGET/repository/REPO)")
+    parser.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout in seconds (default: %(default)s)")
+    args = parser.parse_args(argv)
+    if not args.username or ":" in args.username or not 0 < args.timeout <= 3600:
+        parser.error("--username must be non-empty without a colon and --timeout must be in (0, 3600]")
+    try:
+        target = http_url(args.target, "--target")
+        endpoints = {}
+        for item in args.docker_endpoint:
+            name, separator, url = item.partition("=")
+            if not separator:
+                raise ValueError(f"--docker-endpoint expects REPO=URL: {item}")
+            endpoints[name] = http_url(url, "--docker-endpoint")
+        password = args.password_file.read_text(encoding="utf-8").rstrip("\r\n")
+        if not password:
+            raise ValueError(f"The password file is empty: {args.password_file}")
+        snapshot = Snapshot(args.db_file)
+        try:
+            for name in [*args.repository, *endpoints]:
+                if name not in snapshot.repositories:
+                    raise ValueError(f"Repository not found in the source: {name}")
+                if name in endpoints and snapshot.repositories[name]["format"] != "docker":
+                    raise ValueError(f"--docker-endpoint names a non-Docker repository: {name}")
+            names = [name for name in creation_order(snapshot.repositories)
+                     if not args.repository or name in args.repository]
+            migration = Migration(snapshot, NexusClient(target, args.username, password, args.timeout), endpoints)
+            repositories = migration.run(names)
+        finally:
+            snapshot.close()
+    except (OSError, ValueError, sqlite3.Error, MigrationError) as exc:
+        parser.exit(1, f"Nexus migrate failed: {exc}\n")
+    counts, failures = migration.counts, migration.failures
+    print(f"Migrated {repositories} repositories ({counts['created']} created, {counts['existing']} already present) "
+          f"and {counts['uploaded']} assets ({counts['skipped']} already present) to {target}"
+          + (f"; {len(failures)} failures" if failures else ""))
+    return 1 if failures else 0
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["export"]:
+        return export_main(argv[1:])
+    if argv[:1] == ["migrate"]:
+        return migrate_main(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--host", default="127.0.0.1", help="listen address (default: %(default)s)")
     parser.add_argument("--port", type=int, default=8081, help="listen port, 0 chooses a free port (default: %(default)s)")
