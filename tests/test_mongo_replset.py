@@ -324,8 +324,15 @@ class ReplicaSetTests(unittest.TestCase):
         client.send("work", insert)
         client.close()
         client = self.client(port)
+        # The reply to the first insert is lost with its connection. Retry only once the server has applied it;
+        # otherwise the retry runs first and the late original becomes the recognized retry instead.
+        deadline = time.monotonic() + 10
+        while client("work", {"count": "jobs"})["n"] < 2:
+            self.assertLess(time.monotonic(), deadline, "the first insert was never applied")
+            time.sleep(0.02)
         retried = client("work", insert)
         self.assertEqual((retried["n"], retried["retriedStmtIds"]), (2, [0, 1]))
+        self.assertEqual(client("work", {"count": "jobs"})["n"], 2)
         modify = {
             "findAndModify": "jobs",
             "query": {"_id": 1},
