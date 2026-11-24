@@ -10,7 +10,8 @@ The server implements RESP2/RESP3 with logical databases. Use --cluster for
 Redis Cluster clients that need to discover a single primary with all slots.
 The snapshot format is specific to this server; run `export --db-file FILE
 --out dump.rdb` to write an RDB file (or RESP commands with --format resp)
-that Redis 7.0 or later loads. Multi-node clustering,
+that Redis 7.0 or later loads, and `import --db-file NEW --in PATH` to build a
+snapshot from an RDB file or append-only file of Redis 8.4 or earlier. Multi-node clustering,
 replication, Sentinel, Lua/functions, modules, and ACL management are outside
 its compatibility scope.
 """
@@ -378,6 +379,8 @@ class Store:
         self.started = int(time.time())
         self.last_save = self.started
         self.processed = 0
+        # While replaying an append-only file nothing expires, as in Redis, so later commands see every key.
+        self.loading = False
         if snapshot is not None and snapshot.exists():
             self.load()
 
@@ -407,10 +410,13 @@ class Store:
             watcher.watch_dirty = True
         self.changed.notify_all()
 
+    def expired(self, expires: int | None) -> bool:
+        return expires is not None and not self.loading and expires <= milliseconds()
+
     def get(self, database: int, key: bytes, kind: bytes | None = None) -> Entry | None:
         data = self.databases[database]
         entry = data.get(key)
-        if entry is not None and entry.expires is not None and entry.expires <= milliseconds():
+        if entry is not None and self.expired(entry.expires):
             del data[key]
             self.touch(database, key)
             entry = None
@@ -904,6 +910,74 @@ class Store:
         self.put(database, key, entry)
         return 1
 
+    @command("SWAPDB", 2, exact=True)
+    def swapdb(self, session, name, args):
+        if self.cluster:
+            raise RedisError("ERR SWAPDB is not allowed in cluster mode")
+        indexes = []
+        for arg, which in zip(args, ("first", "second")):
+            try:
+                indexes.append(integer(arg, minimum=-(1 << 31), maximum=(1 << 31) - 1))
+            except RedisError:
+                raise RedisError(f"ERR invalid {which} DB index") from None
+        first, second = indexes
+        if not (0 <= first < len(self.databases) and 0 <= second < len(self.databases)):
+            raise RedisError("ERR DB index is out of range")
+        self.databases[first], self.databases[second] = self.databases[second], self.databases[first]
+        for database, key in list(self.watchers):
+            if database in {first, second}:
+                self.touch(database, key)
+        self.changed.notify_all()
+        return OK
+
+    @command("DUMP", 1, exact=True)
+    def dump(self, session, name, args):
+        entry = self.get(session.database, args[0])
+        if entry is None:
+            return None
+        payload = bytes((RDB_TYPES[entry.kind],)) + b"".join(rdb_payload(entry)) + RDB_FORMAT_VERSION.to_bytes(2, "little")
+        return payload + crc64(payload).to_bytes(8, "little")
+
+    @command("RESTORE RESTORE-ASKING", 3, 9)
+    def restore(self, session, name, args):
+        key, raw_ttl, payload, *options = args
+        ttl = integer(raw_ttl)
+        if ttl < 0:
+            raise RedisError("ERR Invalid TTL value, must be >= 0")
+        replace = absolute = False
+        while options:
+            option = options.pop(0).upper()
+            if option == b"REPLACE":
+                replace = True
+            elif option == b"ABSTTL":
+                absolute = True
+            elif option == b"IDLETIME" and options:
+                if integer(options.pop(0)) < 0:
+                    raise RedisError("ERR Invalid IDLETIME value, must be >= 0")
+            elif option == b"FREQ" and options:
+                if not 0 <= integer(options.pop(0)) <= 255:
+                    raise RedisError("ERR Invalid FREQ value, must be >= 0 and <= 255")
+            else:
+                raise RedisError(SYNTAX)
+        if not replace and self.get(session.database, key) is not None:
+            raise RedisError("BUSYKEY Target key name already exists.")
+        if (len(payload) < 10 or int.from_bytes(payload[-10:-8], "little") > RDB_IMPORT_VERSION
+                or crc64(payload[:-8]) != int.from_bytes(payload[-8:], "little")):
+            raise RedisError("ERR DUMP payload version or checksum are wrong")
+        reader = RDBReader(payload[:-10])
+        try:
+            value = read_rdb_value(reader, reader.byte())
+        except ValueError:
+            value = None
+        if value is None:
+            raise RedisError("ERR Bad data format")
+        expires = (ttl if absolute else milliseconds() + ttl) if ttl else None
+        if self.expired(expires):
+            self.delete(session.database, key)
+        else:
+            self.put(session.database, key, Entry(*value, expires))
+        return OK
+
     @command("EXPIRE PEXPIRE EXPIREAT PEXPIREAT", 2, 4)
     def expire(self, session, name, args):
         key, duration, *options = args
@@ -926,7 +1000,7 @@ class Store:
             return 0
         if b"LT" in flags and existing is not None and absolute >= existing:
             return 0
-        if absolute <= milliseconds():
+        if self.expired(absolute):
             return self.delete(session.database, key)
         entry.expires = absolute
         self.touch(session.database, key)
@@ -1024,7 +1098,7 @@ class Store:
             return previous
         if keep_ttl and old:
             expires = old.expires
-        if expires is not None and expires <= milliseconds():
+        if self.expired(expires):
             self.delete(session.database, key)
         else:
             self.put(session.database, key, Entry(b"string", value, expires))
@@ -1055,7 +1129,7 @@ class Store:
         if entry is None:
             return None
         if options:
-            if expires is not None and expires <= milliseconds():
+            if self.expired(expires):
                 self.delete(session.database, key)
             elif entry.expires != expires:
                 entry.expires = expires
@@ -1960,9 +2034,11 @@ class Store:
                 if identifier > start and state.consumer == consumer
             ][:count]
             for identifier in pending:
-                state = group.pending[identifier]
-                state.delivered_at = now
-                state.deliveries += 1
+                # Redis reports a deleted pending entry without counting another delivery.
+                if identifier in stream.items:
+                    state = group.pending[identifier]
+                    state.delivered_at = now
+                    state.deliveries += 1
             self.touch(session.database, key)
             return [[stream_id_bytes(identifier), stream.items.get(identifier)] for identifier in pending]
         entries = [
@@ -2056,6 +2132,144 @@ class Store:
                 for consumer, seen in group.consumers.items()
             ]
         raise RedisError(SYNTAX)
+
+    @command("XSETID", 2, 6)
+    def xsetid(self, session, name, args):
+        key, raw_id, *options = args
+        identifier = parse_stream_id(raw_id)
+        entries_added = None
+        for option, value in pairs(options):
+            option = option.upper()
+            if option == b"ENTRIESADDED":
+                entries_added = integer(value)
+                if entries_added < 0:
+                    raise RedisError("ERR entries_added must be positive")
+            elif option == b"MAXDELETEDID":
+                # The server keeps no deletion tombstone, so the ID is only validated.
+                if identifier < parse_stream_id(value):
+                    raise RedisError("ERR The ID specified in XSETID is smaller than the provided max_deleted_entry_id")
+            else:
+                raise RedisError(SYNTAX)
+        stream = self.value(session, key, b"stream")
+        if stream is None:
+            raise RedisError("ERR no such key")
+        if stream.items:
+            if identifier < max(stream.items):
+                raise RedisError("ERR The ID specified in XSETID is smaller than the target stream top item")
+            if entries_added is not None and entries_added < len(stream.items):
+                raise RedisError("ERR The entries_added specified in XSETID is smaller than the target stream length")
+        stream.last_id = identifier
+        if entries_added is not None:
+            stream.entries_added = entries_added
+        self.touch(session.database, key)
+        return OK
+
+    def claim_group(self, session, key, group_name, raw_idle, command_name):
+        stream = self.value(session, key, b"stream")
+        group = require_group(stream, group_name)
+        try:
+            return stream, group, max(0, integer(raw_idle))
+        except RedisError:
+            raise RedisError(f"ERR Invalid min-idle-time argument for {command_name}") from None
+
+    def claim_reply(self, stream, identifier, justid):
+        return stream_id_bytes(identifier) if justid else [stream_id_bytes(identifier), stream.items[identifier]]
+
+    @command("XCLAIM", 5)
+    def xclaim(self, session, name, args):
+        key, group_name, consumer, raw_idle, *rest = args
+        stream, group, min_idle = self.claim_group(session, key, group_name, raw_idle, "XCLAIM")
+        ids = []
+        while rest:
+            try:
+                ids.append(parse_stream_id(rest[0]))
+            except RedisError:
+                break
+            rest.pop(0)
+        delivered = retry_count = last_id = None
+        force = justid = False
+        while rest:
+            raw_option = rest.pop(0)
+            option = raw_option.upper()
+            if option == b"FORCE":
+                force = True
+            elif option == b"JUSTID":
+                justid = True
+            elif option in {b"IDLE", b"TIME", b"RETRYCOUNT"} and rest:
+                value = integer(rest.pop(0))
+                if option == b"RETRYCOUNT":
+                    retry_count = value
+                else:
+                    delivered = value if option == b"TIME" else milliseconds() - value
+            elif option == b"LASTID" and rest:
+                last_id = parse_stream_id(rest.pop(0))
+            else:
+                raise RedisError(f"ERR Unrecognized XCLAIM option '{raw_option.decode('utf-8', 'replace')}'")
+        if last_id is not None and last_id > group.last_id:
+            group.last_id = last_id
+        now = group.consumers[consumer] = milliseconds()
+        self.touch(session.database, key)
+        if delivered is None or not 0 <= delivered <= now:
+            delivered = now
+        result = []
+        for identifier in ids:
+            state = group.pending.get(identifier)
+            if identifier not in stream.items:
+                group.pending.pop(identifier, None)
+                continue
+            if state is None and not force:
+                continue
+            if state is None:
+                state = group.pending[identifier] = PendingMessage(consumer, delivered, 1)
+            elif min_idle and now - state.delivered_at < min_idle:
+                continue
+            state.consumer, state.delivered_at = consumer, delivered
+            if retry_count is not None and retry_count >= 0:
+                state.deliveries = retry_count
+            elif not justid:
+                state.deliveries += 1
+            result.append(self.claim_reply(stream, identifier, justid))
+        return result
+
+    @command("XAUTOCLAIM", 5, 8)
+    def xautoclaim(self, session, name, args):
+        key, group_name, consumer, raw_idle, start, *options = args
+        stream, group, min_idle = self.claim_group(session, key, group_name, raw_idle, "XAUTOCLAIM")
+        count, justid = 100, False
+        while options:
+            option = options.pop(0).upper()
+            if option == b"COUNT" and options:
+                try:
+                    count = integer(options.pop(0), minimum=1, maximum=MAX_INT // 16)
+                except RedisError:
+                    raise RedisError("ERR COUNT must be > 0") from None
+            elif option == b"JUSTID":
+                justid = True
+            else:
+                raise RedisError(SYNTAX)
+        minimum, _ = stream_bounds(start, b"+")
+        now = group.consumers[consumer] = milliseconds()
+        self.touch(session.database, key)
+        candidates = sorted(identifier for identifier in group.pending if identifier >= minimum)
+        claimed, deleted, attempts, index = [], [], count * 10, 0
+        while attempts and count and index < len(candidates):
+            identifier = candidates[index]
+            index += 1
+            attempts -= 1
+            state = group.pending[identifier]
+            if identifier not in stream.items:
+                del group.pending[identifier]
+                deleted.append(stream_id_bytes(identifier))
+                count -= 1
+                continue
+            if min_idle and now - state.delivered_at < min_idle:
+                continue
+            state.consumer, state.delivered_at = consumer, now
+            state.deliveries += not justid
+            claimed.append(self.claim_reply(stream, identifier, justid))
+            count -= 1
+        cursor = stream_id_bytes(candidates[index]) if index < len(candidates) else b"0-0"
+        return [cursor, claimed, deleted]
 
 
 MAX_STREAM_COMPONENT = (1 << 64) - 1
@@ -2161,7 +2375,7 @@ KEYLESS_COMMANDS = {
     b"PING", b"ECHO", b"QUIT", b"RESET", b"AUTH", b"HELLO", b"CLIENT", b"SELECT", b"TIME",
     b"SAVE", b"BGSAVE", b"LASTSAVE", b"INFO", b"ROLE", b"READONLY", b"READWRITE", b"ASKING",
     b"CLUSTER", b"CONFIG", b"COMMAND", b"MULTI", b"DISCARD", b"EXEC", b"UNWATCH", b"RANDOMKEY",
-    b"DBSIZE", b"KEYS", b"FLUSHDB", b"FLUSHALL", b"SCAN",
+    b"DBSIZE", b"KEYS", b"FLUSHDB", b"FLUSHALL", b"SCAN", b"SWAPDB",
 } | PUBSUB_COMMANDS
 MULTI_KEY_COMMANDS = {
     b"WATCH", b"DEL", b"UNLINK", b"EXISTS", b"TOUCH", b"MGET", b"SUNION", b"SINTER", b"SDIFF",
@@ -2890,10 +3104,716 @@ def export_main(argv) -> int:
     return 0
 
 
+# Redis RDB, append-only file, and RESP import
+
+# Redis 7.4 through 8.4 write RDB version 12; Redis 8.6 and later write newer versions.
+RDB_IMPORT_VERSION = 12
+IMPORT_DATABASES = 1024
+MASK64 = (1 << 64) - 1
+ZIPLIST_INTEGERS = {0xC0: 2, 0xD0: 4, 0xE0: 8, 0xF0: 3, 0xFE: 1}
+LISTPACK_INTEGERS = {0xF1: 2, 0xF2: 3, 0xF3: 4, 0xF4: 8}
+MODULE_TYPE_CHARACTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+SCRIPT_COMMANDS = {b"EVAL", b"EVALSHA", b"EVAL_RO", b"EVALSHA_RO", b"FCALL", b"FCALL_RO"}
+
+
+class RDBReader:
+    """Decode RDB primitives from a buffer; error offsets count from the start of the buffer."""
+
+    def __init__(self, data: bytes, offset: int = 0):
+        self.data, self.offset = data, offset
+
+    def fail(self, message: str):
+        raise ValueError(f"{message} at byte {self.offset}")
+
+    def take(self, size: int) -> bytes:
+        if self.offset + size > len(self.data):
+            self.fail("unexpected end of data")
+        self.offset += size
+        return self.data[self.offset - size:self.offset]
+
+    def byte(self) -> int:
+        return self.take(1)[0]
+
+    def length(self) -> int:
+        first = self.byte()
+        if first < 0x80:
+            return first if first < 0x40 else (first & 0x3F) << 8 | self.byte()
+        if first in (0x80, 0x81):
+            return int.from_bytes(self.take(4 if first == 0x80 else 8), "big")
+        self.fail(f"invalid length encoding {first:#04x}")
+
+    def string(self) -> bytes:
+        first = self.byte()
+        if first < 0xC0:
+            self.offset -= 1
+            return self.take(self.length())
+        encoding = first & 0x3F
+        if encoding < 3:
+            return b"%d" % int.from_bytes(self.take(1 << encoding), "little", signed=True)
+        if encoding != 3:
+            self.fail(f"invalid string encoding {encoding}")
+        compressed, size = self.length(), self.length()
+        return lzf_decompress(self.take(compressed), size)
+
+    def milliseconds(self) -> int:
+        return int.from_bytes(self.take(8), "little", signed=True)
+
+    def stream_id(self) -> tuple[int, int]:
+        return self.length(), self.length()
+
+    def double(self) -> float:
+        size = self.byte()
+        special = {253: math.nan, 254: math.inf, 255: -math.inf}
+        return special[size] if size in special else float(self.take(size))
+
+
+def lzf_decompress(data: bytes, size: int) -> bytes:
+    output = bytearray()
+    position = 0
+    try:
+        while position < len(data):
+            control = data[position]
+            position += 1
+            if control < 32:
+                output += data[position:position + control + 1]
+                position += control + 1
+                continue
+            length = control >> 5
+            if length == 7:
+                length += data[position]
+                position += 1
+            start = len(output) - ((control & 0x1F) << 8) - data[position] - 1
+            end = start + length + 2
+            position += 1
+            if start < 0:
+                raise IndexError
+            if end <= len(output):
+                output += output[start:end]
+            else:
+                for index in range(start, end):
+                    output.append(output[index])
+    except IndexError:
+        raise ValueError("invalid LZF compressed string") from None
+    if position != len(data) or len(output) != size:
+        raise ValueError("invalid LZF compressed string")
+    return bytes(output)
+
+
+def element_bytes(value: bytes | int) -> bytes:
+    return value if isinstance(value, bytes) else b"%d" % value
+
+
+def ziplist_items(blob: bytes) -> list:
+    """Decode a ziplist, which Redis 6.2 and earlier save, into bytes and integers."""
+    if len(blob) < 11 or int.from_bytes(blob[:4], "little") != len(blob) or blob[-1] != 0xFF:
+        raise ValueError("invalid ziplist header")
+    items, offset = [], 10
+    try:
+        while blob[offset] != 0xFF:
+            offset += 5 if blob[offset] == 0xFE else 1
+            first = blob[offset]
+            if first < 0xC0:
+                if first < 0x40:
+                    size, offset = first, offset + 1
+                elif first < 0x80:
+                    size, offset = (first & 0x3F) << 8 | blob[offset + 1], offset + 2
+                else:
+                    size, offset = int.from_bytes(blob[offset + 1:offset + 5], "big"), offset + 5
+                items.append(blob[offset:offset + size])
+                offset += size
+            elif 0xF1 <= first <= 0xFD:
+                items.append((first & 0x0F) - 1)
+                offset += 1
+            else:
+                width = ZIPLIST_INTEGERS[first]
+                items.append(int.from_bytes(blob[offset + 1:offset + 1 + width], "little", signed=True))
+                offset += 1 + width
+    except (IndexError, KeyError):
+        raise ValueError("invalid ziplist entry") from None
+    if offset != len(blob) - 1 or int.from_bytes(blob[8:10], "little") not in (len(items), 0xFFFF):
+        raise ValueError("invalid ziplist")
+    return items
+
+
+def listpack_items(blob: bytes) -> list:
+    """Decode a listpack into bytes and integers."""
+    if len(blob) < 7 or int.from_bytes(blob[:4], "little") != len(blob) or blob[-1] != 0xFF:
+        raise ValueError("invalid listpack header")
+    items, offset, end = [], 6, len(blob) - 1
+    try:
+        while offset < end:
+            start, first = offset, blob[offset]
+            if first < 0x80:
+                items.append(first)
+                offset += 1
+            elif first < 0xC0:
+                offset += 1 + (first & 0x3F)
+                items.append(blob[start + 1:offset])
+            elif first < 0xE0:
+                value = (first & 0x1F) << 8 | blob[offset + 1]
+                items.append(value - 8192 if value >= 4096 else value)
+                offset += 2
+            elif first < 0xF0:
+                offset += 2 + ((first & 0x0F) << 8 | blob[offset + 1])
+                items.append(blob[start + 2:offset])
+            elif first == 0xF0:
+                offset += 5 + int.from_bytes(blob[offset + 1:offset + 5], "little")
+                items.append(blob[start + 5:offset])
+            else:
+                offset += 1 + LISTPACK_INTEGERS[first]
+                items.append(int.from_bytes(blob[start + 1:offset], "little", signed=True))
+            size = offset - start
+            offset += 1 if size <= 127 else 2 if size < 16383 else 3 if size < 2097151 else 4 if size < 268435455 else 5
+    except (IndexError, KeyError):
+        raise ValueError("invalid listpack entry") from None
+    if offset != end or int.from_bytes(blob[4:6], "little") not in (len(items), 0xFFFF):
+        raise ValueError("invalid listpack")
+    return items
+
+
+def intset_items(blob: bytes) -> list[int]:
+    width, count = int.from_bytes(blob[:4], "little"), int.from_bytes(blob[4:8], "little")
+    if width not in (2, 4, 8) or len(blob) != 8 + width * count:
+        raise ValueError("invalid intset")
+    return [int.from_bytes(blob[index:index + width], "little", signed=True) for index in range(8, len(blob), width)]
+
+
+def zipmap_items(blob: bytes) -> list[bytes]:
+    """Decode a zipmap, the hash encoding of Redis 2.4 and earlier, into alternating fields and values."""
+    items, offset = [], 1
+    try:
+        while blob[offset] != 0xFF:
+            for value in (False, True):
+                size = blob[offset]
+                if size == 0xFF:
+                    raise IndexError
+                if size == 0xFE:
+                    size, offset = int.from_bytes(blob[offset + 1:offset + 5], "little"), offset + 5
+                else:
+                    offset += 1
+                free = blob[offset] if value else 0
+                offset += value
+                items.append(blob[offset:offset + size])
+                offset += size + free
+    except IndexError:
+        raise ValueError("invalid zipmap") from None
+    if offset != len(blob) - 1:
+        raise ValueError("invalid zipmap")
+    return items
+
+
+def rdb_collection(kind: bytes, items: list):
+    """Return (kind, value) from decoded elements, or None for an empty collection; reject duplicates like Redis."""
+    if not items:
+        return None
+    if kind == b"list":
+        return kind, [element_bytes(item) for item in items]
+    if kind == b"set":
+        members = {element_bytes(item) for item in items}
+        if len(members) != len(items):
+            raise ValueError("duplicate set members")
+        return kind, members
+    if len(items) % 2:
+        raise ValueError(f"{kind.decode()} has an odd number of elements")
+    if kind == b"hash":
+        value = {element_bytes(field): element_bytes(item) for field, item in zip(items[::2], items[1::2])}
+    else:
+        value = {element_bytes(member): float(score) for member, score in zip(items[::2], items[1::2])}
+        if any(math.isnan(score) for score in value.values()):
+            raise ValueError("sorted set score is NaN")
+    if 2 * len(value) != len(items):
+        raise ValueError(f"duplicate {kind.decode()} fields")
+    return kind, value
+
+
+def module_type_name(module_id: int) -> str:
+    return "".join(MODULE_TYPE_CHARACTERS[(module_id >> (10 + 6 * index)) & 63] for index in range(8, -1, -1))
+
+
+def skip_module_value(reader: RDBReader) -> None:
+    while (opcode := reader.length()) != 0:
+        if opcode in (1, 2):
+            reader.length()
+        elif opcode in (3, 4):
+            reader.take(4 if opcode == 3 else 8)
+        elif opcode == 5:
+            reader.string()
+        else:
+            reader.fail(f"invalid module data opcode {opcode}")
+
+
+def estimate_entries_read(stream: Stream, first_id, group_id):
+    """Mirror streamEstimateDistanceFromFirstEverEntry for RDB 9 groups, whose streams keep no tombstone."""
+    added, length = stream.entries_added, len(stream.items)
+    if not added:
+        return 0
+    if (not length and group_id <= stream.last_id) or group_id == stream.last_id:
+        return added
+    if group_id > stream.last_id:
+        return None
+    if group_id < first_id:
+        return added - length
+    return added - length + 1 if group_id == first_id else None
+
+
+def stream_node_entries(items: list, master: tuple[int, int]) -> list:
+    """Return the live entries of one stream listpack node, skipping deleted ones."""
+    try:
+        count, deleted, width = items[:3]
+        names = [element_bytes(name) for name in items[3:3 + width]]
+        if items[3 + width] != 0:
+            raise ValueError
+        position, entries = 4 + width, []
+        for _ in range(count + deleted):
+            flags, ms, seq = items[position:position + 3]
+            position += 3
+            if flags & 2:
+                fields = [part for pair in zip(names, items[position:position + width]) for part in pair]
+                position += width
+            else:
+                size = items[position]
+                fields = items[position + 1:position + 1 + 2 * size]
+                position += 1 + 2 * size
+            position += 1
+            if not flags & 1:
+                identifier = ((master[0] + ms) & MASK64, (master[1] + seq) & MASK64)
+                entries.append((identifier, [element_bytes(part) for part in fields]))
+    except (IndexError, TypeError, ValueError):
+        raise ValueError("invalid stream listpack") from None
+    if position != len(items) or len(entries) != count or any(not fields or len(fields) % 2 for _, fields in entries):
+        raise ValueError("invalid stream listpack")
+    return entries
+
+
+def read_rdb_stream(reader: RDBReader, rdb_type: int) -> Stream:
+    stream = Stream()
+    for _ in range(reader.length()):
+        master = reader.string()
+        if len(master) != 16:
+            reader.fail("invalid stream node ID")
+        master_id = (int.from_bytes(master[:8], "big"), int.from_bytes(master[8:], "big"))
+        for identifier, fields in stream_node_entries(listpack_items(reader.string()), master_id):
+            if stream.items and identifier <= next(reversed(stream.items)):
+                raise ValueError("stream entries are out of order")
+            stream.items[identifier] = fields
+    length, stream.last_id = reader.length(), reader.stream_id()
+    if rdb_type == 15:
+        first_id, stream.entries_added = next(iter(stream.items), ZERO_STREAM_ID), length
+    else:
+        # The maximal deleted entry ID has no place in the snapshot, which keeps no tombstones.
+        first_id, _, stream.entries_added = reader.stream_id(), reader.stream_id(), reader.length()
+    if length != len(stream.items):
+        raise ValueError(f"stream length {length} does not match its {len(stream.items)} entries")
+    for _ in range(reader.length()):
+        name, last_id = reader.string(), reader.stream_id()
+        entries_read = estimate_entries_read(stream, first_id, last_id) if rdb_type == 15 else reader.length()
+        if name in stream.groups:
+            raise ValueError(f"duplicate consumer group {name!r}")
+        if entries_read is not None and entries_read > MAX_INT:
+            entries_read = None  # Redis saves the unknown counter, -1, as an unsigned length.
+        group = stream.groups[name] = StreamGroup(last_id, entries_read)
+        for _ in range(reader.length()):
+            identifier = raw_stream_tuple(reader.take(16))
+            if identifier in group.pending:
+                raise ValueError(f"duplicate pending entry in group {name!r}")
+            group.pending[identifier] = PendingMessage(None, reader.milliseconds(), reader.length())
+        for _ in range(reader.length()):
+            consumer = reader.string()
+            if consumer in group.consumers:
+                raise ValueError(f"duplicate consumer {consumer!r} in group {name!r}")
+            group.consumers[consumer] = reader.milliseconds()
+            if rdb_type == 21:
+                reader.milliseconds()  # The active time; the server keeps only the seen time.
+            for _ in range(reader.length()):
+                state = group.pending.get(raw_stream_tuple(reader.take(16)))
+                if state is None or state.consumer is not None:
+                    raise ValueError(f"consumer {consumer!r} owns an entry missing from or claimed in group {name!r}")
+                state.consumer = consumer
+        if any(state.consumer is None for state in group.pending.values()):
+            raise ValueError(f"group {name!r} has pending entries without a consumer")
+    return stream
+
+
+def raw_stream_tuple(data: bytes) -> tuple[int, int]:
+    return int.from_bytes(data[:8], "big"), int.from_bytes(data[8:], "big")
+
+
+ENCODED_RDB_TYPES = {
+    9: (b"hash", zipmap_items), 10: (b"list", ziplist_items), 11: (b"set", intset_items),
+    12: (b"zset", ziplist_items), 13: (b"hash", ziplist_items), 16: (b"hash", listpack_items),
+    17: (b"zset", listpack_items), 20: (b"set", listpack_items), 23: (b"hash", listpack_items),
+    25: (b"hash", listpack_items),
+}
+FIELD_EXPIRATION_ERROR = "it is a hash with field expiration times (Redis 7.4 or later), which the server cannot store"
+
+
+def read_rdb_value(reader: RDBReader, rdb_type: int):
+    """Decode one RDB object as (kind, value), or None for an empty collection, which Redis skips."""
+    if rdb_type == 0:
+        return b"string", reader.string()
+    if rdb_type in (1, 2, 4):
+        count = reader.length() * (2 if rdb_type == 4 else 1)
+        return rdb_collection({1: b"list", 2: b"set", 4: b"hash"}[rdb_type], [reader.string() for _ in range(count)])
+    if rdb_type in (3, 5):
+        items = []
+        for _ in range(reader.length()):
+            items.append(reader.string())
+            items.append(struct.unpack("<d", reader.take(8))[0] if rdb_type == 5 else reader.double())
+        return rdb_collection(b"zset", items)
+    if rdb_type in (22, 24):
+        if rdb_type == 24:
+            reader.milliseconds()
+        items, expiring = [], False
+        for _ in range(reader.length()):
+            expiring |= reader.length() != 0
+            items += (reader.string(), reader.string())
+        if expiring:
+            raise ValueError(FIELD_EXPIRATION_ERROR)
+        return rdb_collection(b"hash", items)
+    if rdb_type in (14, 18):
+        items = []
+        for _ in range(reader.length()):
+            container = reader.length() if rdb_type == 18 else 2
+            node = reader.string()
+            if not node or container not in (1, 2):
+                raise ValueError("invalid quicklist node")
+            items += [node] if container == 1 else (listpack_items if rdb_type == 18 else ziplist_items)(node)
+        return rdb_collection(b"list", items)
+    if rdb_type in ENCODED_RDB_TYPES:
+        if rdb_type == 25:
+            reader.milliseconds()
+        kind, decode = ENCODED_RDB_TYPES[rdb_type]
+        items = decode(reader.string())
+        if rdb_type in (23, 25):
+            if len(items) % 3:
+                raise ValueError("invalid hash listpack with field expiration times")
+            if any(items[2::3]):
+                raise ValueError(FIELD_EXPIRATION_ERROR)
+            items = [item for index, item in enumerate(items) if index % 3 != 2]
+        return rdb_collection(kind, items)
+    if rdb_type in (15, 19, 21):
+        return b"stream", read_rdb_stream(reader, rdb_type)
+    if rdb_type == 7:
+        module_id = reader.length()
+        raise ValueError(f"it holds a value of module type {module_type_name(module_id)!r} "
+                         f"(encoding version {module_id & 1023}), which the server cannot store")
+    if rdb_type == 6:
+        raise ValueError("it holds module data in the pre-release Redis 4.0 format")
+    raise ValueError(f"unknown RDB value type {rdb_type}")
+
+
+@dataclass
+class ImportNotes:
+    empty: int = 0
+    functions: int = 0
+    scripts: int = 0
+    commands: int = 0
+    modules: set[str] = field(default_factory=set)
+    warnings: list[str] = field(default_factory=list)
+
+    def report(self) -> list[str]:
+        messages = list(self.warnings)
+        if self.empty:
+            messages.append(f"skipped {self.empty} empty keys, as Redis does when it loads them")
+        if self.functions:
+            messages.append(f"skipped {self.functions} function libraries; the server does not run Redis Functions")
+        if self.scripts:
+            messages.append(f"skipped {self.scripts} FUNCTION and SCRIPT commands; the server does not run scripts")
+        if self.modules:
+            messages.append(f"skipped auxiliary data of module types {', '.join(sorted(self.modules))}")
+        return messages
+
+
+def read_rdb(data: bytes, offset: int, label: str, databases: list[dict], notes: ImportNotes) -> tuple[int, int]:
+    """Load the RDB image at offset into databases and return (offset after it, RDB version)."""
+    reader = RDBReader(data, offset)
+    database, expires = 0, None
+    try:
+        signature = reader.take(9)
+        if signature[:5] != b"REDIS" or not signature[5:].isdigit():
+            raise ValueError("not an RDB file: the REDIS signature is missing")
+        version = int(signature[5:])
+        if not 1 <= version <= RDB_IMPORT_VERSION:
+            raise ValueError(f"RDB version {version} is not supported; import reads versions 1 to "
+                             f"{RDB_IMPORT_VERSION}, which Redis 8.4 and earlier write")
+        while (opcode := reader.byte()) != 0xFF:
+            if opcode == 0xFD:
+                expires = int.from_bytes(reader.take(4), "little", signed=True) * 1000
+            elif opcode == 0xFC:
+                expires = reader.milliseconds()
+            elif opcode == 0xF9:
+                reader.take(1)
+            elif opcode in (0xF8, 0xFB, 0xF4):
+                # IDLE, RESIZEDB, and SLOT_INFO only carry eviction and sizing hints.
+                for _ in range({0xF8: 1, 0xFB: 2, 0xF4: 3}[opcode]):
+                    reader.length()
+            elif opcode == 0xFE:
+                database = reader.length()
+                if database >= IMPORT_DATABASES:
+                    reader.fail(f"database {database} exceeds the {IMPORT_DATABASES} databases the server supports")
+            elif opcode == 0xFA:
+                reader.string()
+                reader.string()
+            elif opcode == 0xF7:
+                module = module_type_name(reader.length())
+                if reader.length() != 2:
+                    reader.fail("invalid module auxiliary data")
+                reader.length()
+                skip_module_value(reader)
+                notes.modules.add(module)
+            elif opcode in (0xF5, 0xF6):
+                if opcode == 0xF6:
+                    # Redis 7.0 release candidates saved the library name, engine, and description separately.
+                    reader.string()
+                    reader.string()
+                    if reader.length():
+                        reader.string()
+                reader.string()
+                notes.functions += 1
+            else:
+                key = reader.string()
+                try:
+                    value = read_rdb_value(reader, opcode)
+                except ValueError as error:
+                    raise ValueError(f"cannot import key {key!r} in database {database}: {error}") from None
+                if value is None:
+                    notes.empty += 1
+                elif key in databases[database]:
+                    raise ValueError(f"duplicate key {key!r} in database {database}")
+                else:
+                    databases[database][key] = Entry(*value, expires)
+                expires = None
+        end = reader.offset
+        if version >= 5:
+            checksum = int.from_bytes(reader.take(8), "little")
+            if checksum and checksum != crc64(data[offset:end]):
+                raise ValueError("the RDB checksum does not match its contents")
+    except ValueError as error:
+        raise ValueError(f"{label}: {error}") from None
+    return reader.offset, version
+
+
+class AOFTruncated(ValueError):
+    """The data ends inside a command."""
+
+
+def aof_number(line: bytes, prefix: bytes) -> int | None:
+    digits = line[1:-2]
+    if line[:1] != prefix or line[-2:] != b"\r\n" or not digits.isdigit() or len(digits) > 18:
+        return None
+    return int(digits)
+
+
+def read_aof_command(data: bytes, position: int):
+    """Return (arguments, next position) for the command at position; arguments is None for an annotation."""
+    end = data.find(b"\n", position)
+    if data[position:position + 1] == b"#":
+        return None, len(data) if end < 0 else end + 1
+    if end < 0:
+        raise AOFTruncated
+    count = aof_number(data[position:end + 1], b"*")
+    if not count:
+        raise ValueError("expected a RESP array of bulk strings")
+    position, arguments = end + 1, []
+    for _ in range(count):
+        end = data.find(b"\n", position)
+        if end < 0:
+            raise AOFTruncated
+        size = aof_number(data[position:end + 1], b"$")
+        if size is None:
+            raise ValueError("expected a bulk string")
+        start, position = end + 1, end + 3 + size
+        if position > len(data):
+            raise AOFTruncated
+        if data[position - 2:position] != b"\r\n":
+            raise ValueError("bulk string is not terminated by CRLF")
+        arguments.append(data[start:position - 2])
+    return arguments, position
+
+
+def replay_aof(store: Store, data: bytes, position: int, label: str, notes: ImportNotes, *,
+               last: bool, allow_truncated: bool) -> None:
+    """Run each command through the server's own implementation, as Redis replays an append-only file."""
+    session = Session(0, True)
+    session.closing = True  # Blocking commands return at once, as they do for the Redis AOF client.
+    transaction = 0
+    while position < len(data):
+        try:
+            arguments, following = read_aof_command(data, position)
+        except AOFTruncated:
+            break
+        except ValueError as error:
+            raise ValueError(f"{label}: invalid command at byte {position}: {error}") from None
+        if arguments is not None:
+            name = arguments[0].upper()
+            if name == b"MULTI" and session.pending is None:
+                transaction = position
+            if name in {b"FUNCTION", b"SCRIPT"}:
+                notes.scripts += 1
+            elif name in SCRIPT_COMMANDS:
+                raise ValueError(f"{label}: {name.decode()} at byte {position} runs a script, which the server cannot do")
+            elif name not in COMMANDS:
+                raise ValueError(f"{label}: unsupported command {arguments[0][:64]!r} at byte {position}")
+            else:
+                try:
+                    reply = store.execute(session, arguments)
+                    if name == b"EXEC" and isinstance(reply, list):
+                        for item in reply:
+                            if isinstance(item, RedisError):
+                                raise item
+                except RedisError as error:
+                    raise ValueError(f"{label}: {name.decode('ascii', 'replace')} at byte {position} failed: {error}") from None
+                notes.commands += 1
+        position = following
+    pending = session.pending is not None
+    if position < len(data) or pending:
+        position = transaction if pending else position
+        what = "transaction" if pending else "command"
+        if not (allow_truncated and last):
+            hint = "pass --allow-truncated to load the commands before it" if last else "only the last file may be truncated"
+            raise ValueError(f"{label} ends with an incomplete {what} at byte {position}; {hint}")
+        notes.warnings.append(f"ignored the incomplete {what} at byte {position} of {label}")
+
+
+def is_aof_manifest(path: Path) -> bool:
+    with path.open("rb") as handle:
+        head = handle.read(4096)
+    lines = [line for line in head.splitlines() if not line.startswith(b"#")]
+    return bool(lines) and lines[0].strip().lower().startswith(b"file ")
+
+
+def aof_manifest_files(source: Path) -> tuple[Path | None, list[Path]]:
+    """Return the base file and the incr files of a Redis 7 multi-part append-only file, in load order."""
+    if source.is_dir():
+        manifests = sorted(source.glob("*.manifest"))
+        if len(manifests) != 1:
+            raise ValueError(f"{source} must contain exactly one AOF manifest; pass the manifest with --in")
+        source = manifests[0]
+    base, incr, sequence = None, [], 0
+    for number, line in enumerate(source.read_bytes().splitlines(), 1):
+        if line.startswith(b"#"):
+            continue
+        try:
+            parts = split_inline(line.strip(b" \t\r\n"))
+        except ValueError:
+            parts = []
+        info = {key.lower(): value for key, value in zip(parts[::2], parts[1::2])}
+        name, kind = info.get(b"file", b""), info.get(b"type", b"")[:1]
+        number_text = info.get(b"seq", b"")
+        if len(parts) < 6 or len(parts) % 2 or not name or not number_text.isdigit() or kind not in (b"b", b"h", b"i"):
+            raise ValueError(f"{source} line {number} is not a valid AOF manifest entry")
+        if b"/" in name or b"\\" in name:
+            raise ValueError(f"{source} line {number} names a path instead of a file in the AOF directory")
+        if kind == b"b":
+            if base is not None:
+                raise ValueError(f"{source} lists more than one base file")
+            base = name
+        elif kind == b"i":
+            if int(number_text) <= sequence:
+                raise ValueError(f"{source} lists incr files out of sequence")
+            sequence = int(number_text)
+            incr.append(name)
+    if base is None and not incr:
+        raise ValueError(f"{source} lists no base or incr files")
+    return base and source.parent / os.fsdecode(base), [source.parent / os.fsdecode(name) for name in incr]
+
+
+def import_redis(source: Path, file_format: str, allow_truncated: bool) -> tuple[Store, str, ImportNotes]:
+    """Load the source into an offline Store and describe what was read."""
+    store = Store(IMPORT_DATABASES, None, None, False)
+    store.loading = True
+    notes = ImportNotes()
+    multipart = source.is_dir() or (file_format in ("auto", "aof") and is_aof_manifest(source))
+    if multipart and file_format in ("rdb", "resp"):
+        raise ValueError(f"{source} is a multi-part append-only file; use --format aof")
+    base, incr = aof_manifest_files(source) if multipart else (None, [source])
+    files = [base, *incr] if base else incr
+    versions = []
+    with store.changed:
+        for index, path in enumerate(files):
+            data = path.read_bytes()
+            position = 0
+            if data.startswith(b"REDIS"):
+                if file_format == "resp":
+                    raise ValueError(f"{path} starts with an RDB image; use --format rdb or aof")
+                position, version = read_rdb(data, 0, str(path), store.databases, notes)
+                versions.append(version)
+                if file_format == "rdb" and position != len(data):
+                    raise ValueError(f"{path} continues after its RDB data; use --format aof for an append-only "
+                                     "file with an RDB preamble")
+            elif file_format == "rdb":
+                raise ValueError(f"{path} is not an RDB file: the REDIS signature is missing")
+            replay_aof(store, data, position, str(path), notes, last=index == len(files) - 1,
+                       allow_truncated=allow_truncated)
+    if versions and not notes.commands and not multipart and file_format != "aof":
+        return store, f"RDB version {versions[0]}", notes
+    parts = [f"RDB version {versions[0]} {'base' if multipart else 'preamble'}"] if versions else []
+    if multipart:
+        parts += ([] if versions or not base else ["AOF base"]) + [f"{len(incr)} incr files"]
+    parts.append(f"{notes.commands} commands")
+    kind = "RESP" if file_format == "resp" else "append-only file"
+    return store, f"{kind}: {', '.join(parts)}", notes
+
+
+def finish_import(store: Store) -> tuple[int, int, int]:
+    """Drop keys that have expired, as Redis does once loading ends, and size the snapshot to the used databases."""
+    now = milliseconds()
+    expired = 0
+    for data in store.databases:
+        for key in [key for key, entry in data.items() if entry.expires is not None and entry.expires <= now]:
+            del data[key]
+            expired += 1
+    store.loading = False
+    used = [index for index, data in enumerate(store.databases) if data]
+    store.databases = store.databases[:used[-1] + 1 if used else 1]
+    return sum(map(len, store.databases)), len(used), expired
+
+
+def import_main(argv) -> int:
+    parser = argparse.ArgumentParser(
+        prog=f"{Path(sys.argv[0]).name} import",
+        description="Build a Redis test server JSON snapshot from an RDB file, an append-only file, or RESP commands.",
+    )
+    parser.add_argument("--db-file", type=Path, required=True, help="new JSON snapshot to create")
+    parser.add_argument("--in", dest="source", type=Path, required=True, metavar="PATH",
+                        help="RDB file, append-only file, appendonlydir or its manifest, or RESP commands")
+    parser.add_argument("--format", choices=("auto", "rdb", "aof", "resp"), default="auto",
+                        help="source format (default: %(default)s)")
+    parser.add_argument("--allow-truncated", action="store_true",
+                        help="load an append-only file whose last command is incomplete, like aof-load-truncated")
+    args = parser.parse_args(argv)
+    destination = args.db_file.expanduser().absolute()
+    source = args.source.expanduser()
+    try:
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Snapshot file already exists: {destination}")
+        if not source.exists():
+            raise FileNotFoundError(f"Source not found: {source}")
+        store, description, notes = import_redis(source, args.format, args.allow_truncated)
+        keys, databases, expired = finish_import(store)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".redis-import-", dir=destination.parent) as temporary:
+            store.snapshot = Path(temporary) / "snapshot.json"
+            with store.changed:
+                store.save()
+            publish_export(store.snapshot, destination)
+    except (OSError, ValueError, RedisError) as error:
+        parser.exit(1, f"Redis import failed: {error}\n")
+    if len(store.databases) > DEFAULT_REDIS_DATABASES:
+        notes.warnings.append(f"serve the snapshot with --databases {len(store.databases)} or more")
+    for message in notes.report():
+        print(f"Redis import warning: {message}", file=sys.stderr)
+    skipped = f"; skipped {expired} expired keys" if expired else ""
+    print(f"Imported {keys} keys in {databases} databases from {source} ({description}) to {destination}{skipped}")
+    return 0
+
+
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["export"]:
         return export_main(argv[1:])
+    if argv[:1] == ["import"]:
+        return import_main(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--host", default="127.0.0.1", help="listen address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=6379, help="listen port, use 0 for an available port")

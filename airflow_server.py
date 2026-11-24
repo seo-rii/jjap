@@ -150,6 +150,10 @@ class AirflowService:
         self.lineage_url = lineage_url
         self.lineage_namespace = lineage_namespace
         self.lineage_token = lineage_token
+        self.startup_dags = dags
+        # A reset bumps the generation, so an attempt claimed before it neither starts nor records an outcome.
+        self.generation = 0
+        self.process = None
         self.scheduler = threading.Thread(target=self._schedule, name="airflow-scheduler", daemon=True)
         self.publisher = threading.Thread(target=self._publish, name="airflow-lineage", daemon=True)
         self.lease = None
@@ -205,18 +209,7 @@ class AirflowService:
         """)
         now = time.time()
         with self.db:
-            self.db.execute("UPDATE dags SET active=0")
-            for dag_id, dag in dags.items():
-                previous = self.db.execute("SELECT spec, next_run FROM dags WHERE dag_id=?", (dag_id,)).fetchone()
-                schedule = dag["schedule_seconds"]
-                next_run = now + schedule if schedule is not None else None
-                if previous and json.loads(previous["spec"])["schedule_seconds"] == schedule:
-                    next_run = previous["next_run"]
-                self.db.execute(
-                    """INSERT INTO dags VALUES (?, ?, ?, 1, ?)
-                       ON CONFLICT(dag_id) DO UPDATE SET spec=excluded.spec, active=1, next_run=excluded.next_run""",
-                    (dag_id, json.dumps(dag), dag["is_paused"], next_run),
-                )
+            self._register(dags, now)
             interrupted = self.db.execute("""
                 SELECT tasks.*, runs.spec, attempts.lineage_id FROM tasks JOIN runs USING (dag_id, run_id)
                 JOIN attempts USING (dag_id, run_id, task_id, attempt) WHERE tasks.state='running'
@@ -228,6 +221,36 @@ class AirflowService:
                                 (now, *key))
                 self._event(task["lineage_id"], key, json.loads(task["spec"])["tasks"][key[2]], "FAIL", now)
                 self._finalize_run(key[0], key[1], now)
+
+    def _register(self, dags, now):
+        self.db.execute("UPDATE dags SET active=0")
+        for dag_id, dag in dags.items():
+            previous = self.db.execute("SELECT spec, next_run FROM dags WHERE dag_id=?", (dag_id,)).fetchone()
+            schedule = dag["schedule_seconds"]
+            next_run = now + schedule if schedule is not None else None
+            if previous and json.loads(previous["spec"])["schedule_seconds"] == schedule:
+                next_run = previous["next_run"]
+            self.db.execute(
+                """INSERT INTO dags VALUES (?, ?, ?, 1, ?)
+                   ON CONFLICT(dag_id) DO UPDATE SET spec=excluded.spec, active=1, next_run=excluded.next_run""",
+                (dag_id, json.dumps(dag), dag["is_paused"], next_run),
+            )
+
+    def reset(self):
+        """Kill a running attempt, forget every run, and register the startup DAGs with fresh schedules."""
+        with self.lock:
+            self.generation += 1
+            if self.process is not None and self.process.poll() is None:
+                self._kill_process(self.process)
+                try:
+                    self.process.wait(5)
+                except subprocess.TimeoutExpired:
+                    pass
+            with self.db:
+                for table in ("lineage_outbox", "attempts", "tasks", "runs", "dags"):
+                    self.db.execute(f"DELETE FROM {table}")
+                self._register(self.startup_dags, time.time())
+        self.wake.set()
 
     def start(self):
         self.scheduler.start()
@@ -316,7 +339,7 @@ class AirflowService:
             for run in runs:
                 work = self._claim(run, now)
                 if work:
-                    return work
+                    return (*work, self.generation)
         return None
 
     def _claim(self, run, now):
@@ -366,11 +389,11 @@ class AirflowService:
                 WHERE dag_id=? AND run_id=? AND task_id=? AND attempt=? AND truncated=0
         """, (chunk, MAX_LOG, chunk, MAX_LOG, *key))
 
-    def _copy_log(self, key, pipe, done):
+    def _copy_log(self, key, pipe, done, generation):
         with pipe:
             while chunk := pipe.read1(16384):
                 with self.lock:
-                    if done.is_set():
+                    if done.is_set() or generation != self.generation:
                         return
                     with self.db:
                         self._append_log(key, chunk)
@@ -385,17 +408,21 @@ class AirflowService:
         except ProcessLookupError:
             pass
 
-    def _execute(self, key, attempt, spec):
+    def _execute(self, key, attempt, spec, generation):
         env = dict(os.environ, JJAP_AIRFLOW_DAG_ID=key[0], JJAP_AIRFLOW_RUN_ID=key[1],
                    JJAP_AIRFLOW_TASK_ID=key[2], JJAP_AIRFLOW_TRY_NUMBER=str(attempt))
-        try:
-            process = subprocess.Popen(spec["command"], env=env, stdin=subprocess.DEVNULL,
-                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                       start_new_session=(os.name == "posix"))
-        except (OSError, ValueError) as exc:
-            return False, f"Could not start task: {exc}\n"
+        with self.lock:
+            if generation != self.generation:
+                return False, ""
+            try:
+                process = self.process = subprocess.Popen(spec["command"], env=env, stdin=subprocess.DEVNULL,
+                                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                          start_new_session=(os.name == "posix"))
+            except (OSError, ValueError) as exc:
+                return False, f"Could not start task: {exc}\n"
         done = threading.Event()
-        reader = threading.Thread(target=self._copy_log, args=((*key, attempt), process.stdout, done), daemon=True)
+        reader = threading.Thread(target=self._copy_log, args=((*key, attempt), process.stdout, done, generation),
+                                  daemon=True)
         reader.start()
         deadline = time.monotonic() + spec["timeout_seconds"]
         error = ""
@@ -414,6 +441,7 @@ class AirflowService:
             reader.join(timeout=1)
         with self.lock:
             done.set()
+            self.process = None
         return code == 0 and not error, error or (f"Task exited with status {code}.\n" if code else "")
 
     def _schedule(self):
@@ -423,12 +451,14 @@ class AirflowService:
                 self.wake.wait(0.1)
                 self.wake.clear()
                 continue
-            key, attempt, spec, lineage_id = work
-            success, detail = self._execute(key, attempt, spec)
+            key, attempt, spec, lineage_id, generation = work
+            success, detail = self._execute(key, attempt, spec, generation)
             now = time.time()
             retry = not success and attempt <= spec["retries"] and not self.stop.is_set()
             state = "success" if success else ("up_for_retry" if retry else "failed")
             with self.lock, self.db:
+                if generation != self.generation:
+                    continue
                 if detail:
                     self._append_log((*key, attempt), ("\n" + detail).encode("utf-8"))
                 self.db.execute("UPDATE tasks SET state=?, ended=?, ready=? WHERE dag_id=? AND run_id=? AND task_id=?",
@@ -650,6 +680,8 @@ class AirflowHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(encoded)))
             if status == 401:
                 self.send_header("WWW-Authenticate", "Bearer")
+            if status == 405:
+                self.send_header("Allow", "POST")
             self.end_headers()
             self.wfile.write(encoded)
         except (BrokenPipeError, ConnectionResetError):
@@ -664,6 +696,14 @@ class AirflowHandler(BaseHTTPRequestHandler):
     def do_PATCH(self):
         self._dispatch()
 
+    def _other_method(self):
+        if urlsplit(self.path).path.rstrip("/") == "/_jjap/reset":
+            self._dispatch()
+        else:
+            self.send_error(501, f"Unsupported method ({self.command!r})")
+
+    do_PUT = do_DELETE = _other_method
+
     def _route(self, path, query):
         service = self.server.service
         method = self.command
@@ -675,6 +715,11 @@ class AirflowHandler(BaseHTTPRequestHandler):
         scheme, _, token = self.headers.get("Authorization", "").partition(" ")
         if not self._authenticate(token if scheme.lower() == "bearer" else None):
             raise APIError(401, "Invalid bearer token")
+        if path == ["_jjap", "reset"]:
+            if method != "POST":
+                raise APIError(405, "Use POST to reset the server")
+            service.reset()
+            return {"reset": True}
         if path[:2] != ["api", "v2"]:
             raise APIError(404, "Endpoint was not found")
         path = path[2:]

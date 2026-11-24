@@ -155,6 +155,13 @@ class Gateway:
             raise GatewayError("Invalid or expired API key", 401, "invalid_api_key")
         return digest, json.loads(row[0]) or None
 
+    def reset(self):
+        """Forget virtual keys, usage, and stored responses; the configured models and master key stay."""
+        with self.lock, self.db:
+            for table in ("gateway_keys", "gateway_usage", "gateway_responses"):
+                self.db.execute(f"DELETE FROM {table}")
+            self.positions.clear()
+
     def create_key(self, body):
         unsupported = body.keys() - {"models", "key_alias", "duration"}
         if unsupported:
@@ -429,6 +436,8 @@ class Handler(BaseHTTPRequestHandler):
             payload = json_bytes(payload)
         self.response_started = True
         self.send_response(status)
+        if status == 405 and self.path_name == "/_jjap/reset":
+            self.send_header("Allow", "POST")
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
@@ -450,7 +459,7 @@ class Handler(BaseHTTPRequestHandler):
         api = self.server.gateway
         url = urlsplit(self.path)
         path = url.path.rstrip("/").removeprefix("/v1/")
-        path = "/" + path.lstrip("/")
+        path = self.path_name = "/" + path.lstrip("/")
         method = self.command
         if method == "GET" and path in ("/health/liveliness", "/health/readiness", "/health"):
             self.respond(200, {"status": "healthy"})
@@ -458,6 +467,14 @@ class Handler(BaseHTTPRequestHandler):
         header = self.headers.get("Authorization", "")
         if not header and (key := self.headers.get("x-litellm-api-key")):
             header = key if " " in key else "Bearer " + key
+        if path == "/_jjap/reset":
+            if api.master_hash:
+                api.access(header, admin=True)
+            if method != "POST":
+                raise GatewayError("Use POST to reset the gateway", 405, "method_not_allowed")
+            api.reset()
+            self.respond(200, {"reset": True})
+            return
         if path in ("/key/generate", "/key/delete", "/spend/logs"):
             api.access(header, admin=True)
             if method == "POST" and path == "/key/generate":
@@ -604,6 +621,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_http(self):
         self.response_started = False
+        self.path_name = None
         try:
             self.dispatch()
         except (BrokenPipeError, ConnectionResetError):
@@ -627,6 +645,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
 
     do_GET = do_POST = handle_http
+
+    def other_method(self):
+        if urlsplit(self.path).path.rstrip("/").removeprefix("/v1") == "/_jjap/reset":
+            self.handle_http()
+        else:
+            self.send_error(501, f"Unsupported method ({self.command!r})")
+
+    do_PUT = do_DELETE = do_PATCH = other_method
 
 
 class Server(ThreadingHTTPServer):

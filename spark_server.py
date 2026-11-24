@@ -228,9 +228,13 @@ class SparkService:
         self.digests = {name: job_digest(job) for name, job in jobs.items()}
         self.iceberg_script = Path(iceberg_script or Path(__file__).with_name("iceberg_server.py")).resolve()
         self.lock = threading.Lock()
+        self.idle = threading.Condition(self.lock)
         self.wake = threading.Event()
         self.stop = threading.Event()
         self.active = None
+        self.resetting = 0
+        # Like the Spark master's driver counter, sequence numbers keep growing after a reset.
+        self.last_ordinal = 0
         self.worker = threading.Thread(target=self._work, name="spark-sql-worker")
         self.db = None
         self.lease = None
@@ -279,8 +283,9 @@ class SparkService:
         if name not in self.jobs:
             return {"success": False, "message": "No registered SQL job matches appResource."}
         with self.lock, self.db:
-            cursor = self.db.execute("INSERT INTO submissions (job, digest, state) VALUES (?, ?, 'SUBMITTED')",
-                                     (name, self.digests[name]))
+            last = self.db.execute("SELECT coalesce(max(ordinal), 0) FROM submissions").fetchone()[0]
+            cursor = self.db.execute("INSERT INTO submissions (ordinal, job, digest, state) VALUES (?, ?, ?, 'SUBMITTED')",
+                                     (max(last, self.last_ordinal) + 1, name, self.digests[name]))
             sequence = cursor.lastrowid
             identifier = f"driver-{dt.datetime.now(dt.timezone.utc):%Y%m%d%H%M%S}-{sequence:04d}"
             self.db.execute("UPDATE submissions SET submission_id=? WHERE ordinal=?", (identifier, sequence))
@@ -315,13 +320,31 @@ class SparkService:
                    f"Driver {identifier} is publishing output, has finished, or does not exist")
         return {"success": success, "submissionId": identifier, "message": message}
 
+    def reset(self):
+        """Cancel the running job, wait until it stops, and forget every submission; registered jobs stay."""
+        with self.lock:
+            self.resetting += 1
+            try:
+                # A job that is already publishing its output finishes, as a kill request would allow.
+                if self.active is not None and not self.active.publishing:
+                    self.active.canceled.set()
+                while self.active is not None and self.worker.is_alive():
+                    self.idle.wait(0.1)
+                with self.db:
+                    last = self.db.execute("SELECT coalesce(max(ordinal), 0) FROM submissions").fetchone()[0]
+                    self.last_ordinal = max(last, self.last_ordinal)
+                    self.db.execute("DELETE FROM submissions")
+            finally:
+                self.resetting -= 1
+        self.wake.set()
+
     def _finish(self, identifier, state, message):
         self.db.execute("UPDATE submissions SET state=?, message=? WHERE submission_id=?",
                         (state, message, identifier))
 
     def _claim(self):
         with self.lock, self.db:
-            if self.stop.is_set():
+            if self.stop.is_set() or self.resetting:
                 return None
             while row := self.db.execute("""
                 SELECT * FROM submissions WHERE state='SUBMITTED' ORDER BY ordinal LIMIT 1
@@ -359,6 +382,7 @@ class SparkService:
                     state, message = "KILLED", "Local SQL job was canceled."
                 self._finish(run.identifier, state, message[:4096])
                 self.active = None
+                self.idle.notify_all()
 
     def _companion(self, run, relation, arguments, *, stdout):
         command = [sys.executable, "-I", "-B", str(self.iceberg_script), "--warehouse", relation["warehouse"]]
@@ -529,6 +553,11 @@ class SparkHandler(BaseHTTPRequestHandler):
             if scheme.lower() != "bearer" or not hmac.compare_digest(supplied.encode(), token.encode()):
                 raise RESTError("Invalid bearer token", 401)
         path = [unquote(segment) for segment in urlsplit(self.path).path.strip("/").split("/")]
+        if path == ["_jjap", "reset"]:
+            if self.command != "POST":
+                raise RESTError("Use POST to reset the server", 405)
+            self.server.service.reset()
+            return {"reset": True}
         if path[0] and path[0] != "v1":
             raise RESTError("Unknown Spark REST protocol version", 468, highestProtocolVersion="v1")
         service = self.server.service
@@ -552,11 +581,13 @@ class SparkHandler(BaseHTTPRequestHandler):
             status, data = 500, {"action": "ErrorResponse", "message": "Submission state storage failed"}
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             return
-        payload = json.dumps({"serverSparkVersion": SPARK_VERSION, **data}).encode()
+        payload = json.dumps({"serverSparkVersion": SPARK_VERSION, **data} if "action" in data else data).encode()
         try:
             self.send_response(status)
             if status == 401:
                 self.send_header("WWW-Authenticate", "Bearer")
+            if status == 405:
+                self.send_header("Allow", "POST")
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
@@ -565,6 +596,14 @@ class SparkHandler(BaseHTTPRequestHandler):
             pass
 
     do_GET = do_POST = _dispatch
+
+    def _other_method(self):
+        if urlsplit(self.path).path.rstrip("/") == "/_jjap/reset":
+            self._dispatch()
+        else:
+            self.send_error(501, f"Unsupported method ({self.command!r})")
+
+    do_PUT = do_DELETE = do_PATCH = _other_method
 
 
 # PySpark script export
