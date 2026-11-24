@@ -40,7 +40,18 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install Redis
-        run: sudo apt-get update && sudo apt-get install -y redis-server && redis-server --version
+        timeout-minutes: 10
+        # A stalled package mirror once hung apt-get update until the job timed out, so bound each attempt.
+        run: |
+          apt="sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          for attempt in 1 2 3; do
+            if timeout 150 $apt update && timeout 150 $apt install -y redis-server; then
+              break
+            fi
+            echo "apt-get attempt $attempt failed; retrying" >&2
+            sleep 10
+          done
+          redis-server --version
       - name: Load exports into Redis and import Redis dumps
         run: python -B -m unittest discover -s tests -p "test_redis*.py" -v
 
