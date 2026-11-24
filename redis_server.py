@@ -8,7 +8,9 @@ Set REDIS_TEST_PASSWORD or use --password-file to require AUTH.
 
 The server implements RESP2/RESP3 with logical databases. Use --cluster for
 Redis Cluster clients that need to discover a single primary with all slots.
-The snapshot format is specific to this server. Multi-node clustering,
+The snapshot format is specific to this server; run `export --db-file FILE
+--out dump.rdb` to write an RDB file (or RESP commands with --format resp)
+that Redis 7.0 or later loads. Multi-node clustering,
 replication, Sentinel, Lua/functions, modules, and ACL management are outside
 its compatibility scope.
 """
@@ -30,6 +32,7 @@ import select
 import signal
 import socket
 import socketserver
+import struct
 import sys
 import tempfile
 import threading
@@ -2450,7 +2453,447 @@ class RedisServer(socketserver.ThreadingTCPServer):
         super().__init__(address, RedisHandler)
 
 
+# Redis RDB and RESP export
+
+# RDB 10 is the newest format Redis 7.0 reads; later releases still load it.
+RDB_FORMAT_VERSION = 10
+RDB_TYPES = {b"string": 0, b"list": 1, b"set": 2, b"hash": 4, b"zset": 5, b"stream": 19}
+SNAPSHOT_VALUE_TYPES = {"string": str, "list": list, "set": list, "hash": list, "zset": list, "stream": dict}
+STREAM_NODE_MAX_BYTES = 4096
+STREAM_NODE_MAX_ENTRIES = 100
+EXPORT_BATCH_ITEMS = 64
+EXPORT_BATCH_BYTES = 1 << 20
+DEFAULT_REDIS_DATABASES = 16
+CRC64_TABLE: list[int] = []
+
+
+def crc64(data: bytes, crc: int = 0) -> int:
+    """Redis CRC-64/Jones (reflected, zero initial value) as used by RDB files and DUMP payloads."""
+    if not CRC64_TABLE:
+        for value in range(256):
+            for _ in range(8):
+                value = (value >> 1) ^ (0x95AC9329AC4BC9B5 if value & 1 else 0)
+            CRC64_TABLE.append(value)
+    table = CRC64_TABLE
+    for byte in data:
+        crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    return crc
+
+
+def rdb_length(value: int) -> bytes:
+    if value < 1 << 6:
+        return bytes((value,))
+    if value < 1 << 14:
+        return bytes((0x40 | value >> 8, value & 0xFF))
+    if value <= 0xFFFFFFFF:
+        return b"\x80" + value.to_bytes(4, "big")
+    return b"\x81" + value.to_bytes(8, "big")
+
+
+def rdb_string(value: bytes) -> bytes:
+    return rdb_length(len(value)) + value
+
+
+def rdb_milliseconds(value: int) -> bytes:
+    return value.to_bytes(8, "little", signed=True)
+
+
+def raw_stream_id(identifier) -> bytes:
+    return identifier[0].to_bytes(8, "big") + identifier[1].to_bytes(8, "big")
+
+
+def listpack_backlen(size: int) -> bytes:
+    if size <= 127:
+        return bytes((size,))
+    count = 2 if size < 16383 else 3 if size < 2097151 else 4 if size < 268435455 else 5
+    return bytes([size >> 7 * (count - 1)] + [(size >> 7 * index) & 127 | 128 for index in range(count - 2, -1, -1)])
+
+
+def listpack_entry(value: bytes | int) -> bytes:
+    """Encode one element like lpAppend, which stores canonical integer strings as integers."""
+    if isinstance(value, bytes):
+        if len(value) > 20 or not INTEGER.fullmatch(value) or not MIN_INT <= int(value) <= MAX_INT:
+            size = len(value)
+            if size < 64:
+                encoded = bytes((0x80 | size,)) + value
+            elif size < 4096:
+                encoded = bytes((0xE0 | size >> 8, size & 0xFF)) + value
+            else:
+                encoded = b"\xf0" + size.to_bytes(4, "little") + value
+            return encoded + listpack_backlen(len(encoded))
+        value = int(value)
+    if 0 <= value <= 127:
+        encoded = bytes((value,))
+    elif -4096 <= value <= 4095:
+        encoded = bytes((0xC0 | (value & 0x1FFF) >> 8, value & 0xFF))
+    else:
+        marker, width = next((marker, width) for marker, width in ((0xF1, 2), (0xF2, 3), (0xF3, 4), (0xF4, 8))
+                             if -(1 << 8 * width - 1) <= value < 1 << 8 * width - 1)
+        encoded = bytes((marker,)) + value.to_bytes(width, "little", signed=True)
+    return encoded + listpack_backlen(len(encoded))
+
+
+def listpack(elements: list[bytes]) -> bytes:
+    body = b"".join(elements)
+    return (len(body) + 7).to_bytes(4, "little") + min(len(elements), 0xFFFF).to_bytes(2, "little") + body + b"\xff"
+
+
+def signed64(value: int) -> int:
+    value &= (1 << 64) - 1
+    return value - (1 << 64) if value >> 63 else value
+
+
+def stream_listpacks(items) -> list[tuple[tuple[int, int], bytes]]:
+    """Split entries into listpack nodes as XADD does with the default stream-node-max-* settings."""
+    nodes = []
+    for identifier, fields in items:
+        names = fields[::2]
+        if nodes:
+            master_id, master_names, elements, count = nodes[-1]
+            size = 7 + len(listpack_entry(count)) + sum(map(len, elements))
+            full = size + sum(map(len, fields)) >= STREAM_NODE_MAX_BYTES or count >= STREAM_NODE_MAX_ENTRIES
+        if not nodes or full:
+            master_id, master_names = identifier, names
+            elements = [listpack_entry(0), listpack_entry(len(names)), *map(listpack_entry, names), listpack_entry(0)]
+            nodes.append([master_id, master_names, elements, 0])
+        same = names == master_names
+        elements.extend(map(listpack_entry, (
+            2 if same else 0, signed64(identifier[0] - master_id[0]), signed64(identifier[1] - master_id[1]),
+        )))
+        if same:
+            elements.extend(map(listpack_entry, fields[1::2]))
+        else:
+            elements.extend(map(listpack_entry, [len(names), *fields]))
+        elements.append(listpack_entry(len(names) + 3 if same else 2 * len(names) + 4))
+        nodes[-1][3] += 1
+    return [(master_id, listpack([listpack_entry(count), *elements])) for master_id, _, elements, count in nodes]
+
+
+def deleted_pending_ids(stream: Stream) -> list[tuple[int, int]]:
+    pending = {identifier for group in stream.groups.values() for identifier in group.pending}
+    return sorted(pending.difference(stream.items))
+
+
+def rdb_stream(stream: Stream):
+    live = sorted(stream.items.items())
+    nodes = stream_listpacks(live)
+    yield rdb_length(len(nodes))
+    for master_id, data in nodes:
+        yield rdb_string(raw_stream_id(master_id)) + rdb_string(data)
+    first = live[0][0] if live else ZERO_STREAM_ID
+    deleted = deleted_pending_ids(stream)
+    # The snapshot keeps no XDEL tombstone; a pending ID missing from the stream is the only known one.
+    tombstone = deleted[-1] if deleted else ZERO_STREAM_ID
+    yield b"".join(map(rdb_length, (
+        len(live), *stream.last_id, *first, *tombstone, stream.entries_added, len(stream.groups),
+    )))
+    for name, group in sorted(stream.groups.items()):
+        pending = sorted(group.pending.items())
+        entries_read = (1 << 64) - 1 if group.entries_read is None else group.entries_read
+        yield rdb_string(name) + b"".join(map(rdb_length, (*group.last_id, entries_read, len(pending))))
+        owned = {}
+        for identifier, state in pending:
+            owned.setdefault(state.consumer, []).append(identifier)
+            yield raw_stream_id(identifier) + rdb_milliseconds(state.delivered_at) + rdb_length(state.deliveries)
+        yield rdb_length(len(group.consumers))
+        for consumer, seen in sorted(group.consumers.items()):
+            identifiers = owned.get(consumer, [])
+            yield (rdb_string(consumer) + rdb_milliseconds(seen) + rdb_length(len(identifiers))
+                   + b"".join(map(raw_stream_id, identifiers)))
+
+
+def rdb_payload(entry: Entry):
+    value = entry.value
+    if entry.kind == b"string":
+        yield rdb_string(value)
+        return
+    if entry.kind == b"stream":
+        yield from rdb_stream(value)
+        return
+    yield rdb_length(len(value))
+    if entry.kind == b"list":
+        yield from map(rdb_string, value)
+    elif entry.kind == b"set":
+        yield from map(rdb_string, sorted(value))
+    elif entry.kind == b"hash":
+        for name, item in value.items():
+            yield rdb_string(name) + rdb_string(item)
+    else:
+        # Redis saves skiplists from the highest score so loading inserts at the head.
+        for member, score in sorted_set(value, reverse=True):
+            yield rdb_string(member) + struct.pack("<d", score)
+
+
+def write_rdb(handle, databases) -> None:
+    crc = 0
+
+    def write(data):
+        nonlocal crc
+        crc = crc64(data, crc)
+        handle.write(data)
+
+    write(b"REDIS%04d" % RDB_FORMAT_VERSION)
+    for name, value in ((b"redis-ver", b"7.0.0"), (b"redis-bits", b"64"), (b"ctime", b"%d" % int(time.time()))):
+        write(b"\xfa" + rdb_string(name) + rdb_string(value))
+    for index, keys in databases:
+        expiring = sum(entry.expires is not None for _, entry in keys)
+        write(b"\xfe" + rdb_length(index) + b"\xfb" + rdb_length(len(keys)) + rdb_length(expiring))
+        for key, entry in keys:
+            if entry.expires is not None:
+                write(b"\xfc" + rdb_milliseconds(entry.expires))
+            write(bytes((RDB_TYPES[entry.kind],)) + rdb_string(key))
+            for data in rdb_payload(entry):
+                write(data)
+    write(b"\xff")
+    handle.write(crc.to_bytes(8, "little"))
+
+
+def resp_command(*arguments: bytes) -> bytes:
+    return b"*%d\r\n" % len(arguments) + b"".join(b"$%d\r\n%s\r\n" % (len(item), item) for item in arguments)
+
+
+def export_batches(items):
+    batch, size = [], 0
+    for item in items:
+        batch.append(item)
+        size += len(item) if isinstance(item, bytes) else sum(map(len, item))
+        if len(batch) == EXPORT_BATCH_ITEMS or size >= EXPORT_BATCH_BYTES:
+            yield batch
+            batch, size = [], 0
+    if batch:
+        yield batch
+
+
+def score_text(score: float) -> bytes:
+    return b"-0" if score == 0 and math.copysign(1.0, score) < 0 else format_score(score)
+
+
+def resp_stream(key: bytes, stream: Stream):
+    deleted = deleted_pending_ids(stream)
+    # XCLAIM FORCE only accepts existing entries, so pending IDs that were deleted get a placeholder.
+    entries = sorted({**stream.items, **dict.fromkeys(deleted, [b"", b""])}.items())
+    for identifier, fields in entries:
+        yield (b"XADD", key, stream_id_bytes(identifier), *fields)
+    if not entries:
+        yield (b"XADD", key, b"MAXLEN", b"0", b"0-1", b"x", b"y")
+    yield (b"XSETID", key, stream_id_bytes(stream.last_id), b"ENTRIESADDED", b"%d" % stream.entries_added,
+           b"MAXDELETEDID", stream_id_bytes(deleted[-1] if deleted else ZERO_STREAM_ID))
+    for name, group in sorted(stream.groups.items()):
+        entries_read = -1 if group.entries_read is None else group.entries_read
+        yield (b"XGROUP", b"CREATE", key, name, stream_id_bytes(group.last_id), b"ENTRIESREAD", b"%d" % entries_read)
+        owned = {}
+        for identifier, state in sorted(group.pending.items()):
+            owned.setdefault(state.consumer, []).append((identifier, state))
+        for consumer in sorted(group.consumers):
+            if consumer not in owned:
+                yield (b"XGROUP", b"CREATECONSUMER", key, name, consumer)
+            for identifier, state in owned.get(consumer, ()):
+                yield (b"XCLAIM", key, name, consumer, b"0", stream_id_bytes(identifier),
+                       b"TIME", b"%d" % state.delivered_at, b"RETRYCOUNT", b"%d" % state.deliveries, b"JUSTID", b"FORCE")
+    for batch in export_batches(map(stream_id_bytes, deleted)):
+        yield (b"XDEL", key, *batch)
+
+
+def resp_commands(key: bytes, entry: Entry):
+    # DEL makes a replay into a non-empty server replace keys instead of merging into them.
+    yield (b"DEL", key)
+    value = entry.value
+    if entry.kind == b"string":
+        yield (b"SET", key, value)
+    elif entry.kind in {b"list", b"set"}:
+        name, items = (b"RPUSH", value) if entry.kind == b"list" else (b"SADD", sorted(value))
+        for batch in export_batches(items):
+            yield (name, key, *batch)
+    elif entry.kind in {b"hash", b"zset"}:
+        name = b"HSET"
+        pairs = value.items()
+        if entry.kind == b"zset":
+            name, pairs = b"ZADD", [(score_text(score), member) for member, score in sorted_set(value)]
+        for batch in export_batches(pairs):
+            yield (name, key, *(item for pair in batch for item in pair))
+    else:
+        yield from resp_stream(key, value)
+    if entry.expires is not None:
+        yield (b"PEXPIREAT", key, b"%d" % entry.expires)
+
+
+def write_resp(handle, databases) -> None:
+    for index, keys in databases:
+        handle.write(resp_command(b"SELECT", b"%d" % index))
+        for key, entry in keys:
+            for arguments in resp_commands(key, entry):
+                handle.write(resp_command(*arguments))
+
+
+def check_export_stream(stream: Stream) -> None:
+    def check_id(identifier, label, entry=True):
+        if not (type(identifier) is tuple and len(identifier) == 2 and all(
+                type(part) is int and 0 <= part <= MAX_STREAM_COMPONENT for part in identifier)):
+            raise ValueError(f"invalid {label} {identifier!r}")
+        if entry and not ZERO_STREAM_ID < identifier <= stream.last_id:
+            raise ValueError(f"{label} {stream_id_bytes(identifier).decode()} is not between 0-1 and the last ID")
+
+    def check_number(value, label, minimum=0):
+        if type(value) is not int or not minimum <= value <= MAX_INT:
+            raise ValueError(f"invalid {label} {value!r}")
+
+    check_id(stream.last_id, "last stream ID", entry=False)
+    for identifier, fields in stream.items.items():
+        check_id(identifier, "stream entry ID")
+        if not fields or len(fields) % 2:
+            raise ValueError(f"stream entry {stream_id_bytes(identifier).decode()} needs field-value pairs")
+    for group in stream.groups.values():
+        check_id(group.last_id, "group last ID", entry=False)
+        if group.entries_read is not None:
+            check_number(group.entries_read, "group entries-read")
+        for seen in group.consumers.values():
+            check_number(seen, "consumer seen time", MIN_INT)
+        for identifier, state in group.pending.items():
+            check_id(identifier, "pending entry ID")
+            if state.consumer not in group.consumers:
+                raise ValueError(f"pending entry {stream_id_bytes(identifier).decode()} has unknown consumer {state.consumer!r}")
+            check_number(state.delivered_at, "delivery time", MIN_INT)
+            check_number(state.deliveries, "delivery count")
+    check_number(stream.entries_added, "entries-added")
+    if stream.entries_added < len(stream.items) + len(deleted_pending_ids(stream)):
+        raise ValueError("entries-added is smaller than the number of known stream entries")
+
+
+def snapshot_entry(row, database: int, number: int) -> tuple[bytes, Entry]:
+    try:
+        if not isinstance(row, list) or len(row) != 4:
+            raise ValueError("expected [key, type, expiration, value]")
+        encoded_key, kind, expires, value = row
+        if not isinstance(kind, str) or kind not in SNAPSHOT_VALUE_TYPES:
+            raise ValueError(f"unknown type {kind!r}")
+        if expires is not None and (type(expires) is not int or not MIN_INT <= expires <= MAX_INT):
+            raise ValueError(f"invalid expiration time {expires!r}")
+        if not isinstance(value, SNAPSHOT_VALUE_TYPES[kind]):
+            raise ValueError(f"invalid {kind} value")
+        key = from_base64(encoded_key)
+        entry = Entry(kind.encode("ascii"), unpack_entry(kind.encode("ascii"), value), expires)
+        if entry.kind == b"stream":
+            check_export_stream(entry.value)
+        return key, entry
+    except (AttributeError, KeyError, TypeError, ValueError, RedisError) as error:
+        detail = f"missing field {error}" if isinstance(error, KeyError) else error
+        raise ValueError(f"Invalid snapshot row {number} in database {database}: {detail}") from None
+
+
+def read_export_snapshot(filename: Path, only_database: int | None = None) -> list[tuple[int, dict[bytes, Entry]]]:
+    if not filename.is_file():
+        raise FileNotFoundError(f"Snapshot file not found: {filename}")
+    with filename.open("rb") as handle:
+        data = handle.read()
+    try:
+        snapshot = json.loads(data)
+    except (RecursionError, ValueError) as error:
+        raise ValueError(f"Expected a Redis test server JSON snapshot ({error})") from None
+    if not isinstance(snapshot, dict) or not {"version", "databases"} <= snapshot.keys():
+        raise ValueError("Expected a Redis test server JSON snapshot")
+    version, databases = snapshot["version"], snapshot["databases"]
+    if type(version) is not int or version != 1:
+        raise ValueError(f"Unsupported Redis test server snapshot version {version!r}")
+    if not isinstance(databases, list) or not all(isinstance(rows, list) for rows in databases):
+        raise ValueError("Expected a list of databases in the Redis test server snapshot")
+    if only_database is not None and not 0 <= only_database < len(databases):
+        raise ValueError(f"Database {only_database} is not in the snapshot, which has {len(databases)} databases")
+    result = []
+    for index, rows in enumerate(databases):
+        if only_database is not None and index != only_database:
+            continue
+        entries = {}
+        for number, row in enumerate(rows):
+            key, entry = snapshot_entry(row, index, number)
+            if key in entries:
+                raise ValueError(f"Duplicate key {key!r} in database {index}")
+            entries[key] = entry
+        result.append((index, entries))
+    return result
+
+
+def export_warning(message: str) -> None:
+    print(f"Redis export warning: {message}", file=sys.stderr)
+
+
+def export_redis(filename: Path, destination: Path, file_format: str = "rdb", only_database: int | None = None):
+    """Write an RDB file or RESP command stream from one JSON snapshot; return (keys, databases, expired)."""
+    now = milliseconds()
+    databases = []
+    expired = 0
+    for index, entries in read_export_snapshot(filename, only_database):
+        keys = []
+        for key, entry in entries.items():
+            if entry.expires is not None and entry.expires <= now:
+                expired += 1
+            elif entry.kind not in {b"string", b"stream"} and not entry.value:
+                export_warning(f"skipped empty {entry.kind.decode()} {key!r} in database {index}; Redis cannot store it")
+            else:
+                keys.append((key, entry))
+        if keys:
+            databases.append((index, keys))
+            if index >= DEFAULT_REDIS_DATABASES:
+                export_warning(f"database {index} loads only into Redis configured with databases {index + 1} or more")
+    consumers = sum(len(group.consumers) for _, keys in databases for _, entry in keys
+                    if entry.kind == b"stream" for group in entry.value.groups.values())
+    if file_format == "resp" and consumers:
+        export_warning(f"Redis sets the seen-time of {consumers} stream consumers when the commands run; "
+                       "--format rdb keeps it")
+    with destination.open("xb") as handle:
+        (write_rdb if file_format == "rdb" else write_resp)(handle, databases)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return sum(len(keys) for _, keys in databases), len(databases), expired
+
+
+def publish_export(staged: Path, destination: Path) -> None:
+    if os.name == "nt":
+        # Windows rename refuses an existing destination.
+        staged.rename(destination)
+        return
+    try:
+        os.link(staged, destination)
+    except FileExistsError:
+        raise
+    except OSError:
+        # Some file systems lack hard links; fall back to a checked rename.
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Output file already exists: {destination}") from None
+        os.replace(staged, destination)
+
+
+def export_main(argv) -> int:
+    parser = argparse.ArgumentParser(
+        prog=f"{Path(sys.argv[0]).name} export",
+        description="Export a Redis test server JSON snapshot for Redis 7.0 or later.",
+    )
+    parser.add_argument("--db-file", type=Path, required=True, help="existing JSON snapshot written by the server")
+    parser.add_argument("--out", type=Path, required=True, help="new output file")
+    parser.add_argument("--format", choices=("rdb", "resp"), default="rdb",
+                        help="RDB version 10 file or RESP commands for redis-cli --pipe (default: %(default)s)")
+    parser.add_argument("--db", type=int, help="export just one logical database (Redis Cluster accepts only 0)")
+    args = parser.parse_args(argv)
+    destination = args.out.expanduser().absolute()
+    try:
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Output file already exists: {destination}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".redis-export-", dir=destination.parent) as temporary:
+            staged = Path(temporary) / "export"
+            keys, databases, expired = export_redis(args.db_file.expanduser(), staged, args.format, args.db)
+            publish_export(staged, destination)
+    except (OSError, ValueError, RedisError) as error:
+        parser.exit(1, f"Redis export failed: {error}\n")
+    kind = f"RDB version {RDB_FORMAT_VERSION}" if args.format == "rdb" else "RESP commands"
+    skipped = f"; skipped {expired} expired keys" if expired else ""
+    print(f"Exported {keys} keys in {databases} databases to {destination} as {kind}{skipped}")
+    return 0
+
+
 def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["export"]:
+        return export_main(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--host", default="127.0.0.1", help="listen address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=6379, help="listen port, use 0 for an available port")
