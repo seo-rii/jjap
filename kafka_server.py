@@ -4,18 +4,24 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import gzip
 import io
+import json
+import os
 import re
+import socket
 import socketserver
 import sqlite3
 import struct
+import sys
 import threading
 import time
 import uuid
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote
 
 
 BROKER_ID = 0
@@ -1010,7 +1016,731 @@ class Server(socketserver.ThreadingTCPServer):
             self.broker.store.maintain_groups(time.monotonic())
 
 
+# Replay into a running Kafka cluster
+
+
+MIGRATE_CLIENT = "jjap-kafka-migrate"
+MIGRATE_REQUEST_BYTES = 1024 * 1024
+MIGRATE_APIS = {  # api_key: (name, lowest and highest version this client speaks)
+    0: ("Produce", 3, 8), 2: ("ListOffsets", 1, 5), 3: ("Metadata", 4, 8), 8: ("OffsetCommit", 2, 7),
+    10: ("FindCoordinator", 0, 2), 15: ("DescribeGroups", 0, 4), 17: ("SaslHandshake", 1, 1), 18: ("ApiVersions", 0, 0),
+    19: ("CreateTopics", 2, 4), 36: ("SaslAuthenticate", 0, 1), 69: ("ConsumerGroupDescribe", 0, 1),
+}
+FLEXIBLE_APIS = {69}  # every other version above predates tagged fields
+KAFKA_ERRORS = {
+    1: "OFFSET_OUT_OF_RANGE", 2: "CORRUPT_MESSAGE", 3: "UNKNOWN_TOPIC_OR_PARTITION", 5: "LEADER_NOT_AVAILABLE",
+    6: "NOT_LEADER_OR_FOLLOWER", 7: "REQUEST_TIMED_OUT", 9: "REPLICA_NOT_AVAILABLE", 10: "MESSAGE_TOO_LARGE",
+    12: "OFFSET_METADATA_TOO_LARGE", 14: "COORDINATOR_LOAD_IN_PROGRESS", 15: "COORDINATOR_NOT_AVAILABLE",
+    16: "NOT_COORDINATOR", 17: "INVALID_TOPIC_EXCEPTION", 18: "RECORD_LIST_TOO_LARGE", 19: "NOT_ENOUGH_REPLICAS",
+    20: "NOT_ENOUGH_REPLICAS_AFTER_APPEND", 22: "ILLEGAL_GENERATION", 24: "INVALID_GROUP_ID", 25: "UNKNOWN_MEMBER_ID",
+    27: "REBALANCE_IN_PROGRESS", 29: "TOPIC_AUTHORIZATION_FAILED", 30: "GROUP_AUTHORIZATION_FAILED",
+    31: "CLUSTER_AUTHORIZATION_FAILED", 32: "INVALID_TIMESTAMP", 33: "UNSUPPORTED_SASL_MECHANISM",
+    34: "ILLEGAL_SASL_STATE", 35: "UNSUPPORTED_VERSION", 36: "TOPIC_ALREADY_EXISTS", 37: "INVALID_PARTITIONS", 38: "INVALID_REPLICATION_FACTOR",
+    40: "INVALID_CONFIG", 41: "NOT_CONTROLLER", 42: "INVALID_REQUEST", 44: "POLICY_VIOLATION",
+    58: "SASL_AUTHENTICATION_FAILED", 69: "GROUP_ID_NOT_FOUND", 76: "UNSUPPORTED_COMPRESSION_TYPE",
+    87: "INVALID_RECORD", 113: "STALE_MEMBER_EPOCH",
+}
+# The broker rejected these before appending, so resending the same batch cannot duplicate records.
+LEADER_MOVED = {3, 5, 6, 19}
+COORDINATOR_MOVED = {14, 15, 16}
+GROUP_ACTIVE = {22, 25, 27, 113}
+
+
+def error_name(code):
+    return KAFKA_ERRORS.get(code, f"error code {code}")
+
+
+def broker_address(text):
+    host, colon, port = text.strip().rpartition(":")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    if not colon or not host or not port.isdigit() or not 0 < int(port) < 65536:
+        raise ValueError(f"Invalid bootstrap server {text.strip()!r}; expected HOST:PORT")
+    return host, int(port)
+
+
+def show_address(address):
+    host, port = address
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+class MigrationError(Exception):
+    """The target cluster rejected a step, or the connection to it failed."""
+
+
+class UnsupportedApi(MigrationError):
+    pass
+
+
+class KafkaConnection:
+    def __init__(self, address, timeout, credentials):
+        self.name = show_address(address)
+        self.correlation = 0
+        self.ranges = {18: (0, 0)}
+        self.socket = socket.create_connection(address, timeout=timeout)
+        self.stream = self.socket.makefile("rb")
+        try:
+            error, ranges = self.request(18, lambda version: b"", lambda reply, version: (
+                reply.i16(), reply.array(lambda: (reply.i16(), (reply.i16(), reply.i16())))))
+            if error:
+                raise MigrationError(f"{self.name} rejected ApiVersions with {error_name(error)}")
+            self.ranges = dict(ranges)
+            if credentials:
+                self.authenticate(*credentials)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        self.stream.close()
+        self.socket.close()
+
+    def read(self, size):
+        data = self.stream.read(size)
+        if len(data) != size:
+            raise MigrationError(f"{self.name} closed the connection")
+        return data
+
+    def request(self, api, body, parse):
+        name, lowest, highest = MIGRATE_APIS[api]
+        offered = self.ranges.get(api)
+        if offered is None or max(lowest, offered[0]) > min(highest, offered[1]):
+            raise UnsupportedApi(f"{self.name} does not support {name} versions {lowest}-{highest}")
+        version = min(highest, offered[1])
+        self.correlation += 1
+        frame = (struct.pack(">hhi", api, version, self.correlation) + wire_string(MIGRATE_CLIENT)
+                 + (b"\0" if api in FLEXIBLE_APIS else b"") + body(version))
+        self.socket.sendall(struct.pack(">i", len(frame)) + frame)
+        size = struct.unpack(">i", self.read(4))[0]
+        if not 4 <= size <= MAX_FRAME_BYTES:
+            raise MigrationError(f"{self.name} sent an invalid {name} response size")
+        reply = Reader(self.read(size))
+        try:
+            if reply.i32() != self.correlation:
+                raise MigrationError(f"{self.name} answered {name} out of order")
+            if api in FLEXIBLE_APIS:
+                reply.tagged_fields()
+            result = parse(reply, version)
+            reply.finish()
+        except WireError as exc:
+            raise MigrationError(f"{self.name} sent a malformed {name} v{version} response: {exc}") from exc
+        return result
+
+    def authenticate(self, username, password):
+        error, mechanisms = self.request(17, lambda version: wire_string("PLAIN"),
+                                         lambda reply, version: (reply.i16(), reply.array(reply.string)))
+        if error:
+            offered = ", ".join(mechanisms) or "none"
+            raise MigrationError(f"{self.name} refused SASL/PLAIN with {error_name(error)} (mechanisms offered: {offered})")
+        token = b"\0" + username.encode("utf-8") + b"\0" + password.encode("utf-8")
+
+        def parse(reply, version):
+            result = reply.i16(), reply.string(nullable=True), reply.bytes()
+            if version >= 1:
+                reply.i64()  # session_lifetime_ms
+            return result
+
+        error, message, _ = self.request(36, lambda version: wire_bytes(token), parse)
+        if error:
+            raise MigrationError(f"{self.name} rejected the SASL/PLAIN login: {message or error_name(error)}")
+
+
+class KafkaCluster:
+    def __init__(self, bootstrap, timeout, credentials):
+        self.bootstrap = bootstrap
+        self.timeout = timeout
+        self.credentials = credentials
+        self.connections = {}
+        self.brokers = {}
+
+    def close(self):
+        for connection in self.connections.values():
+            connection.close()
+        self.connections.clear()
+
+    def request(self, address, api, body, parse):
+        try:
+            connection = self.connections.get(address)
+            if connection is None:
+                # Socket reads outlast the broker-side request timeout so its own error arrives first.
+                connection = self.connections[address] = KafkaConnection(address, self.timeout + 10, self.credentials)
+            return connection.request(api, body, parse)
+        except (OSError, MigrationError) as exc:
+            stale = self.connections.pop(address, None)
+            if stale is not None:
+                stale.close()
+            if isinstance(exc, MigrationError):
+                raise
+            raise MigrationError(f"{show_address(address)}: {exc}") from exc
+
+    def any_request(self, api, body, parse):
+        failures = []
+        for address in dict.fromkeys([*self.bootstrap, *self.brokers.values()]):
+            try:
+                return self.request(address, api, body, parse)
+            except MigrationError as exc:
+                failures.append(str(exc))
+        raise MigrationError("; ".join(failures))
+
+    def metadata(self, topics):
+        def body(version):
+            return wire_array(wire_string(name) for name in topics) + b"\0" * (3 if version >= 8 else 1)
+
+        def parse(reply, version):
+            if version >= 3:
+                reply.i32()  # throttle_time_ms
+            brokers = reply.array(lambda: (reply.i32(), (reply.string(), reply.i32()), reply.string(nullable=True)))
+            reply.string(nullable=True)  # cluster_id
+            reply.i32()  # controller_id
+
+            def partition():
+                error, index, leader = reply.i16(), reply.i32(), reply.i32()
+                if version >= 7:
+                    reply.i32()  # leader_epoch
+                for _ in range(3 if version >= 5 else 2):
+                    reply.array(reply.i32)
+                return index, (error, leader)
+
+            def topic():
+                error, name, internal = reply.i16(), reply.string(), reply.boolean()
+                partitions = dict(reply.array(partition))
+                if version >= 8:
+                    reply.i32()  # topic_authorized_operations
+                return name, (error, internal, partitions)
+
+            topics = dict(reply.array(topic))
+            if version >= 8:
+                reply.i32()  # cluster_authorized_operations
+            return {node: address for node, address, _ in brokers}, topics
+
+        self.brokers, result = self.any_request(3, body, parse)
+        return result
+
+    def create_topic(self, name, count, replication):
+        def body(version):
+            factor = replication if replication is not None else -1 if version >= 4 else 1
+            return (wire_array([wire_string(name) + struct.pack(">ihii", count, factor, 0, 0)])
+                    + struct.pack(">i?", int(self.timeout * 1000), False))
+
+        def parse(reply, version):
+            reply.i32()  # throttle_time_ms
+            return reply.array(lambda: (reply.string(), reply.i16(), reply.string(nullable=True)))
+
+        results = self.any_request(19, body, parse)
+        if [item[0] for item in results] != [name]:
+            raise MigrationError("CreateTopics answered for a different topic")
+        return results[0][1:]
+
+    def leaders(self, topic, count):
+        deadline = time.monotonic() + self.timeout
+        while True:
+            error, _, partitions = self.metadata([topic]).get(topic, (UNKNOWN_TOPIC_OR_PARTITION, False, {}))
+            leaders = {index: self.brokers[leader] for index, (code, leader) in partitions.items()
+                       if code in (NONE, 9) and leader in self.brokers}
+            if not error and all(index in leaders for index in range(count)):
+                return leaders
+            if time.monotonic() >= deadline:
+                reason = error_name(error) if error else "some partitions have no leader"
+                raise MigrationError(f"partition leaders were not ready within {self.timeout:g} seconds ({reason})")
+            time.sleep(0.2)
+
+    def list_offsets(self, topic, count, leaders, timestamp):
+        def body(members):
+            return lambda version: struct.pack(">i", -1) + (b"\0" if version >= 2 else b"") + wire_array([
+                wire_string(topic) + wire_array(struct.pack(">i", partition) + (b"\xff" * 4 if version >= 4 else b"")
+                                                + struct.pack(">q", timestamp) for partition in members)])
+
+        def parse(reply, version):
+            if version >= 2:
+                reply.i32()  # throttle_time_ms
+
+            def partition():
+                index, error, _, offset = reply.i32(), reply.i16(), reply.i64(), reply.i64()
+                if version >= 4:
+                    reply.i32()  # leader_epoch
+                return index, (error, offset)
+
+            return {index: item for _, items in reply.array(lambda: (reply.string(), reply.array(partition)))
+                    for index, item in items}
+
+        offsets, deadline = {}, time.monotonic() + self.timeout
+        while len(offsets) < count:
+            moved = False
+            for address, members in by_leader(leaders, [index for index in range(count) if index not in offsets]):
+                replies = self.request(address, 2, body(members), parse)
+                for index in members:
+                    error, offset = replies.get(index, (None, -1))
+                    if error == NONE:
+                        offsets[index] = offset
+                    elif error in LEADER_MOVED and time.monotonic() < deadline:
+                        moved = True
+                    else:
+                        raise MigrationError(f"partition {index}: ListOffsets failed with "
+                                             f"{'no answer' if error is None else error_name(error)}")
+            if moved:
+                time.sleep(0.2)
+                leaders = self.leaders(topic, count)
+        return offsets
+
+    def produce(self, address, topic, copies):
+        def body(version):
+            return (wire_string(None) + struct.pack(">hi", -1, int(self.timeout * 1000)) + wire_array([
+                wire_string(topic) + wire_array(struct.pack(">i", copy.partition) + wire_bytes(copy.pending[2])
+                                                for copy in copies)]))
+
+        def parse(reply, version):
+            def partition():
+                index, error, base, append_time = reply.i32(), reply.i16(), reply.i64(), reply.i64()
+                if version >= 5:
+                    reply.i64()  # log_start_offset
+                details = []
+                if version >= 8:
+                    details = [message for _, message in reply.array(lambda: (reply.i32(), reply.string(nullable=True)))]
+                    details.append(reply.string(nullable=True))
+                return index, (error, base, append_time, "; ".join(item for item in details if item))
+
+            replies = {index: item for _, items in reply.array(lambda: (reply.string(), reply.array(partition)))
+                       for index, item in items}
+            reply.i32()  # throttle_time_ms
+            return replies
+
+        return self.request(address, 0, body, parse)
+
+    def coordinator(self, group):
+        def body(version):
+            return wire_string(group) + (b"\0" if version >= 1 else b"")
+
+        def parse(reply, version):
+            if version >= 1:
+                reply.i32()  # throttle_time_ms
+            error = reply.i16()
+            message = reply.string(nullable=True) if version >= 1 else None
+            return error, message, reply.i32(), (reply.string(), reply.i32())
+
+        deadline = time.monotonic() + self.timeout
+        while True:
+            error, message, _, address = self.any_request(10, body, parse)
+            if error == NONE:
+                return address
+            if error not in COORDINATOR_MOVED or time.monotonic() >= deadline:
+                raise MigrationError(f"FindCoordinator failed with {error_name(error)}" + (f": {message}" if message else ""))
+            time.sleep(0.2)
+
+    def group_activity(self, group):
+        """Return the group's state and member count, or None when the coordinator cannot describe it."""
+        def classic(reply, version):
+            if version >= 1:
+                reply.i32()  # throttle_time_ms
+
+            def described():
+                error, _, state = reply.i16(), reply.string(), reply.string()
+                reply.string(), reply.string()  # protocol_type, protocol_data
+                members = reply.array(lambda: (reply.string(), reply.string(nullable=True) if version >= 4 else None,
+                                               reply.string(), reply.string(), reply.bytes(), reply.bytes()))
+                if version >= 3:
+                    reply.i32()  # authorized_operations
+                return error, state, len(members)
+
+            return reply.array(described)
+
+        def consumer(reply, version):
+            reply.i32()  # throttle_time_ms
+            if reply.unsigned_varint() != 2:
+                raise WireError("expected one group")
+            error = reply.i16()
+            reply.string(nullable=True, compact=True)  # error_message
+            reply.string(compact=True)  # group_id
+            state = reply.string(compact=True)
+            reply.i32(), reply.i32(), reply.string(compact=True)  # group and assignment epochs, assignor
+            members = reply.unsigned_varint() - 1
+            reply.read(reply.remaining)  # member details are not needed
+            return [(error, state, members)]
+
+        encoded = group.encode("utf-8")
+        result = self.describe(group, 15, lambda version: wire_array([wire_string(group)])
+                               + (b"\0" if version >= 3 else b""), classic)
+        if result is None or result == ("Dead", 0):
+            # Kafka reports a group that uses the KIP-848 consumer protocol as Dead to classic DescribeGroups.
+            result = self.describe(group, 69, lambda version: wire_uint(2) + wire_uint(len(encoded) + 1) + encoded
+                                   + b"\0\0", consumer)
+        return result
+
+    def describe(self, group, api, body, parse):
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                described = self.request(self.coordinator(group), api, body, parse)
+            except UnsupportedApi:
+                return None
+            if len(described) != 1:
+                raise MigrationError(f"{MIGRATE_APIS[api][0]} answered for a different group")
+            error, state, members = described[0]
+            if error == NONE:
+                return state, members
+            if error == 69:  # GROUP_ID_NOT_FOUND: no group of this protocol type
+                return None
+            if error not in COORDINATOR_MOVED or time.monotonic() >= deadline:
+                raise MigrationError(f"{MIGRATE_APIS[api][0]} failed for consumer group {group!r} with {error_name(error)}")
+            time.sleep(0.2)
+
+    def commit(self, address, group, offsets):
+        def body(version):
+            header = wire_string(group) + struct.pack(">i", -1) + wire_string("")  # a standalone commit
+            if version >= 7:
+                header += wire_string(None)  # group_instance_id
+            if version <= 4:
+                header += struct.pack(">q", -1)  # retention_time_ms: the broker default
+            return header + wire_array(wire_string(topic) + wire_array(
+                struct.pack(">iq", partition, offset) + (b"\xff" * 4 if version >= 6 else b"") + wire_string(metadata)
+                for partition, offset, metadata in items
+            ) for topic, items in offsets.items())
+
+        def parse(reply, version):
+            if version >= 3:
+                reply.i32()  # throttle_time_ms
+            return {(topic, index): error for topic, items in reply.array(
+                lambda: (reply.string(), reply.array(lambda: (reply.i32(), reply.i16())))) for index, error in items}
+
+        return self.request(address, 8, body, parse)
+
+
+def by_leader(leaders, items, key=lambda item: item):
+    routes = {}
+    for item in items:
+        routes.setdefault(leaders[key(item)], []).append(item)
+    return routes.items()
+
+
+class KafkaSnapshot:
+    """One read transaction over a Kafka test server SQLite file."""
+
+    TABLES = {"kafka_cluster", "kafka_topics", "kafka_partitions", "kafka_batches", "kafka_timestamps",
+              "kafka_committed_offsets"}
+
+    def __init__(self, path):
+        if not path.is_file():
+            raise ValueError(f"Source database not found: {path}")
+        self.db = sqlite3.connect(f"file:{quote(str(path.absolute()))}?mode=ro", uri=True, isolation_level=None)
+        try:
+            self.db.execute("BEGIN")
+            tables = {name for name, in self.db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if not self.TABLES <= tables:
+                raise ValueError("Expected a Kafka test server SQLite persistence file")
+            self.topics = {name: [] for name, in self.db.execute("SELECT name FROM kafka_topics ORDER BY name")}
+            for topic, partition, end in self.db.execute(
+                    "SELECT topic, partition, next_offset FROM kafka_partitions ORDER BY topic, partition"):
+                ends = self.topics[topic]
+                if partition != len(ends):
+                    raise ValueError(f"Source topic {topic!r} has non-contiguous partition numbers")
+                ends.append(end)
+            self.groups = {}
+            for group, topic, partition, offset, metadata in self.db.execute("""
+                SELECT group_id, topic, partition, offset, metadata FROM kafka_committed_offsets
+                ORDER BY group_id, topic, partition
+            """):
+                self.groups.setdefault(group, []).append((topic, partition, offset, metadata))
+        except BaseException:
+            self.db.close()
+            raise
+
+    def batches(self, topic, partition):
+        return iter(self.db.execute("""
+            SELECT base_offset, last_offset, data FROM kafka_batches WHERE topic = ? AND partition = ? ORDER BY last_offset
+        """, (topic, partition)))
+
+
+@dataclass
+class PartitionCopy:
+    partition: int
+    source_end: int
+    target_start: int
+    rows: object = None
+    pending: tuple | None = None
+    ranges: list = field(default_factory=list)
+    records: int = 0
+    batches: int = 0
+    stalled: float | None = None
+    error: str | None = None
+
+    def __post_init__(self):
+        self.target_end = self.target_start
+
+    def load(self):
+        self.pending = None
+        row = next(self.rows, None) if self.error is None else None
+        if row is None:
+            return
+        base, last, data = row
+        # Client batches carry base offset 0 and no leader epoch; neither field is covered by the CRC.
+        batch = bytes(8) + data[8:12] + b"\xff" * 4 + data[16:]
+        try:
+            (_, stamps), = read_batches(batch)
+            if len(stamps) != last - base + 1:
+                raise ValueError
+        except ValueError:
+            self.error = f"the source batch at offset {base} is corrupt"
+            return
+        self.pending = base, len(stamps), batch
+
+    def advance(self, target):
+        source, count, _ = self.pending
+        if self.ranges and self.ranges[-1][0] + self.ranges[-1][2] == source and self.ranges[-1][1] + self.ranges[-1][2] == target:
+            self.ranges[-1][2] += count
+        else:
+            self.ranges.append([source, target, count])
+        self.target_end = target + count
+        self.records += count
+        self.batches += 1
+        self.stalled = None
+        self.load()
+
+    def translate(self, offset):
+        if offset == self.source_end:
+            return self.target_end
+        index = bisect.bisect_right(self.ranges, offset, key=lambda item: item[0]) - 1
+        if index >= 0:
+            source, target, count = self.ranges[index]
+            if offset < source + count:
+                return target + offset - source
+        return None
+
+
+def replay_topic(cluster, topic, copies, leaders):
+    """Send each partition's batches in order, one batch per partition per Produce request."""
+    log_append_time = False
+    active = [copy for copy in copies if copy.pending]
+    while active:
+        moved = False
+        for address, members in by_leader(leaders, active, key=lambda copy: copy.partition):
+            while members:
+                chunk, size = [], 0
+                while members and (not chunk or size + len(members[0].pending[2]) <= MIGRATE_REQUEST_BYTES):
+                    chunk.append(members.pop(0))
+                    size += len(chunk[-1].pending[2])
+                try:
+                    replies = cluster.produce(address, topic, chunk)
+                except MigrationError as exc:
+                    for copy in chunk:
+                        copy.error = f"{exc} (the last batch may or may not have been written)"
+                    continue
+                for copy in chunk:
+                    error, base, append_time, detail = replies.get(copy.partition, (None, -1, -1, ""))
+                    if error == NONE and base >= 0:
+                        log_append_time = log_append_time or append_time != -1
+                        copy.advance(base)
+                    elif error in LEADER_MOVED:
+                        copy.stalled = copy.stalled or time.monotonic()
+                        if time.monotonic() - copy.stalled < cluster.timeout:
+                            moved = True
+                        else:
+                            copy.error = f"Produce kept failing with {error_name(error)} for {cluster.timeout:g} seconds"
+                    else:
+                        hint = "; raise max.message.bytes on the target topic" if error in (10, 18) else ""
+                        reason = "no answer" if error is None else error_name(error)
+                        copy.error = (f"Produce failed at source offset {copy.pending[0]} with {reason}"
+                                      + (f": {detail}" if detail else "") + hint)
+        active = [copy for copy in active if copy.pending and copy.error is None]
+        if moved and active:
+            time.sleep(0.2)
+            try:
+                leaders = cluster.leaders(topic, len(copies))
+            except MigrationError as exc:
+                for copy in active:
+                    copy.error = str(exc)
+                break
+    return log_append_time
+
+
+def migrate_topic(cluster, snapshot, topic, ends, options):
+    count = len(ends)
+    error, internal, partitions = cluster.metadata([topic]).get(topic, (UNKNOWN_TOPIC_OR_PARTITION, False, {}))
+    created = error == UNKNOWN_TOPIC_OR_PARTITION
+    if created:
+        error, message = cluster.create_topic(topic, count, options.replication_factor)
+        created = error != TOPIC_ALREADY_EXISTS
+        if error not in (NONE, TOPIC_ALREADY_EXISTS):
+            raise MigrationError(f"CreateTopics failed with {error_name(error)}" + (f": {message}" if message else ""))
+        if not created:
+            error, internal, partitions = cluster.metadata([topic]).get(topic, (UNKNOWN_TOPIC_OR_PARTITION, False, {}))
+    if not created:
+        if error not in (NONE, 5):
+            raise MigrationError(f"Metadata failed with {error_name(error)}")
+        if internal:
+            raise MigrationError("the target topic is an internal Kafka topic")
+        if sorted(partitions) != list(range(count)):
+            raise MigrationError(f"the target topic has {len(partitions)} partitions but the source has {count}")
+    leaders = cluster.leaders(topic, count)
+    earliest = cluster.list_offsets(topic, count, leaders, -2)
+    latest = cluster.list_offsets(topic, count, leaders, -1)
+    held = sum(latest[index] - earliest[index] for index in range(count))
+    if held and not options.allow_non_empty_topics:
+        raise MigrationError(f"the target topic already holds {held} records; delete it or pass --allow-non-empty-topics")
+    copies = [PartitionCopy(index, ends[index], latest[index], snapshot.batches(topic, index)) for index in range(count)]
+    for copy in copies:
+        copy.load()
+    if replay_topic(cluster, topic, copies, leaders):
+        print(f"Kafka migrate: warning: topic {topic!r} uses LogAppendTime on the target, "
+              "so the broker replaced the source CreateTime timestamps", file=sys.stderr)
+    return copies
+
+
+def migrate_groups(cluster, groups, copies):
+    """Translate committed offsets through the offset map and commit them as standalone (generation -1) commits."""
+    results = []
+    for group, rows in groups.items():
+        entries, outcome = {}, []
+        for topic, partition, offset, metadata in rows:
+            if topic not in copies:
+                continue
+            copy = copies[topic][partition]
+            target = copy.translate(offset) if copy.error is None else None
+            item = {"group": group, "topic": topic, "partition": partition, "source_offset": offset,
+                    "target_offset": target, "metadata": metadata, "error": None}
+            if copy.error is not None:
+                item["error"] = "skipped because the partition was not fully migrated"
+            elif target is None:
+                item["error"] = f"offset {offset} does not point into the source log, which ends at {copy.source_end}"
+            else:
+                entries[topic, partition] = item
+            outcome.append(item)
+        if not outcome:
+            continue
+        deadline = time.monotonic() + cluster.timeout
+        try:
+            while entries:
+                address = cluster.coordinator(group)
+                offsets = {}
+                for (topic, partition), item in sorted(entries.items()):
+                    offsets.setdefault(topic, []).append((partition, item["target_offset"], item["metadata"]))
+                replies = cluster.commit(address, group, offsets)
+                retry = {}
+                for key, item in entries.items():
+                    error = replies.get(key)
+                    if error in COORDINATOR_MOVED and time.monotonic() < deadline:
+                        retry[key] = item
+                    elif error != NONE:
+                        hint = "; the group is active on the target, stop its consumers first" if error in GROUP_ACTIVE else ""
+                        item["error"] = f"OffsetCommit failed with {'no answer' if error is None else error_name(error)}{hint}"
+                entries = retry
+                if entries:
+                    time.sleep(0.2)
+        except MigrationError as exc:
+            for item in entries.values():
+                item["error"] = str(exc)
+        results.append((group, outcome))
+    return results
+
+
+def migrate_main(argv):
+    parser = argparse.ArgumentParser(
+        prog="kafka_server.py migrate",
+        description="Replay a Kafka test server SQLite snapshot into a running Kafka cluster.",
+    )
+    parser.add_argument("--db-file", type=Path, required=True, help="existing SQLite persistence file")
+    parser.add_argument("--bootstrap-server", required=True, help="target broker HOST:PORT; separate several with commas")
+    parser.add_argument("--topic", action="append", help="migrate only this topic; repeat for more (default: all)")
+    parser.add_argument("--replication-factor", type=int, help="replication factor of created topics (default: the broker's)")
+    parser.add_argument("--offset-map", type=Path, help="new JSON file that receives the source-to-target offset map")
+    parser.add_argument("--allow-non-empty-topics", action="store_true",
+                        help="append to existing target topics that already hold records")
+    parser.add_argument("--username", help="SASL/PLAIN user name (plaintext transport)")
+    parser.add_argument("--password-file", type=Path, help="file whose first line is the SASL/PLAIN password")
+    parser.add_argument("--timeout", type=float, default=30.0,
+                        help="seconds to wait for leaders, coordinators, and acknowledgements (default: %(default)g)")
+    args = parser.parse_args(argv)
+    if args.replication_factor is not None and not 1 <= args.replication_factor <= 32767:
+        parser.error("--replication-factor must be between 1 and 32767")
+    if (args.username is None) != (args.password_file is None):
+        parser.error("--username and --password-file must be given together")
+    if not 0 < args.timeout <= 3600:
+        parser.error("--timeout must be between 0 and 3600 seconds")
+    try:
+        bootstrap = [broker_address(item) for item in args.bootstrap_server.split(",") if item.strip()]
+        if not bootstrap:
+            raise ValueError("--bootstrap-server is empty")
+        credentials = None
+        if args.username is not None:
+            credentials = args.username, args.password_file.expanduser().read_text(encoding="utf-8").split("\n", 1)[0].rstrip("\r")
+        snapshot = KafkaSnapshot(args.db_file.expanduser())
+        cluster = KafkaCluster(bootstrap, args.timeout, credentials)
+        offset_map = None
+        try:
+            if args.offset_map is not None:
+                path = args.offset_map.expanduser().absolute()
+                if os.path.lexists(path):
+                    raise FileExistsError(f"Offset map already exists: {path}")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                offset_map = path.open("x", encoding="utf-8")  # reserved now so a late write cannot fail on access
+            selected = list(dict.fromkeys(args.topic or snapshot.topics))
+            missing = [name for name in selected if name not in snapshot.topics]
+            if missing:
+                raise ValueError(f"Topic not found in the source: {', '.join(missing)}")
+            cluster.metadata([])
+            for group, rows in snapshot.groups.items():
+                if any(row[0] in selected for row in rows):
+                    activity = cluster.group_activity(group)
+                    if activity and (activity[1] or activity[0] not in ("Empty", "Dead")):
+                        raise MigrationError(f"consumer group {group!r} is {activity[0]} on the target with "
+                                             f"{activity[1]} members; stop its consumers first")
+            copies, failures = {}, []
+            for topic in selected:
+                ends = snapshot.topics[topic]
+                try:
+                    copies[topic] = migrate_topic(cluster, snapshot, topic, ends, args)
+                except MigrationError as exc:
+                    copies[topic] = [PartitionCopy(index, end, None, error=str(exc)) for index, end in enumerate(ends)]
+                    failures.append(f"topic {topic!r}: {exc}")
+                    continue
+                failures += [f"topic {topic!r} partition {copy.partition}: {copy.error}"
+                             for copy in copies[topic] if copy.error is not None]
+            groups = migrate_groups(cluster, snapshot.groups, copies)
+            failures += [f"group {group!r} topic {item['topic']!r} partition {item['partition']}: {item['error']}"
+                         for group, items in groups for item in items if item["error"] is not None]
+            if offset_map is not None:
+                json.dump({
+                    "bootstrap_server": args.bootstrap_server,
+                    "partitions": [{
+                        "topic": topic, "partition": copy.partition, "source_end": copy.source_end,
+                        "target_start": copy.target_start, "target_end": copy.target_end, "records": copy.records,
+                        "ranges": [{"source_offset": source, "target_offset": target, "count": count}
+                                   for source, target, count in copy.ranges],
+                        "error": copy.error,
+                    } for topic, items in copies.items() for copy in items],
+                    "group_offsets": [item for _, items in groups for item in items],
+                }, offset_map, indent=2)
+                offset_map.write("\n")
+                offset_map.close()
+                offset_map = None
+        finally:
+            cluster.close()
+            snapshot.db.close()
+            if offset_map is not None:
+                offset_map.close()
+                os.unlink(offset_map.name)
+    except (OSError, ValueError, sqlite3.Error, MigrationError) as exc:
+        parser.exit(1, f"Kafka migrate failed: {exc}\n")
+    partitions = [copy for items in copies.values() for copy in items]
+    committed = sum(item["error"] is None for _, items in groups for item in items)
+    print(f"Migrated {sum(copy.records for copy in partitions)} records in {sum(copy.batches for copy in partitions)} "
+          f"batches across {len(partitions)} partitions of {len(copies)} topics and committed {committed} offsets "
+          f"for {len(groups)} consumer groups to {args.bootstrap_server}", flush=True)
+    if failures:
+        for failure in failures:
+            print(f"Kafka migrate: {failure}", file=sys.stderr)
+        failed_partitions = sum(copy.error is not None for copy in partitions)
+        failed_groups = sum(any(item["error"] is not None for item in items) for _, items in groups)
+        parser.exit(1, f"Kafka migrate failed: {failed_partitions} of {len(partitions)} partitions and "
+                       f"{failed_groups} of {len(groups)} consumer groups failed\n")
+    return 0
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["migrate"]:
+        try:
+            return migrate_main(argv[1:])
+        except KeyboardInterrupt:
+            return 130
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1", help="listen address (default: %(default)s)")
     parser.add_argument("--port", default=9092, type=int, help="listen port, 0 chooses a free port (default: %(default)s)")
