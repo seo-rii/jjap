@@ -461,13 +461,13 @@ class NexusExportTests(unittest.TestCase):
         checksum = json.dumps({method: hashlib.new(method, replacement).hexdigest()
                                for method in ("md5", "sha1", "sha256", "sha512")})
 
-        def write_concurrently(snapshot, repository, folder):
+        def write_concurrently(snapshot, repository, folder, *rest):
             if repository["name"] == "maven-releases":
                 with writer:
                     writer.execute("UPDATE assets SET content = ?, size = ?, checksum = ? WHERE path = ?",
                                    (replacement, len(replacement), checksum, "docs/readme.txt"))
                     writer.execute("DELETE FROM repositories WHERE name = 'raw-locked'")
-            return original(snapshot, repository, folder)
+            return original(snapshot, repository, folder, *rest)
 
         output = self.directory / "snapshot"
         with patch.dict(exporter.__globals__, {"export_files": write_concurrently}):
