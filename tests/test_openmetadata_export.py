@@ -3,6 +3,7 @@
 import contextlib
 import hashlib
 import http.client
+import http.server
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 import uuid
 
 
@@ -315,6 +316,181 @@ class OpenMetadataExportTests(unittest.TestCase):
                       self.run_script("export", "--db-file", other, "--out", self.directory / "invalid", check=False).stderr)
         self.assertEqual(list(self.directory.glob(".openmetadata-export-*")), [])
         self.assertFalse((self.directory / "missing.sqlite3").exists())
+
+    def raw(self, port, include="all"):
+        """Every entity with its ids, versions and history, with this server's origin removed from hrefs."""
+        origin = f"http://127.0.0.1:{port}"
+        result = {}
+        for kind, fqn in ENTITIES + [("table", LEGACY)]:
+            status, entity = request(port, "GET", f"/api/v1/{COLLECTIONS[kind]}/name/{quote(fqn, safe='')}?fields=*&include={include}",
+                                     headers=self.auth)
+            if status == 200:
+                history = self.call(port, "GET", f"{COLLECTIONS[kind]}/{entity['id']}/versions", headers=self.auth)
+                result[f"{kind} {fqn}"] = json.loads(json.dumps([entity, history]).replace(origin, "ORIGIN"))
+        return result
+
+    def test_import_round_trips_export_output_and_reads_a_live_server(self):
+        self.populate()
+        with self.server(self.source) as port:
+            original = self.catalog(port)
+            deleted = normalized(self.entity(port, "table", LEGACY, "deleted"))
+        original[f"table {ORDERS}"].pop("followers")
+        output = self.directory / "export"
+        self.run_script("export", "--db-file", self.source, "--out", output, "--include-deleted")
+        result = self.run_script("import", "--db-file", self.directory / "files.db", "--in", output)
+        self.assertIn("Imported 12 entities (1 soft-deleted) and 3 lineage edges to", result.stdout)
+        with self.server(self.directory / "files.db") as port:
+            self.assertEqual(self.catalog(port), original)
+            self.assertEqual(normalized(self.entity(port, "table", LEGACY, "deleted")), deleted)
+            self.assertEqual(self.entity(port, "table", LEGACY, "deleted")["version"], 0.2)
+
+        with self.server(self.source, "--password-file", str(self.token)) as port:
+            url = f"http://127.0.0.1:{port}/api"
+            source = self.raw(port)
+            denied = self.run_script("import", "--db-file", self.directory / "denied.db", "--source", url, check=False)
+            self.assertEqual(denied.returncode, 1)
+            self.assertIn("OpenMetadata import failed: GET v1/users", denied.stderr)
+            self.assertIn("HTTP 401", denied.stderr)
+            result = self.run_script("import", "--db-file", self.directory / "live.db", "--source", url, "--token-file",
+                                     self.token, "--include-deleted", "--page-size", "1")
+            self.assertIn("Imported 12 entities (1 soft-deleted) and 2 lineage edges to", result.stdout)
+            self.assertIn("the lineage API does not return the edges of the 1 soft-deleted entities", result.stderr)
+            current = self.run_script("import", "--db-file", self.directory / "current.db", "--source", url + "/",
+                                      "--token-file", self.token)
+            self.assertIn("Imported 11 entities and 2 lineage edges", current.stdout)
+        self.assertEqual(len(source), 12)
+        with self.server(self.directory / "live.db", "--password-file", str(self.token)) as port:
+            self.assertEqual(self.raw(port), source)
+            with_followers = self.catalog(port)
+        self.assertEqual(with_followers[f"table {ORDERS}"].pop("followers")[0]["type"], "user")
+        self.assertEqual(with_followers, original)
+        with self.server(self.directory / "current.db") as port:
+            self.assertEqual(self.raw(port), {key: value for key, value in source.items() if key != f"table {LEGACY}"})
+        self.assertFalse((self.directory / "denied.db").exists())
+        self.assertEqual(list(self.directory.glob(".openmetadata-import-*")), [])
+
+    def test_import_reads_openmetadata_history_strings_and_skips_unsupported_lineage(self):
+        service = {"id": str(uuid.uuid4()), "name": "kafka", "fullyQualifiedName": "kafka", "serviceType": "Kafka", "version": 0.2,
+                   "updatedAt": 1767225600000, "updatedBy": "ingestion-bot", "deleted": False, "href": "http://om/api/v1/x",
+                   "connection": {"config": {"type": "Kafka", "bootstrapServers": "kafka:9092"}}}
+        topic = {"id": str(uuid.uuid4()), "name": "orders", "fullyQualifiedName": "kafka.orders", "partitions": 6, "version": 0.1,
+                 "updatedAt": 1767225600001, "updatedBy": "ingestion-bot", "deleted": False, "serviceType": "Kafka",
+                 "service": {"id": service["id"], "type": "messagingService", "name": "kafka", "fullyQualifiedName": "kafka"}}
+        rows = {"services/messagingServices": [service], "topics": [topic]}
+        history = {service["id"]: [service, {**service, "version": 0.1, "connection": {}}], topic["id"]: [topic]}
+        seen = []
+
+        class Catalog(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                path = urlsplit(self.path).path.removeprefix("/api/v1/")
+                seen.append(path)
+                payload = {"data": [], "paging": {"total": 0}}
+                if path in rows:
+                    payload = {"data": rows[path], "paging": {"total": len(rows[path])}}
+                elif path.endswith("/versions"):
+                    entity_id = path.split("/")[-2]
+                    payload = {"entityType": "topic", "versions": [json.dumps(item) for item in history[entity_id]]}
+                elif path == f"lineage/topic/{topic['id']}":
+                    payload = {"entity": {"id": topic["id"], "type": "topic"}, "nodes": [], "upstreamEdges": [],
+                               "downstreamEdges": [{"fromEntity": topic["id"], "toEntity": str(uuid.uuid4())}]}
+                elif path.startswith("lineage/"):
+                    payload = {"entity": {}, "nodes": [], "upstreamEdges": [], "downstreamEdges": []}
+                elif path == "system/version":
+                    payload = {"version": "1.6.2"}
+                body = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Catalog)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        result = self.run_script("import", "--db-file", self.directory / "om.db", "--source", f"http://127.0.0.1:{server.server_port}/api")
+        self.assertIn("Imported 2 entities and 0 lineage edges", result.stdout)
+        self.assertIn("skipped 1 lineage edges to entities that were not imported", result.stderr)
+        self.assertIn("topics", seen)
+        with self.server(self.directory / "om.db") as port:
+            served = self.call(port, "GET", f"topics/{topic['id']}")
+            self.assertEqual({key: served[key] for key in ("version", "updatedBy", "partitions", "fullyQualifiedName")},
+                             {"version": 0.1, "updatedBy": "ingestion-bot", "partitions": 6, "fullyQualifiedName": "kafka.orders"})
+            self.assertEqual(served["service"]["id"], service["id"])
+            versions = self.call(port, "GET", f"services/messagingServices/{service['id']}/versions")["versions"]
+            self.assertEqual([(item["version"], item["connection"]) for item in versions],
+                             [(0.2, service["connection"]), (0.1, {})])
+
+    def test_import_rejects_existing_files_and_invalid_requests(self):
+        self.populate()
+        output = self.directory / "export"
+        self.run_script("export", "--db-file", self.source, "--out", output)
+        existing = self.directory / "existing.db"
+        existing.write_bytes(b"keep")
+        result = self.run_script("import", "--db-file", existing, "--in", output, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("already exists", result.stderr)
+        self.assertEqual(existing.read_bytes(), b"keep")
+        result = self.run_script("import", "--db-file", self.directory / "empty.db", "--in", self.directory, check=False)
+        self.assertTrue(result.stderr.startswith("OpenMetadata import failed:"), result.stderr)
+        body = output / "requests" / "00009-table.json"
+        broken = json.loads(body.read_text(encoding="utf-8"))
+        del broken["columns"]
+        body.write_text(json.dumps(broken), encoding="utf-8")
+        result = self.run_script("import", "--db-file", self.directory / "broken.db", "--in", output, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"OpenMetadata import failed: table {ORDERS}: columns is required", result.stderr)
+        self.assertFalse((self.directory / "broken.db").exists())
+        self.assertEqual(list(self.directory.glob(".openmetadata-import-*")), [])
+
+    def test_reset_empties_the_catalog_and_dry_run_writes_nothing(self):
+        self.populate()
+        target = self.directory / "target.db"
+        with self.server(target, "--password-file", str(self.token)) as port:
+            url = f"http://127.0.0.1:{port}/api"
+            planned = self.run_script("migrate", "--db-file", self.source, "--target", url, "--token-file", self.token,
+                                      "--include-deleted", "--dry-run")
+            self.assertIn(f"would create table {ORDERS}", planned.stdout)
+            self.assertIn(f"would add lineage {ORDERS} -> {TOPIC}", planned.stdout)
+            self.assertIn(f"would soft-delete table {LEGACY} again", planned.stdout)
+            self.assertIn(f"Dry run: would migrate 12 entities and 3 lineage edges (soft-deleted 1 again) at {url}", planned.stdout)
+            self.assertEqual(self.call(port, "GET", "users", headers=self.auth)["data"], [])
+            self.run_script("migrate", "--db-file", self.source, "--target", url, "--token-file", self.token)
+            self.call(port, "DELETE", f"topics/{self.entity(port, 'topic', TOPIC)['id']}", headers=self.auth)
+            again = self.run_script("migrate", "--db-file", self.source, "--target", url, "--token-file", self.token, "--dry-run")
+            self.assertIn(f"would update table {ORDERS}", again.stdout)
+            self.assertIn(f"would restore and update topic {TOPIC}", again.stdout)
+            self.assertIn("OpenMetadata restores it on PUT", again.stderr)
+
+            self.assertEqual(request(port, "POST", "/_jjap/reset")[0], 401)
+            self.assertEqual(request(port, "GET", "/_jjap/reset", headers=self.auth)[0], 405)
+            self.assertEqual(request(port, "PUT", "/_jjap/reset", headers=self.auth)[0], 405)
+            self.assertEqual(request(port, "POST", "/_jjap/reset", headers=self.auth), (200, {"reset": True}))
+            for kind in COLLECTIONS.values():
+                self.assertEqual(self.call(port, "GET", f"{kind}?include=all", headers=self.auth)["data"], [])
+        with self.server(target) as port:
+            self.assertEqual(self.call(port, "GET", "tables?include=all")["paging"]["total"], 0)
+            self.put(port, "databaseService", {"name": "mysql_prod", "serviceType": "Mysql"})
+        with contextlib.closing(sqlite3.connect(target)) as connection:
+            self.assertEqual([connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                              for table in ("metadata_entities", "metadata_versions", "metadata_lineage")], [1, 1, 0])
+
+        dangling = self.directory / "dangling.db"
+        with self.server(dangling) as port:
+            self.put(port, "messagingService", {"name": "kafka", "serviceType": "Kafka",
+                                                "owners": [{"type": "team", "fullyQualifiedName": "data"}]})
+        with self.server(self.directory / "empty.db") as port:
+            url = f"http://127.0.0.1:{port}/api"
+            planned = self.run_script("migrate", "--db-file", dangling, "--target", url, "--dry-run", check=False)
+            real = self.run_script("migrate", "--db-file", dangling, "--target", url, check=False)
+        for result in (planned, real):
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("messagingService kafka: owner team data not found", result.stderr)
+        self.assertIn("OpenMetadata migrate failed: dry run found 1 failures; would migrate 1 entities", planned.stderr)
+        self.assertIn("OpenMetadata migrate failed: 1 failures; migrated 1 entities", real.stderr)
 
 
 if __name__ == "__main__":

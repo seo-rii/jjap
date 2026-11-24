@@ -16,7 +16,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 import uuid
 
 
@@ -245,6 +245,186 @@ class OpenLineageExportTests(unittest.TestCase):
         self.assertIn("OpenLineage test server SQLite persistence file",
                       self.run_script("export", "--db-file", other, "--out", target, check=False).stderr)
         self.assertFalse((self.directory / "missing.sqlite3").exists())
+
+    def stored(self, db_file):
+        with contextlib.closing(sqlite3.connect(f"{db_file.as_uri()}?mode=ro", uri=True)) as connection:
+            return [row[0] for row in connection.execute("SELECT payload FROM lineage_events ORDER BY seq")]
+
+    def test_import_round_trips_export_files_and_reads_marquez_events(self):
+        run_ids = self.populate()
+        stored = self.stored_payloads()
+        with self.server(self.source) as port:
+            original = self.snapshot(port, run_ids)
+        plain, packed = self.directory / "events.ndjson", self.directory / "events.ndjson.gz"
+        self.run_script("export", "--db-file", self.source, "--out", plain)
+        self.run_script("export", "--db-file", self.source, "--out", packed)
+        for name, source in (("plain.db", plain), ("packed.db", packed)):
+            result = self.run_script("import", "--db-file", self.directory / name, "--in", source)
+            self.assertIn("Imported 6 OpenLineage events to", result.stdout)
+            self.assertEqual(self.stored(self.directory / name), stored)
+        with self.server(self.directory / "packed.db") as port:
+            self.assertEqual(self.snapshot(port, run_ids), original)
+
+        events = [json.loads(payload) for payload in stored]
+        array = self.directory / "array.json"
+        array.write_text(json.dumps(events[3:] + events[:3], indent=2, ensure_ascii=False), encoding="utf-8")
+        spaced = self.directory / "spaced.ndjson"
+        spaced.write_text("\n\n".join(json.dumps(item) for item in events[:4]) + "\n", encoding="utf-8")
+        result = self.run_script("import", "--db-file", self.directory / "mixed.db", "--in", array, "--in", spaced)
+        self.assertIn("Imported 6 OpenLineage events (4 duplicate events dropped)", result.stdout)
+        self.assertEqual(self.stored(self.directory / "mixed.db"), stored[3:] + stored[:3])
+        with self.server(self.directory / "mixed.db") as port:
+            self.assertEqual(self.snapshot(port, run_ids), original)
+
+        token = self.directory / "token"
+        token.write_text("source-token\n", encoding="ascii")
+        with self.server(self.source, "--password-file", str(token)) as port:
+            url = f"http://127.0.0.1:{port}"
+            denied = self.run_script("import", "--db-file", self.directory / "denied.db", "--source", url, check=False)
+            self.assertEqual(denied.returncode, 1)
+            self.assertIn("OpenLineage import failed: GET", denied.stderr)
+            self.assertIn("HTTP 401", denied.stderr)
+            result = self.run_script("import", "--db-file", self.directory / "live.db", "--source", url,
+                                     "--token-file", token, "--page-size", "1")
+            self.assertIn("Imported 4 OpenLineage events to", result.stdout)
+            self.assertIn("the source reports 6 events in the time range but returned 4", result.stderr)
+            windowed = self.run_script("import", "--db-file", self.directory / "window.db", "--source", url, "--token-file",
+                                       token, "--after", "2026-01-02T00:00:00Z", "--before", "2026-01-02T00:00:01Z")
+            self.assertIn("Imported 1 OpenLineage events", windowed.stdout)
+        run_events = [payload for payload in stored if '"runId"' in payload]
+        self.assertEqual(sorted(self.stored(self.directory / "live.db")), sorted(run_events))
+        with self.server(self.directory / "live.db") as port:
+            live = self.snapshot(port, run_ids)
+        self.assertEqual(live["runs"], original["runs"])
+        self.assertEqual(live["events"], original["events"])
+        self.assertEqual(list(self.directory.glob(".openlineage-import-*")), [])
+        self.assertFalse((self.directory / "denied.db").exists())
+
+    def test_events_api_pages_like_marquez(self):
+        job = {"namespace": "ties", "name": "job"}
+        run_ids = [str(uuid.uuid4()) for _ in range(7)]
+        events = [event("RunEvent", "2026-03-01T00:00:00Z" if index < 5 else f"2026-03-0{index - 3}T00:00:00Z",
+                        eventType="START", run={"runId": run_id}, job=job) for index, run_id in enumerate(run_ids)]
+        events.append(event("JobEvent", "2026-03-01T00:00:00Z", job={"namespace": "ties", "name": "static"}))
+        with self.server(self.source) as port:
+            self.post(port, events[::-1], "/api/v1/lineage/batch")
+            listing = self.get(port, "/api/v1/events/lineage?sortDirection=asc&limit=3&offset=4")
+            self.assertEqual(listing["totalCount"], 8)
+            self.assertEqual([item["run"]["runId"] for item in listing["events"]], [run_ids[0], run_ids[5], run_ids[6]])
+            newest = self.get(port, "/api/v1/events/lineage?limit=1")["events"][0]
+            self.assertEqual(newest["run"]["runId"], run_ids[6])
+            window = self.get(port, "/api/v1/events/lineage?" + urlencode(
+                {"after": "2026-03-02T00:00:00+00:00", "before": "2026-03-03T00:00:00Z", "sortDirection": "ASC"}))
+            self.assertEqual(([item["run"]["runId"] for item in window["events"]], window["totalCount"]), ([run_ids[5]], 1))
+            self.assertEqual(request(port, "GET", "/api/v1/events/lineage?sortDirection=up")[0], 400)
+            self.assertEqual(request(port, "GET", "/api/v1/events/lineage?after=yesterday")[0], 400)
+            result = self.run_script("import", "--db-file", self.directory / "ties.db", "--source",
+                                     f"http://127.0.0.1:{port}", "--page-size", "2")
+        self.assertIn("Imported 7 OpenLineage events", result.stdout)
+        self.assertEqual(sorted(json.loads(payload)["run"]["runId"] for payload in self.stored(self.directory / "ties.db")),
+                         sorted(run_ids))
+
+    def test_import_pages_marquez_that_caps_limit_and_rejects_unsorted_listings(self):
+        job = {"namespace": "fake", "name": "job"}
+        stored = [event("RunEvent", f"2026-04-01T00:00:0{index // 3}Z", eventType="START", run={"runId": str(uuid.uuid4())}, job=job)
+                  for index in range(7)]
+        seen, behavior = [], {"descending": False}
+
+        class Marquez(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                query = dict(parse_qsl(urlsplit(self.path).query))
+                seen.append((query["after"], query["offset"]))
+                rows = [item for item in stored if query["after"] <= item["eventTime"].replace("Z", ".000000Z") < query["before"]]
+                rows = rows[::-1] if behavior["descending"] else rows
+                start = int(query["offset"])
+                body = json.dumps({"events": rows[start:start + min(int(query["limit"]), 2)], "totalCount": len(rows)}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Marquez)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}"
+        result = self.run_script("import", "--db-file", self.directory / "capped.db", "--source", url, "--page-size", "100")
+        self.assertIn("Imported 7 OpenLineage events to", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(sorted(self.stored(self.directory / "capped.db")),
+                         sorted(json.dumps(item, sort_keys=True, separators=(",", ":")) for item in stored))
+        self.assertEqual(seen[:3], [("1900-01-01T00:00:00.000000Z", "0"), ("2026-04-01T00:00:00.000000Z", "0"),
+                                    ("2026-04-01T00:00:00.000000Z", "2")])
+        behavior["descending"] = True
+        result = self.run_script("import", "--db-file", self.directory / "unsorted.db", "--source", url, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("OpenLineage import failed: the source ignored sortDirection=asc", result.stderr)
+        self.assertFalse((self.directory / "unsorted.db").exists())
+
+    def test_import_reports_invalid_events_and_refuses_existing_files(self):
+        start = event("RunEvent", eventType="START", run={"runId": str(uuid.uuid4())}, job={"namespace": "n", "name": "j"})
+        lines = [json.dumps(start),
+                 json.dumps({"eventTime": "2026-01-01T00:00:00Z", "schemaURL": SCHEMA}), "{not json"]
+        for content, message in (("\n".join(lines[:2]), "line 2: producer is required"),
+                                 (lines[0] + "\n\n" + lines[2], "line 3: invalid JSON"),
+                                 ('"just text"', "line 1: Expected an OpenLineage event object")):
+            source = self.directory / "bad.ndjson.gz"
+            source.write_bytes(gzip.compress(content.encode()))
+            result = self.run_script("import", "--db-file", self.directory / "bad.db", "--in", source, check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertTrue(result.stderr.startswith("OpenLineage import failed:"), result.stderr)
+            self.assertIn(message, result.stderr)
+            self.assertFalse((self.directory / "bad.db").exists())
+        conflict = [json.loads(lines[0]), {**json.loads(lines[0]), "job": {"namespace": "n", "name": "other"}}]
+        (self.directory / "conflict.json").write_text(json.dumps(conflict), encoding="utf-8")
+        result = self.run_script("import", "--db-file", self.directory / "bad.db", "--in", self.directory / "conflict.json",
+                                 check=False)
+        self.assertIn("item 1: runId already belongs to a different job", result.stderr)
+        existing = self.directory / "existing.db"
+        existing.write_bytes(b"keep")
+        result = self.run_script("import", "--db-file", existing, "--in", self.directory / "conflict.json", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("already exists", result.stderr)
+        self.assertEqual(existing.read_bytes(), b"keep")
+        self.assertEqual(list(self.directory.glob(".openlineage-import-*")), [])
+
+    def test_reset_empties_the_collector_and_dry_run_posts_nothing(self):
+        run_ids = self.populate()
+        token = self.directory / "token"
+        token.write_text("reset-token\n", encoding="ascii")
+        auth = {"Authorization": "Bearer reset-token"}
+        target = self.directory / "target.db"
+        with self.server(target, "--password-file", str(token)) as port:
+            url = f"http://127.0.0.1:{port}"
+            refused = self.run_script("migrate", "--db-file", self.source, "--target", url, "--dry-run", check=False)
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn("dry run: the target refused the credentials: HTTP 401", refused.stderr)
+            planned = self.run_script("migrate", "--db-file", self.source, "--target", url, "--token-file", token,
+                                      "--batch-size", "4", "--dry-run")
+            self.assertIn("would post 6 events in 2 requests", planned.stdout)
+            self.assertIn(f"Dry run: would migrate 6 OpenLineage events to {url}/api/v1/lineage/batch", planned.stdout)
+            self.assertEqual(self.get(port, "/api/v1/namespaces", auth)["totalCount"], 0)
+            self.run_script("migrate", "--db-file", self.source, "--target", url, "--token-file", token)
+            again = self.run_script("migrate", "--db-file", self.source, "--target", url, "--token-file", token, "--dry-run")
+            self.assertIn("the target already holds 6 events in the same time range", again.stderr)
+
+            self.assertEqual(request(port, "POST", "/_jjap/reset")[0], 401)
+            self.assertEqual(request(port, "GET", "/_jjap/reset", headers=auth)[0], 405)
+            self.assertEqual(request(port, "DELETE", "/_jjap/reset", headers=auth)[0], 405)
+            status, body = request(port, "POST", "/_jjap/reset", headers=auth)
+            self.assertEqual((status, json.loads(body)), (200, {"reset": True}))
+            self.assertEqual(self.get(port, "/api/v1/namespaces", auth), {"namespaces": [], "totalCount": 0})
+            self.assertEqual(request(port, "GET", f"/api/v1/runs/{run_ids[0]}", headers=auth)[0], 404)
+        with self.server(target, "--password-file", str(token)) as port:
+            self.assertEqual(self.get(port, "/api/v1/events/lineage", auth), {"events": [], "totalCount": 0})
+            self.post(port, event("JobEvent", job={"namespace": "after", "name": "reset"}), headers=auth)
+            self.assertEqual(self.get(port, "/api/v1/namespaces", auth)["totalCount"], 1)
+        with contextlib.closing(sqlite3.connect(target)) as connection:
+            self.assertEqual(connection.execute("SELECT seq FROM lineage_events").fetchall(), [(1,)])
 
 
 if __name__ == "__main__":

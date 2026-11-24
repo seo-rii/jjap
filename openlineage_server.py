@@ -24,7 +24,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 
 EVENT_LIMIT = 4 * 1024 * 1024
@@ -160,6 +160,24 @@ class Store:
                     INSERT INTO lineage_events (digest, occurred, run_id, job_namespace, job_name, payload)
                     VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(digest) DO NOTHING
                 """, row)
+
+    def reset(self):
+        with self.lock, self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.connection.execute("DELETE FROM lineage_events")
+
+    def page(self, after, before, ascending, limit, offset):
+        """Marquez's GET /api/v1/events/lineage: run events only, but totalCount covers every event in the range."""
+        order = "ASC" if ascending else "DESC"
+        with self.lock:
+            rows = self.connection.execute(f"""
+                SELECT payload FROM lineage_events WHERE occurred >= ? AND occurred < ? AND run_id IS NOT NULL
+                ORDER BY occurred {order}, seq {order} LIMIT ? OFFSET ?
+            """, (after, before, limit, offset)).fetchall()
+            total, = self.connection.execute(
+                "SELECT COUNT(*) FROM lineage_events WHERE occurred >= ? AND occurred < ?", (after, before),
+            ).fetchone()
+        return {"events": [json.loads(payload) for payload, in rows], "totalCount": total}
 
     def events(self, run_id=None):
         with self.lock:
@@ -315,6 +333,13 @@ def integer(params, key, default, maximum):
     return value
 
 
+def moment(params, key, default):
+    try:
+        return timestamp(params.get(key, [default])[-1]).isoformat(timespec="microseconds")
+    except ValueError:
+        raise RequestError(400, f"{key} must be an ISO 8601 date-time") from None
+
+
 def page(key, values, params):
     offset = integer(params, "offset", 0, 2**31 - 1)
     limit = integer(params, "limit", 100, 10_000)
@@ -327,7 +352,7 @@ class Handler(BaseHTTPRequestHandler):
         super().setup()
 
     def respond(self, status, payload=None):
-        body = b"" if payload is None else json.dumps(payload, separators=(",", ":")).encode()
+        body = b"" if payload is None or self.command == "HEAD" else json.dumps(payload, separators=(",", ":")).encode()
         self.send_response(status)
         if status == 401:
             self.send_header("WWW-Authenticate", "Bearer")
@@ -376,6 +401,11 @@ class Handler(BaseHTTPRequestHandler):
         authorization = self.headers.get("Authorization", "")
         if self.server.token and not hmac.compare_digest(authorization.encode(), self.server.token):
             raise RequestError(401, "A bearer token is required")
+        if path == "/_jjap/reset":
+            if self.command != "POST":
+                raise RequestError(405, "Method not allowed")
+            self.server.store.reset()
+            return 200, {"reset": True}
         if self.command == "POST":
             if path == "/api/v1/lineage":
                 self.server.store.add([self.read_json()])
@@ -406,6 +436,13 @@ class Handler(BaseHTTPRequestHandler):
                 if len(segments) == 3:
                     return {"events": [event for _, event in events]}
                 return Projection(events).runs[run_id]
+            case ["events", "lineage"]:
+                direction = params.get("sortDirection", ["desc"])[-1].lower()
+                if direction not in {"asc", "desc"}:
+                    raise RequestError(400, "sortDirection must be asc or desc")
+                return store.page(moment(params, "after", "1970-01-01T00:00:00+00:00"),
+                                  moment(params, "before", "2030-01-01T00:00:00+00:00"), direction == "asc",
+                                  integer(params, "limit", 100, 2**31 - 1), integer(params, "offset", 0, 2**31 - 1))
         result = Projection(store.events())
         match segments:
             case ["lineage"]:
@@ -449,7 +486,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 
-    do_GET = do_POST = handle_http
+    do_GET = do_HEAD = do_POST = do_PUT = do_PATCH = do_DELETE = handle_http
 
 
 class Server(ThreadingHTTPServer):
@@ -551,6 +588,7 @@ def migrate_main(argv):
                              "(default: 100 when ENDPOINT ends with /batch, else one per request)")
     parser.add_argument("--retries", type=int, default=3, help="retries per request on 429, 5xx, or connection errors")
     parser.add_argument("--timeout", type=float, default=30, help="seconds per HTTP request")
+    parser.add_argument("--dry-run", action="store_true", help="read the events and check the target without posting anything")
     args = parser.parse_args(argv)
     target = args.target.rstrip("/")
     if urlsplit(target).scheme not in {"http", "https"} or args.batch_size < 0 or args.retries < 0 or args.timeout <= 0:
@@ -565,6 +603,8 @@ def migrate_main(argv):
     try:
         if args.token_file:
             headers["Authorization"] = f"Bearer {read_token(args.token_file)}"
+        if args.dry_run:
+            return dry_run(parser, args, target, url, headers, batch_size)
         pending = []
 
         def flush():
@@ -594,6 +634,228 @@ def migrate_main(argv):
     if failed:
         parser.exit(1, f"OpenLineage migrate failed: {failed} of {sent + failed} events were rejected by {url}\n")
     print(f"Migrated {sent} OpenLineage events to {url}")
+    return 0
+
+
+def fetch_json(url, headers, retries, timeout):
+    """GET a JSON document, retrying 429/5xx responses and connection failures; return (status, payload)."""
+    for attempt in range(retries + 1):
+        request = urllib.request.Request(url, headers={key: value for key, value in headers.items() if key != "Content-Type"})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                status, raw = response.status, response.read()
+        except urllib.error.HTTPError as error:
+            status, raw = error.code, error.read(500)
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
+            if attempt == retries:
+                raise ConnectionError(f"{url}: {getattr(error, 'reason', error)}") from None
+            time.sleep(min(0.25 * 2 ** attempt, 4))
+            continue
+        if (status == 429 or status >= 500) and attempt < retries:
+            time.sleep(min(0.25 * 2 ** attempt, 4))
+            continue
+        try:
+            return status, json.loads(raw) if raw else None
+        except ValueError:
+            return status, raw.decode("utf-8", "replace").strip()
+
+
+def utc_text(moment):
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def dry_run(parser, args, target, url, headers, batch_size):
+    """Read the snapshot and check that the target answers and accepts the credentials; post nothing."""
+    count, times = 0, []
+    for _, payload in snapshot_events(args.db_file):
+        count += 1
+        times.append(timestamp(json.loads(payload)["eventTime"]))
+    requests = -(-count // batch_size) if batch_size else count
+    status, payload = fetch_json(f"{target}/api/v1/namespaces?limit=1", headers, args.retries, args.timeout)
+    if status in {401, 403}:
+        parser.exit(1, f"OpenLineage migrate failed: dry run: the target refused the credentials: HTTP {status}\n")
+    if status == 200 and times:
+        latest = max(times)
+        latest = latest + timedelta(microseconds=1) if latest.year < 9999 else latest
+        query = urlencode({"after": utc_text(min(times)), "before": utc_text(latest), "limit": 0})
+        status, payload = fetch_json(f"{target}/api/v1/events/lineage?{query}", headers, args.retries, args.timeout)
+        if status == 200 and isinstance(payload, dict) and payload.get("totalCount"):
+            print(f"warning: the target already holds {payload['totalCount']} events in the same time range; "
+                  "Marquez does not deduplicate, so they would be stored again", file=sys.stderr)
+    elif status != 200:
+        print(f"warning: GET {target}/api/v1/namespaces returned HTTP {status}; the target's read API was not checked",
+              file=sys.stderr)
+    print(f"would post {count} events in {requests} requests to {url}")
+    print(f"Dry run: would migrate {count} OpenLineage events to {url}")
+    return 0
+
+
+# Import NDJSON or JSON-array event files, or the raw events of a running Marquez server
+
+IMPORT_AFTER, IMPORT_BEFORE = "1900-01-01T00:00:00Z", "9999-12-31T23:59:59.999999Z"
+
+
+def file_events(path):
+    """Yield (label, event) from NDJSON, one event per line, or a JSON array file; gzip is detected by content."""
+    with path.expanduser().open("rb") as raw:
+        stream = gzip.GzipFile(fileobj=raw) if raw.peek(2)[:2] == b"\x1f\x8b" else raw
+        with io.TextIOWrapper(stream, encoding="utf-8-sig") as text:
+            for number, line in enumerate(text, 1):
+                if not line.strip():
+                    continue
+                if line.lstrip().startswith("["):
+                    events = json.loads(line + text.read())
+                    if not isinstance(events, list):
+                        raise ValueError(f"{path}: expected a JSON array of events")
+                    for position, event in enumerate(events):
+                        yield f"{path} item {position}", event
+                    return
+                try:
+                    event = json.loads(line)
+                except ValueError as error:
+                    raise ValueError(f"{path} line {number}: invalid JSON ({error})") from None
+                yield f"{path} line {number}", event
+
+
+def marquez_events(source, headers, after, before, page_size, retries, timeout, stats):
+    """Page through GET /api/v1/events/lineage in ascending event time.
+
+    Its after bound is inclusive, so each page restarts at the last event time seen and skips the events of that
+    time it already returned; offset only advances while a whole page shares one event time. Paging ends on an empty
+    page rather than a short one, so a server that caps limit loses nothing."""
+    cursor, offset, boundary, stale = after, 0, set(), 0
+    while True:
+        query = urlencode({"sortDirection": "asc", "after": utc_text(cursor), "before": utc_text(before),
+                           "limit": page_size, "offset": offset})
+        status, payload = fetch_json(f"{source}/api/v1/events/lineage?{query}", headers, retries, timeout)
+        if status != 200 or not isinstance(payload, dict) or not isinstance(payload.get("events"), list):
+            raise ValueError(f"GET {source}/api/v1/events/lineage returned HTTP {status}: {str(payload)[:300]}")
+        if stats.get("total") is None and isinstance(payload.get("totalCount"), int):
+            stats["total"] = payload["totalCount"]
+        seen, read = [], stats.get("read", 0)
+        for event in payload["events"]:
+            label = f"source event {stats.get('read', 0) + 1}"
+            try:
+                moment = timestamp(event.get("eventTime") if isinstance(event, dict) else None)
+            except ValueError as error:
+                raise ValueError(f"{label}: {error}") from None
+            digest = hashlib.sha256(json.dumps(event, sort_keys=True, separators=(",", ":")).encode()).digest()
+            seen.append((moment, digest))
+            if moment == cursor and digest in boundary:
+                continue
+            stats["read"] = stats.get("read", 0) + 1
+            yield label, event
+        times = [moment for moment, _ in seen]
+        if times != sorted(times) or times and times[0] < cursor:
+            raise ValueError("the source ignored sortDirection=asc; it needs a Marquez release with sorted event listings")
+        if not seen:
+            return
+        stale = stale + 1 if stats.get("read", 0) == read else 0
+        if stale > 1:
+            raise ValueError("the source returned the same events again; it ignores the offset parameter")
+        if times[-1] == cursor:
+            offset += len(seen)
+            boundary.update(digest for _, digest in seen)
+        else:
+            cursor, offset = times[-1], 0
+            boundary = {digest for moment, digest in seen if moment == cursor}
+
+
+def load_events(store, events):
+    batch = []
+
+    def flush():
+        try:
+            store.add([event for _, event in batch])
+        except RequestError:
+            for label, event in batch:
+                try:
+                    store.add([event])
+                except RequestError as error:
+                    raise ValueError(f"{label}: {error}") from None
+        batch.clear()
+
+    read = 0
+    for label, event in events:
+        try:
+            event_row(event)
+        except (ValueError, OverflowError, RecursionError) as error:
+            raise ValueError(f"{label}: {error}") from None
+        read += 1
+        batch.append((label, event))
+        if len(batch) >= 500:
+            flush()
+    if batch:
+        flush()
+    stored, = store.connection.execute("SELECT COUNT(*) FROM lineage_events").fetchone()
+    return read, stored
+
+
+def publish_file(staged, destination):
+    """Publish a finished file; a hard link, unlike rename, refuses a destination that appeared meanwhile."""
+    try:
+        os.link(staged, destination)
+    except FileExistsError:
+        raise FileExistsError(f"Database file already exists: {destination}") from None
+    except OSError:
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Database file already exists: {destination}") from None
+        os.rename(staged, destination)
+
+
+def import_main(argv):
+    parser = argparse.ArgumentParser(prog="openlineage_server.py import",
+                                     description="Build a new SQLite persistence file from OpenLineage event files "
+                                                 "or from the raw events of a running Marquez server.")
+    parser.add_argument("--db-file", type=Path, required=True, help="new SQLite persistence file")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--in", dest="inputs", type=Path, action="append", metavar="FILE",
+                        help="NDJSON (one event per line) or JSON-array file, optionally gzip-compressed; repeatable")
+    source.add_argument("--source", help="Marquez API base URL, for example http://localhost:5000")
+    parser.add_argument("--token-file", type=Path, help="file containing a bearer token for --source")
+    parser.add_argument("--after", default=IMPORT_AFTER, help="earliest event time to read from --source (inclusive)")
+    parser.add_argument("--before", default=IMPORT_BEFORE, help="event time to stop reading from --source (exclusive)")
+    parser.add_argument("--page-size", type=int, default=500, help="events per request to --source")
+    parser.add_argument("--retries", type=int, default=3, help="retries per request on 429, 5xx, or connection errors")
+    parser.add_argument("--timeout", type=float, default=30, help="seconds per HTTP request")
+    args = parser.parse_args(argv)
+    source_url = (args.source or "").rstrip("/")
+    if args.source is not None and urlsplit(source_url).scheme not in {"http", "https"}:
+        parser.error("--source must be an http(s) URL")
+    if args.token_file and args.source is None:
+        parser.error("--token-file needs --source")
+    if args.page_size < 1 or args.retries < 0 or args.timeout <= 0:
+        parser.error("--page-size and --timeout must be positive and --retries not negative")
+    destination = args.db_file.expanduser().absolute()
+    stats = {}
+    try:
+        after, before = timestamp(args.after), timestamp(args.before)
+        if os.path.lexists(destination) or os.path.lexists(f"{destination}-wal"):
+            raise FileExistsError(f"Database file already exists: {destination}")
+        if args.source is not None:
+            headers = {"Accept": "application/json"}
+            if args.token_file:
+                headers["Authorization"] = f"Bearer {read_token(args.token_file)}"
+            events = marquez_events(source_url, headers, after, before, args.page_size, args.retries, args.timeout, stats)
+        else:
+            events = (item for path in args.inputs for item in file_events(path))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".openlineage-import-", dir=destination.parent) as temporary:
+            staged = Path(temporary) / destination.name
+            store = Store(staged)
+            try:
+                read, stored = load_events(store, events)
+                store.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                store.connection.close()
+            publish_file(staged, destination)
+    except (OSError, ValueError, EOFError, zlib.error, RecursionError, sqlite3.Error) as error:
+        parser.exit(1, f"OpenLineage import failed: {error}\n")
+    if stats.get("total") is not None and stats.get("read", 0) < stats["total"]:
+        print(f"warning: the source reports {stats['total']} events in the time range but returned {stats.get('read', 0)}; "
+              "Marquez's events API lists run events only, so job and dataset events were not imported", file=sys.stderr)
+    duplicates = f" ({read - stored} duplicate events dropped)" if read > stored else ""
+    print(f"Imported {stored} OpenLineage events{duplicates} to {destination}")
     return 0
 
 
@@ -631,6 +893,8 @@ def main(argv=None):
         return export_main(argv[1:])
     if argv[:1] == ["migrate"]:
         return migrate_main(argv[1:])
+    if argv[:1] == ["import"]:
+        return import_main(argv[1:])
     return serve_main(argv)
 
 
