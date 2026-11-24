@@ -21,9 +21,13 @@ bulk writes, indexes, validators, capped collections, views, and aggregation.
 Queries scan small test data sets. Index metadata, uniqueness, and TTL are
 enforced. Cursors hold snapshots of the documents returned by each read.
 
-Coverage excludes replica sets, sharding, transactions, change streams, time
-series, non-simple collations, specialized indexes, JavaScript evaluation, and
-user/role administration. Only the implemented operators are available.
+Add --replica-set rs0 to serve as the primary of a one-member replica set with
+multi-document transactions, retryable writes, and change streams. Resume tokens
+and retryable write results persist with --db-file.
+
+Coverage excludes multi-member replica sets, sharding, time series, non-simple
+collations, specialized indexes, JavaScript evaluation, and user/role
+administration. Only the implemented operators are available.
 
 Protocol references:
 https://www.mongodb.com/docs/v8.0/reference/mongodb-wire-protocol/
@@ -54,6 +58,7 @@ import socket
 import socketserver
 import sqlite3
 import ssl
+import string
 import stringprep
 import struct
 import subprocess
@@ -4735,6 +4740,8 @@ def id_index():
 
 class Catalog:
     def __init__(self, filename, *, readonly=False):
+        # Replica set mode sets a list here to observe every change before its SQLite commit.
+        self.journal = None
         if readonly:
             source = Path(filename).resolve(strict=True)
             if not source.is_file():
@@ -4788,9 +4795,9 @@ class Catalog:
             db, name, row[0], decode_bson(row[1])[0], {key: decode_bson(spec)[0] for key, spec in indexes}
         )
 
-    def create(self, db, name, options=None, indexes=None):
+    def create(self, db, name, options=None, indexes=None, uuid=None):
         options = {} if options is None else options
-        identifier = uuid4().bytes
+        identifier = uuid or uuid4().bytes
         self.sql.execute(
             "INSERT INTO mongo_collections (db, name, uuid, options) VALUES (?, ?, ?, ?)",
             (db, name, identifier, encode_bson(options)),
@@ -4799,10 +4806,14 @@ class Catalog:
             indexes = {} if "viewOn" in options else {"_id_": id_index()}
         collection = Collection(db, name, identifier, options, {})
         for spec in indexes.values():
-            self.set_index(collection, spec)
+            self.store_index(collection, spec)
+        if self.journal is not None:
+            self.journal.append(("create", collection))
         return collection
 
     def set_options(self, collection, options):
+        if self.journal is not None:
+            self.journal.append(("options", self.collection(collection.database, collection.name), options))
         self.sql.execute(
             "UPDATE mongo_collections SET options=? WHERE db=? AND name=?",
             (encode_bson(options), collection.database, collection.name),
@@ -4810,6 +4821,11 @@ class Catalog:
         collection.options = options
 
     def set_index(self, collection, spec):
+        if self.journal is not None:
+            self.journal.append(("index", self.collection(collection.database, collection.name), spec))
+        self.store_index(collection, spec)
+
+    def store_index(self, collection, spec):
         self.sql.execute(
             """INSERT INTO mongo_indexes (db, name, idx, spec) VALUES (?, ?, ?, ?)
                ON CONFLICT(db, name, idx) DO UPDATE SET spec=excluded.spec""",
@@ -4818,6 +4834,9 @@ class Catalog:
         collection.indexes[spec["name"]] = spec
 
     def drop_index(self, collection, name):
+        if self.journal is not None:
+            before = self.collection(collection.database, collection.name)
+            self.journal.append(("dropIndex", before, before.indexes[name]))
         self.sql.execute(
             "DELETE FROM mongo_indexes WHERE db=? AND name=? AND idx=?",
             (collection.database, collection.name, name),
@@ -4825,7 +4844,50 @@ class Catalog:
         del collection.indexes[name]
 
     def drop(self, db, name):
+        if self.journal is not None and (collection := self.collection(db, name)) is not None:
+            self.journal.append(("drop", collection, self.record_rows(db, name).fetchall()))
         return self.sql.execute("DELETE FROM mongo_collections WHERE db=? AND name=?", (db, name)).rowcount
+
+    def drop_database(self, db):
+        dropped = [self.drop(db, name) for _, name in self.namespaces(db)]
+        if dropped and self.journal is not None:
+            self.journal.append(("dropDatabase", db))
+
+    def rename(self, source_db, source, target_db, target):
+        """Move a collection, replacing an existing target."""
+        dropped = self.collection(target_db, target)
+        if self.journal is not None:
+            moved = self.collection(source_db, source)
+            rows = self.record_rows(source_db, source).fetchall()
+            dropped_rows = self.record_rows(target_db, target).fetchall() if dropped else []
+        if dropped is not None:
+            self.sql.execute("DELETE FROM mongo_collections WHERE db=? AND name=?", (target_db, target))
+        self.sql.execute(
+            "UPDATE mongo_collections SET db=?, name=? WHERE db=? AND name=?",
+            (target_db, target, source_db, source),
+        )
+        if self.journal is not None:
+            renamed = self.collection(target_db, target)
+            self.journal.append(("rename", moved, renamed, rows, dropped, dropped_rows))
+
+    def insert_record(self, collection, data, document):
+        record = self.sql.execute(
+            "INSERT INTO mongo_documents (db, name, data) VALUES (?, ?, ?)",
+            (collection.database, collection.name, data),
+        ).lastrowid
+        if self.journal is not None:
+            self.journal.append(("insert", collection, record, document))
+        return record
+
+    def update_record(self, collection, record, data, previous, document, update=None):
+        self.sql.execute("UPDATE mongo_documents SET data=? WHERE record=?", (data, record))
+        if self.journal is not None:
+            self.journal.append(("update", collection, record, previous, document, update))
+
+    def delete_record(self, collection, record, previous):
+        self.sql.execute("DELETE FROM mongo_documents WHERE record=?", (record,))
+        if self.journal is not None:
+            self.journal.append(("delete", collection, record, previous))
 
     def record_rows(self, db, name):
         return self.sql.execute(
@@ -5044,10 +5106,7 @@ class CollectionWriter:
     def insert(self, document):
         document = with_id(document)
         data, keys = self.prepare(document, None, None)
-        record = self.catalog.sql.execute(
-            "INSERT INTO mongo_documents (db, name, data) VALUES (?, ?, ?)",
-            (self.collection.database, self.collection.name, data),
-        ).lastrowid
+        record = self.catalog.insert_record(self.collection, data, document)
         self.set_record(record, document, data, keys)
         if self.collection.capped:
             self.enforce_cap()
@@ -5060,7 +5119,8 @@ class CollectionWriter:
         ):
             self.delete(next(iter(self.records)))
 
-    def replace(self, record, document):
+    def replace(self, record, document, *, update=None):
+        """Store a changed document; update is the update spec, for change stream descriptions."""
         previous, size = self.records[record]
         if "_id" not in document or encode_bson({"_id": document["_id"]}) != encode_bson(
             {"_id": previous["_id"]}
@@ -5072,7 +5132,7 @@ class CollectionWriter:
         data, keys = self.prepare(document, record, previous)
         if data == encode_bson(previous):
             return False
-        self.catalog.sql.execute("UPDATE mongo_documents SET data=? WHERE record=?", (data, record))
+        self.catalog.update_record(self.collection, record, data, previous, document, update)
         self.remove_keys(previous)
         self.size -= size
         self.set_record(record, document, data, keys)
@@ -5080,7 +5140,7 @@ class CollectionWriter:
 
     def delete(self, record):
         previous, size = self.records.pop(record)
-        self.catalog.sql.execute("DELETE FROM mongo_documents WHERE record=?", (record,))
+        self.catalog.delete_record(self.collection, record, previous)
         self.remove_keys(previous)
         self.size -= size
 
@@ -5505,6 +5565,1920 @@ class Cursor:
         return f"{self.database}.{self.collection}"
 
 
+# Replica set mode: cluster time, sessions, transactions, retryable writes, and change streams
+
+ERROR_NAMES.update(
+    {
+        23: "AlreadyInitialized",
+        47: "NoMatchingDocument",
+        76: "NoReplicationEnabled",
+        79: "UnknownReplWriteConcern",
+        91: "ShutdownInProgress",
+        112: "WriteConflict",
+        117: "ConflictingOperationInProgress",
+        125: "CommandFailed",
+        217: "IncompleteTransactionHistory",
+        225: "TransactionTooOld",
+        239: "SnapshotTooOld",
+        246: "SnapshotUnavailable",
+        251: "NoSuchTransaction",
+        256: "TransactionCommitted",
+        260: "InvalidResumeToken",
+        263: "OperationNotSupportedInTransaction",
+        280: "ChangeStreamFatalError",
+        11600: "InterruptedAtShutdown",
+        50768: "NotARetryableWriteCommand",
+    }
+)
+COMMANDS.update(
+    {
+        "abortTransaction": "abort_transaction",
+        "commitTransaction": "commit_transaction",
+        "killAllSessions": "kill_all_sessions",
+        "replSetGetConfig": "repl_set_get_config",
+        "replSetGetStatus": "repl_set_get_status",
+        "replSetInitiate": "repl_set_initiate",
+    }
+)
+ADMIN_COMMANDS.update(
+    {"aborttransaction", "committransaction", "replsetgetconfig", "replsetgetstatus", "replsetinitiate"}
+)
+API_V1_COMMANDS.update({"aborttransaction", "committransaction"})
+COMMAND_METADATA.update({"txnNumber", "autocommit", "startTransaction", "stmtId", "stmtIds"})
+WRITE_COMMANDS.add("committransaction")
+
+REPLICA_TERM = Int64(1)
+ELECTION_ID = ObjectId(bytes.fromhex("7fffffff0000000000000001"))
+TXN_COMMANDS = {
+    "aborttransaction",
+    "aggregate",
+    "bulkwrite",
+    "committransaction",
+    "create",
+    "createindexes",
+    "delete",
+    "distinct",
+    "find",
+    "findandmodify",
+    "getmore",
+    "insert",
+    "killcursors",
+    "update",
+}
+SESSIONLESS_COMMANDS = {
+    "buildinfo",
+    "connectionstatus",
+    "endsessions",
+    "getcmdlineopts",
+    "getparameter",
+    "hello",
+    "hostinfo",
+    "ismaster",
+    "killallsessions",
+    "killsessions",
+    "listcommands",
+    "ping",
+    "refreshsessions",
+    "replsetgetconfig",
+    "replsetgetstatus",
+    "replsetinitiate",
+    "saslcontinue",
+    "saslstart",
+    "serverstatus",
+    "setparameter",
+    "whatsmyuri",
+}
+RETRYABLE_WRITES = {
+    "insert": "documents",
+    "update": "updates",
+    "delete": "deletes",
+    "findandmodify": None,
+    "bulkwrite": "ops",
+}
+SNAPSHOT_READS = {"aggregate", "distinct", "find", "getmore"}
+READ_CONCERN_LEVELS = ("local", "available", "majority", "linearizable", "snapshot")
+CHANGE_STREAM_STAGES = {
+    "$addFields",
+    "$match",
+    "$project",
+    "$redact",
+    "$replaceRoot",
+    "$replaceWith",
+    "$set",
+    "$unset",
+}
+CHANGE_STREAM_OPTIONS = {
+    "allChangesForCluster",
+    "fullDocument",
+    "fullDocumentBeforeChange",
+    "resumeAfter",
+    "showExpandedEvents",
+    "startAfter",
+    "startAtOperationTime",
+}
+EXPANDED_EVENTS = {"create", "createIndexes", "dropIndexes", "modify"}
+INTERNAL_DATABASES = {"admin", "config", "local"}
+TRANSIENT_CODES = {24, 112, 239, 246, 251}
+RETRYABLE_CODES = {6, 7, 89, 91, 189, 262, 9001, 10107, 11600, 11602, 13435, 13436}
+SNAPSHOT_HISTORY_LIMIT = 100_000
+SESSION_RECORD_LIMIT = 10_000
+SESSION_IDLE_SECONDS = 1800
+_RESUME_TOKEN = re.compile(r"82([0-9A-F]{16})2B04([0-9A-F]{16})0([01])04")
+_WRITE_CONFLICT = (
+    "Caused by :: Write conflict during plan execution and yielding is disabled. "
+    ":: Please retry your operation or multi-document transaction."
+)
+
+
+class _Blocked(Exception):
+    """A write outside a transaction touches a document or namespace an open transaction holds."""
+
+    def __init__(self, txn):
+        super().__init__("blocked by an open transaction")
+        self.txn = txn
+
+
+class _Conflict(Exception):
+    """A transaction write conflicts; MongoDB aborts the transaction."""
+
+    def __init__(self, message=_WRITE_CONFLICT):
+        super().__init__(message)
+        self.error = MongoError(message, 112)
+
+
+def ts_stamp(value):
+    return Timestamp(value >> 32, value & 0xFFFFFFFF)
+
+
+def ts_value(stamp, name):
+    if not isinstance(stamp, Timestamp):
+        raise MongoError(f"{name} must be a timestamp", 14)
+    return stamp.time << 32 | stamp.increment
+
+
+def op_time(value):
+    return {"ts": ts_stamp(value), "t": REPLICA_TERM}
+
+
+def resume_token(ts, seq, invalidate=False):
+    return {"_data": f"82{ts:016X}2B04{seq:016X}0{int(invalidate)}04"}
+
+
+def parse_resume_token(token):
+    data = token.get("_data") if isinstance(token, dict) else None
+    if not isinstance(data, str):
+        raise MongoError(
+            f"Bad resume token: _data of missing or of wrong type. Expected string, got {token!r}", 40647
+        )
+    try:
+        bytes.fromhex(data)
+    except ValueError:
+        raise MongoError("resume token string was not a valid hex string", 9) from None
+    if match := _RESUME_TOKEN.fullmatch(data.upper()):
+        return int(match[1], 16), int(match[2], 16), match[3] == "1"
+    if len(data) >= 18 and data[:2] == "82":
+        # A token from another server: resume after its cluster time.
+        return int(data[2:18], 16), None, False
+    raise MongoError("resume token was not produced by a change stream", 9)
+
+
+def images_option(value):
+    spec = require_document(value, "changeStreamPreAndPostImages")
+    if set(spec) != {"enabled"}:
+        raise MongoError("changeStreamPreAndPostImages accepts only the enabled field", 40415)
+    return require_bool(spec["enabled"], "changeStreamPreAndPostImages.enabled")
+
+
+def conflict_keys(collection, *documents):
+    """Unique index entries a write touches; concurrent writers of one entry conflict."""
+    keys = set()
+    for spec in collection.indexes.values():
+        if is_unique(spec):
+            for document in documents:
+                if document is not None:
+                    for values in index_values(document, spec):
+                        keys.add((collection.database, collection.name, spec["name"], index_token(values)))
+    return keys
+
+
+def _same_bson(left, right):
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return list(left) == list(right) and all(_same_bson(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(map(_same_bson, left, right))
+    if isinstance(left, float):
+        return _BSON_DOUBLE.pack(left) == _BSON_DOUBLE.pack(right)
+    return left == right
+
+
+class _Delta:
+    """The updatedFields, removedFields, and truncatedArrays of an update event."""
+
+    def __init__(self):
+        self.updated, self.removed, self.truncated, self.paths = {}, [], [], {}
+
+    def name(self, path):
+        dotted = ".".join(map(str, path))
+        if any(isinstance(part, str) and (part.isdigit() or "." in part) for part in path):
+            self.paths[dotted] = list(path)
+        return dotted
+
+    def set(self, path, value):
+        self.updated[self.name(path)] = value
+
+    def unset(self, path):
+        self.removed.append(self.name(path))
+
+    def truncate(self, path, size):
+        self.truncated.append({"field": self.name(path), "newSize": size})
+
+    def merge(self, other):
+        self.updated.update(other.updated)
+        self.removed.extend(other.removed)
+        self.truncated.extend(other.truncated)
+        self.paths.update(other.paths)
+
+
+def _modifier_delta(old, new, path, delta, targets):
+    for field, value in new.items():
+        if field not in old:
+            delta.set(path + (field,), value)
+        elif not _same_bson(old[field], value):
+            _modifier_value(old[field], value, path + (field,), delta, targets)
+    for field in old:
+        if field not in new:
+            delta.unset(path + (field,))
+
+
+def _modifier_value(old, new, path, delta, targets):
+    # MongoDB logs each modifier at the path it names, appends array elements for $push and
+    # $addToSet, and rewrites whole arrays for $pop and $pull.
+    target = next(
+        (
+            op
+            for parts, op in targets
+            if len(parts) == len(path) and all(t == str(p) or t.startswith("$") for t, p in zip(parts, path))
+        ),
+        None,
+    )
+    if target is None and isinstance(old, dict) and isinstance(new, dict):
+        _modifier_delta(old, new, path, delta, targets)
+    elif (
+        isinstance(old, list)
+        and isinstance(new, list)
+        and len(new) >= len(old)
+        and (target is None or (target in ("$push", "$addToSet") and _same_bson(new[: len(old)], old)))
+    ):
+        for index, value in enumerate(new):
+            if index < len(old):
+                if not _same_bson(old[index], value):
+                    _modifier_value(old[index], value, path + (index,), delta, targets)
+            elif value is not None or index == len(new) - 1:
+                delta.set(path + (index,), value)
+    else:
+        delta.set(path, new)
+
+
+def _array_document(values):
+    return {str(index): value for index, value in enumerate(values)}
+
+
+def _pipeline_delta(old, new, path):
+    """Mirror MongoDB's oplog diff: nested diffs fall back to whole values when not smaller."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        sections, delta = {}, _Delta()
+        for field, value in new.items():
+            if field not in old:
+                sections.setdefault("i", {})[field] = value
+                delta.set(path + (field,), value)
+            elif not _same_bson(old[field], value):
+                child = _pipeline_delta(old[field], value, path + (field,))
+                if child is None:
+                    sections.setdefault("u", {})[field] = value
+                    delta.set(path + (field,), value)
+                else:
+                    sections["s" + field] = child[0]
+                    delta.merge(child[1])
+        for field in old:
+            if field not in new:
+                sections.setdefault("d", {})[field] = False
+                delta.unset(path + (field,))
+        size = len(encode_bson(new))
+    elif isinstance(old, list) and isinstance(new, list):
+        sections, delta = {"a": True}, _Delta()
+        if len(new) < len(old):
+            sections["l"] = len(new)
+            delta.truncate(path, len(new))
+        for index, value in enumerate(new):
+            if index < len(old) and _same_bson(old[index], value):
+                continue
+            child = _pipeline_delta(old[index], value, path + (index,)) if index < len(old) else None
+            if child is None:
+                sections[f"u{index}"] = value
+                delta.set(path + (index,), value)
+            else:
+                sections[f"s{index}"] = child[0]
+                delta.merge(child[1])
+        size = len(encode_bson(_array_document(new)))
+    else:
+        return None
+    if path and len(encode_bson(sections)) > size:
+        return None
+    return sections, delta
+
+
+def update_description(previous, document, update):
+    """Return the update event delta, or None when MongoDB would log a replacement."""
+    if isinstance(update, list):
+        sections, delta = _pipeline_delta(previous, document, ())
+        # A delta oplog entry adds {$v: 2, diff: {}} around the diff.
+        if len(encode_bson(sections)) + 15 > len(encode_bson(document)):
+            return None
+        return delta
+    if not isinstance(update, dict) or not _q_predicate_form(update):
+        return None
+    targets = []
+    for op, fields in update.items():
+        if isinstance(fields, dict):
+            for path, operand in fields.items():
+                targets.append((tuple(path.split(".")), op))
+                if op == "$rename" and isinstance(operand, str):
+                    targets.append((tuple(operand.split(".")), op))
+    delta = _Delta()
+    _modifier_delta(previous, document, (), delta, targets)
+
+    def rank(dotted):
+        parts = dotted.split(".")
+        for index, (target, _) in enumerate(targets):
+            if all(t == p or t.startswith("$") for t, p in zip(target, parts)):
+                return index
+        return len(targets)
+
+    # MongoDB lists changed fields in the order the update names them.
+    delta.updated = dict(sorted(delta.updated.items(), key=lambda item: rank(item[0])))
+    delta.removed.sort(key=rank)
+    return delta
+
+
+@dataclass
+class ChangeStream:
+    scope: tuple
+    pipeline: list
+    full_document: str
+    before: str
+    expanded: bool
+    position: int
+    ts: int
+    start: int = 0
+    invalidate: tuple | None = None
+    remaining: int | None = None
+    await_data: bool = True
+
+
+class Session:
+    def __init__(self, key, uid):
+        self.key = key
+        self.lsid = {"id": Binary(key, 4), "uid": Binary(uid)}
+        self.number = -1
+        self.state = None  # "retryable", "active", "committed", or "aborted" for self.number
+        self.statements = {}
+        self.txn = None
+        self.used = time.monotonic()
+
+    @property
+    def name(self):
+        return f"{UUID(bytes=self.key)} - {base64.b64encode(self.lsid['uid']).decode()} -  - "
+
+
+class Transaction:
+    def __init__(self, replset, session, read_ts):
+        self.session = session
+        self.number = session.number
+        self.store = SnapshotStore(replset, read_ts, self)
+        self.started = time.monotonic()
+        self.cursors = set()
+        self.locks = set()
+
+
+class SnapshotStore:
+    """A Catalog view at one cluster time that buffers a transaction's writes in memory."""
+
+    def __init__(self, replset, read_ts, txn=None):
+        self.replset = replset
+        self.sql = replset.catalog.sql
+        self.read_ts = read_ts
+        self.txn = txn
+        self.collections = {}
+        self.views = {}
+        self.created = {}
+        self.ops = []
+        self.next_record = -1
+
+    def collection(self, db, name):
+        ns = db, name
+        if ns not in self.collections:
+            self.collections[ns] = self.replset.collection_at(db, name, self.read_ts)
+        return deepcopy(self.collections[ns])
+
+    def view(self, db, name):
+        ns = db, name
+        if ns not in self.views:
+            exists = self.collection(db, name) is not None
+            self.views[ns] = self.replset.records_at(db, name, self.read_ts) if exists else {}
+        return self.views[ns]
+
+    def records(self, db, name):
+        return {record: (decode_bson(data)[0], len(data)) for record, data in self.view(db, name).items()}
+
+    def record_rows(self, db, name):
+        return list(self.view(db, name).items())
+
+    def unsupported(self, *_args, **_kwargs):
+        raise MongoError("This operation is not supported in a multi-document transaction", 263)
+
+    set_options = drop_index = drop = drop_database = rename = namespaces = data_stats = unsupported
+
+    def writable(self):
+        if self.txn is None:
+            raise MongoError("writes are unavailable at a read timestamp", 263)
+
+    def create(self, db, name, options=None, indexes=None, uuid=None):
+        self.writable()
+        options = {} if options is None else options
+        if "viewOn" in options:
+            raise MongoError("Cannot create a view in a multi-document transaction.", 263)
+        collection = Collection(
+            db, name, uuid or uuid4().bytes, options, dict(indexes or {"_id_": id_index()})
+        )
+        ns = db, name
+        self.collections[ns] = self.created[ns] = collection
+        self.views[ns] = {}
+        self.ops.append(("create", ns))
+        return deepcopy(collection)
+
+    def set_index(self, collection, spec):
+        ns = collection.database, collection.name
+        if ns not in self.created:
+            raise MongoError(
+                f"Cannot create new indexes on existing collection {collection.ns} in a multi-document transaction.",
+                263,
+            )
+        self.created[ns].indexes[spec["name"]] = spec
+        collection.indexes[spec["name"]] = spec
+
+    def claim(self, collection, *documents):
+        self.writable()
+        if collection.capped:
+            raise MongoError(
+                f"Collection '{collection.ns}' is a capped collection. "
+                "Writes in transactions are not allowed on capped collections.",
+                263,
+            )
+        replset, ns = self.replset, (collection.database, collection.name)
+        if ns not in self.created and replset.catalog_changes.get(ns, 0) > self.read_ts:
+            raise _Conflict()
+        keys = conflict_keys(collection, *documents)
+        for key in keys:
+            holder = replset.locks.get(key)
+            if (holder is not None and holder is not self.txn) or replset.key_commits.get(
+                key, 0
+            ) > self.read_ts:
+                raise _Conflict()
+        for key in keys:
+            replset.locks[key] = self.txn
+            self.txn.locks.add(key)
+
+    def insert_record(self, collection, data, document):
+        self.claim(collection, document)
+        record = self.next_record
+        self.next_record -= 1
+        ns = collection.database, collection.name
+        self.view(*ns)[record] = data
+        self.ops.append(("insert", ns, record, document))
+        return record
+
+    def update_record(self, collection, record, data, previous, document, update=None):
+        self.claim(collection, previous, document)
+        ns = collection.database, collection.name
+        self.view(*ns)[record] = data
+        self.ops.append(("update", ns, record, document, update))
+
+    def delete_record(self, collection, record, previous):
+        self.claim(collection, previous)
+        ns = collection.database, collection.name
+        del self.view(*ns)[record]
+        self.ops.append(("delete", ns, record))
+
+
+class ReplicaSet:
+    """Single-member replica set state. Every method runs under the engine lock."""
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.catalog = engine.catalog
+        self.sql = self.catalog.sql
+        settings = engine.settings
+        self.name = settings["replica_set"]
+        self.log_limit = settings.get("change_log_size", 10_000)
+        self.lifetime = 60
+        self.window = 300
+        self.process_id = ObjectId.new()
+        self.started = time.time()
+        self.sql.executescript("""
+            CREATE TABLE IF NOT EXISTS mongo_replset (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS mongo_changes (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, event BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mongo_sessions (
+                lsid BLOB PRIMARY KEY, txn_number INTEGER NOT NULL, state TEXT NOT NULL,
+                statements BLOB NOT NULL, used REAL NOT NULL
+            );
+            """)
+        meta = dict(self.sql.execute("SELECT key, value FROM mongo_replset"))
+        last = self.sql.execute("SELECT max(ts) FROM mongo_changes").fetchone()[0] or 0
+        self.clock = max(meta.get("cluster_time", 0), last, int(time.time()) << 32)
+        self.pruned_seq = meta.get("pruned_seq", 0)
+        self.pruned_ts = meta.get("pruned_ts", 0)
+        self.set_id = ObjectId(meta["replica_set_id"]) if "replica_set_id" in meta else ObjectId.new()
+        self.election = self.clock
+        with self.sql:
+            self.sql.execute(
+                "INSERT OR IGNORE INTO mongo_replset VALUES ('replica_set_id', ?)", (self.set_id.data,)
+            )
+            self.sql.execute(
+                "DELETE FROM mongo_sessions WHERE used < ?", (time.time() - SESSION_IDLE_SECONDS,)
+            )
+        self.sessions = {}
+        self.active = {}
+        self.locks = {}
+        self.key_commits = {}
+        self.catalog_changes = {}
+        self.cursor_txn = {}
+        self.undo = deque()
+        self.catalog_undo = deque()
+        self.floor = self.clock  # no history exists before startup
+        self.committing = None
+        self.recording = None
+        self.staged = None
+        self.swept = time.monotonic()
+        self.catalog.journal = []
+
+    # Topology and cluster time
+
+    @property
+    def me(self):
+        settings = self.engine.settings
+        port = settings.get("port", 27017)
+        host = settings.get("advertised_host")
+        if host:
+            return f"{host}:{port}" if ":" not in host or host.endswith("]") else host
+        host = settings.get("host", "127.0.0.1")
+        if host in ("", "0.0.0.0", "::"):
+            host = socket.gethostname()
+        return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+    @staticmethod
+    def tick(last):
+        now = int(time.time())
+        return now << 32 | 1 if now > last >> 32 else last + 1
+
+    def hello(self, writable_field, base):
+        me = self.me
+        date = DateTime((self.clock >> 32) * 1000)
+        last = op_time(self.clock)
+        return {
+            "topologyVersion": {"processId": self.process_id, "counter": Int64(0)},
+            "hosts": [me],
+            "setName": self.name,
+            "setVersion": 1,
+            writable_field: True,
+            "secondary": False,
+            "primary": me,
+            "me": me,
+            "electionId": ELECTION_ID,
+            "lastWrite": {
+                "opTime": last,
+                "lastWriteDate": date,
+                "majorityOpTime": last,
+                "majorityWriteDate": date,
+            },
+            **{key: value for key, value in base.items() if key != writable_field},
+        }
+
+    def await_topology(self, command):
+        # Streaming monitors send the topologyVersion they saw and expect a reply after
+        # maxAwaitTimeMS when nothing changed.
+        version = command.get("topologyVersion")
+        wait = command.get("maxAwaitTimeMS")
+        if not isinstance(version, dict) or version.get("processId") != self.process_id:
+            return
+        if not isinstance(wait, int) or isinstance(wait, bool) or wait < 0:
+            return
+        deadline = time.monotonic() + wait / 1000
+        while not self.engine.closed and (remaining := deadline - time.monotonic()) > 0:
+            self.engine.changed.wait(remaining)
+
+    def status(self):
+        now = DateTime.now()
+        last = op_time(self.clock)
+        date = DateTime((self.clock >> 32) * 1000)
+        optimes = {
+            "lastCommittedOpTime": last,
+            "lastCommittedWallTime": now,
+            "readConcernMajorityOpTime": last,
+            "appliedOpTime": last,
+            "durableOpTime": last,
+            "writtenOpTime": last,
+            "lastAppliedWallTime": now,
+            "lastDurableWallTime": now,
+            "lastWrittenWallTime": now,
+        }
+        member = {
+            "_id": 0,
+            "name": self.me,
+            "health": 1.0,
+            "state": 1,
+            "stateStr": "PRIMARY",
+            "uptime": int(time.time() - self.started),
+            "optime": last,
+            "optimeDate": date,
+            "optimeWritten": last,
+            "optimeWrittenDate": date,
+            "lastAppliedWallTime": now,
+            "lastDurableWallTime": now,
+            "lastWrittenWallTime": now,
+            "syncSourceHost": "",
+            "syncSourceId": -1,
+            "infoMessage": "",
+            "electionTime": ts_stamp(self.election),
+            "electionDate": DateTime((self.election >> 32) * 1000),
+            "configVersion": 1,
+            "configTerm": 1,
+            "self": True,
+            "lastHeartbeatMessage": "",
+        }
+        return {
+            "set": self.name,
+            "date": now,
+            "myState": 1,
+            "term": REPLICA_TERM,
+            "syncSourceHost": "",
+            "syncSourceId": -1,
+            "heartbeatIntervalMillis": Int64(2000),
+            "majorityVoteCount": 1,
+            "writeMajorityCount": 1,
+            "votingMembersCount": 1,
+            "writableVotingMembersCount": 1,
+            "optimes": optimes,
+            "members": [member],
+        }
+
+    def config(self):
+        member = {
+            "_id": 0,
+            "host": self.me,
+            "arbiterOnly": False,
+            "buildIndexes": True,
+            "hidden": False,
+            "priority": 1.0,
+            "tags": {},
+            "secondaryDelaySecs": Int64(0),
+            "votes": 1,
+        }
+        settings = {
+            "chainingAllowed": True,
+            "heartbeatIntervalMillis": 2000,
+            "heartbeatTimeoutSecs": 10,
+            "electionTimeoutMillis": 10000,
+            "catchUpTimeoutMillis": -1,
+            "catchUpTakeoverDelayMillis": 30000,
+            "getLastErrorModes": {},
+            "getLastErrorDefaults": {"w": 1, "wtimeout": 0},
+            "replicaSetId": self.set_id,
+        }
+        return {
+            "config": {
+                "_id": self.name,
+                "version": 1,
+                "term": 1,
+                "members": [member],
+                "protocolVersion": Int64(1),
+                "writeConcernMajorityJournalDefault": True,
+                "settings": settings,
+            }
+        }
+
+    def parameters(self):
+        return {
+            "transactionLifetimeLimitSeconds": self.lifetime,
+            "minSnapshotHistoryWindowInSeconds": self.window,
+        }
+
+    def set_parameter(self, key, value):
+        previous = self.parameters()[key]
+        number = require_integral_number(
+            value, key, 1 if key == "transactionLifetimeLimitSeconds" else 0, 2**31 - 1
+        )
+        if key == "transactionLifetimeLimitSeconds":
+            self.lifetime = number
+        else:
+            self.window = number
+        return previous
+
+    # Command routing
+
+    def dispatch(self, db, command, connection, name, execute):
+        try:
+            return self.route(db, command, connection, name, execute)
+        except MongoError as error:
+            self.label(error, command, name)
+            raise
+
+    def route(self, db, command, connection, name, execute):
+        engine = self.engine
+        lsid = session_id(command)
+        number = command.get("txnNumber", MISSING)
+        autocommit = command.get("autocommit", MISSING)
+        start = command.get("startTransaction", MISSING)
+        if autocommit is not MISSING and number is MISSING:
+            raise MongoError("'autocommit' field requires a transaction number to also be specified", 72)
+        if number is not MISSING:
+            if not isinstance(number, Int64):
+                raise MongoError(
+                    f"BSON field 'OperationSessionInfo.txnNumber' is the wrong type '{bson_type(number)}', "
+                    "expected type 'long'",
+                    14,
+                )
+            if lsid is None:
+                raise MongoError("Transaction number requires a session ID to also be specified", 72)
+            if number < 0:
+                raise MongoError("txnNumber must be non-negative", 72)
+        if start is not MISSING and autocommit is MISSING:
+            raise MongoError("'startTransaction' field requires 'autocommit' field to also be specified", 72)
+        if autocommit is not MISSING and autocommit is not False:
+            raise MongoError("Specifying autocommit=true is not allowed.", 72 if autocommit is True else 14)
+        if start is not MISSING and start is not True:
+            raise MongoError("Specifying startTransaction=false is not allowed.", 72)
+        timeout = require_integer(command.get("maxTimeMS", 0), "maxTimeMS", 0)
+        problem = self.write_concern_error(command)
+        started = time.monotonic()
+        with engine.changed:
+            engine.reap_cursors()
+            self.reap()
+            if name in ("hello", "ismaster"):
+                self.await_topology(command)
+            if engine.closed:
+                raise MongoError("The server is shutting down", 91)
+            if autocommit is False:
+                response = self.transaction_command(
+                    db, command, connection, name, execute, lsid, number, start is True, started, timeout
+                )
+            elif number is not MISSING:
+                response = self.retryable_write(
+                    db, command, connection, name, execute, lsid, number, started, timeout
+                )
+            else:
+                response = self.plain_command(db, command, connection, name, execute, started, timeout)
+            ok = response.pop("ok")
+            if name in ("insert", "update", "delete", "bulkwrite"):
+                response.update(electionId=ELECTION_ID, opTime=op_time(self.clock))
+            if problem is not None and (name in WRITE_COMMANDS or name == "aborttransaction"):
+                response["writeConcernError"] = problem
+            response["ok"] = ok
+            return self.gossip(response)
+
+    def gossip(self, document):
+        document["$clusterTime"] = {
+            "clusterTime": ts_stamp(self.clock),
+            "signature": {"hash": Binary(bytes(20)), "keyId": Int64(0)},
+        }
+        document["operationTime"] = ts_stamp(self.clock)
+        return document
+
+    def label(self, error, command, name):
+        code = error.code
+        labels = []
+        in_txn = command.get("autocommit") is False and "txnNumber" in command
+        if in_txn and code in TRANSIENT_CODES:
+            labels.append("TransientTransactionError")
+        if name == "committransaction" and code in RETRYABLE_CODES | {50, 64}:
+            labels.append("UnknownTransactionCommitResult")
+        if "txnNumber" in command and (not in_txn or name in ("committransaction", "aborttransaction")):
+            if code in RETRYABLE_CODES:
+                labels.append("RetryableWriteError")
+        if code in (280, 286) and name in ("aggregate", "getmore"):
+            labels.append("NonResumableChangeStreamError")
+        if labels:
+            error.details.setdefault("errorLabels", labels)
+        if "operationTime" not in error.details:
+            self.gossip(error.details)
+
+    def write_concern_error(self, command):
+        if "writeConcern" not in command:
+            return None
+        concern = require_document(command["writeConcern"], "writeConcern")
+        if "j" in concern:
+            require_bool(concern["j"], "writeConcern.j")
+        wtimeout = require_integer(concern.get("wtimeout", 0), "writeConcern.wtimeout", 0)
+        w = concern.get("w", 1)
+        info = {"writeConcern": {"w": w, "wtimeout": wtimeout, "provenance": "clientSupplied"}}
+        if w == "majority":
+            return None
+        if isinstance(w, str):
+            message = f"No write concern mode named '{w}' found in replica set configuration"
+            return {"code": 79, "codeName": ERROR_NAMES[79], "errmsg": message, "errInfo": info}
+        if require_integer(w, "writeConcern.w", 0) <= 1:
+            return None
+        return {
+            "code": 100,
+            "codeName": ERROR_NAMES[100],
+            "errmsg": "Not enough data-bearing nodes",
+            "errInfo": info,
+        }
+
+    def read_concern(self, command):
+        if "readConcern" not in command:
+            return "local", None
+        concern = require_document(command["readConcern"], "readConcern")
+        unknown = concern.keys() - {"level", "afterClusterTime", "atClusterTime", "afterOpTime", "provenance"}
+        if unknown:
+            raise MongoError(f"BSON field 'readConcern.{min(unknown)}' is an unknown field.", 40415)
+        level = concern.get("level", "local")
+        if level not in READ_CONCERN_LEVELS:
+            raise MongoError(
+                f"Enumeration value '{level}' for field 'readConcern.level' is not a valid value.", 2
+            )
+        at = concern.get("atClusterTime")
+        for field, value in (("atClusterTime", at), ("afterClusterTime", concern.get("afterClusterTime"))):
+            if value is None:
+                continue
+            if field == "atClusterTime" and level != "snapshot":
+                raise MongoError("atClusterTime field can be set only if level is equal to snapshot", 72)
+            if ts_value(value, f"readConcern.{field}") > self.clock:
+                raise MongoError(
+                    f"readConcern {field} value must not be greater than the current clusterTime. "
+                    f"Requested clusterTime: {{ ts: Timestamp({value.time}, {value.increment}) }}; "
+                    f"current clusterTime: {{ ts: Timestamp({self.clock >> 32}, {self.clock & 0xFFFFFFFF}) }}",
+                    72,
+                )
+        return level, None if at is None else ts_value(at, "atClusterTime")
+
+    def write_read_concern(self, command, name):
+        level, at = self.read_concern(command)
+        if name in RETRYABLE_WRITES and level != "local":
+            raise MongoError(
+                f'Command {next(iter(command))} does not support {{ readConcern: {{ level: "{level}", provenance: '
+                '"clientSupplied" } } :: caused by :: read concern not supported',
+                72,
+            )
+        return level, at
+
+    def run(self, db, command, connection, name, execute, started, timeout):
+        """Run a command; a write that touches a transaction's documents waits for it to end."""
+        engine = self.engine
+        while True:
+            if engine.statements is not None:
+                engine.statements.clear()
+            try:
+                return engine.run_command(db, command, connection, name, execute, started, timeout)
+            except _Blocked as blocked:
+                txn = blocked.txn
+                while txn.session.txn is txn:
+                    now = time.monotonic()
+                    waits = [txn.started + self.lifetime - now]
+                    if timeout:
+                        waits.append(started + timeout / 1000 - now)
+                        if waits[-1] <= 0:
+                            raise MongoError("operation exceeded time limit", 50) from None
+                    if engine.closed:
+                        raise MongoError("interrupted at shutdown", 11600) from None
+                    if waits[0] <= 0:
+                        self.reap()
+                    else:
+                        engine.changed.wait(min(waits))
+
+    def plain_command(self, db, command, connection, name, execute, started, timeout):
+        engine = self.engine
+        first = next(iter(command))
+        level, at = self.write_read_concern(command, name)
+        if level == "snapshot" and name not in SNAPSHOT_READS:
+            raise MongoError(
+                f'Command {first} does not support {{ readConcern: {{ level: "snapshot", provenance: '
+                '"clientSupplied" } } :: caused by :: read concern snapshot not supported',
+                72,
+            )
+        if name in ("committransaction", "aborttransaction") and "txnNumber" not in command:
+            raise MongoError(f"{first} must be run within a transaction", 125)
+        cursor_id = argument(command) if name == "getmore" and isinstance(argument(command), int) else None
+        if (owner := self.cursor_txn.get(cursor_id)) is not None:
+            raise MongoError(
+                f"Cannot run getMore on cursor {argument(command)}, which was created in transaction "
+                f"{owner.number}, without a txnNumber",
+                50740,
+            )
+        if level == "snapshot":
+            read_ts = self.clock if at is None else at
+            # Cursors already hold their snapshot, so getMore only echoes the read time.
+            store = None if read_ts == self.clock or name == "getmore" else SnapshotStore(self, read_ts)
+            if store is not None:
+                self.check_floor(read_ts)
+                engine.catalog = store
+            try:
+                response = self.run(db, command, connection, name, execute, started, timeout)
+            finally:
+                engine.catalog = self.catalog
+            target = response["cursor"] if "cursor" in response else response
+            target["atClusterTime"] = ts_stamp(read_ts)
+            return response
+        cursor = engine.cursors.get(argument(command)) if name == "getmore" else None
+        response = self.run(db, command, connection, name, execute, started, timeout)
+        if cursor is None or cursor.tail is None or not cursor.tail.await_data:
+            return response
+        if cursor.in_use:
+            raise MongoError("cursor is already in use", 237)
+        cursor.in_use = True
+        try:
+            deadline = started + (timeout or 1000) / 1000
+            while response["cursor"]["id"] and not response["cursor"]["nextBatch"]:
+                delay = deadline - time.monotonic()
+                if delay <= 0 or engine.closed:
+                    break
+                engine.changed.wait(min(delay, 0.25))
+                if engine.closed:
+                    break
+                response = self.run(db, command, connection, name, execute, started, 0)
+            return response
+        finally:
+            cursor.in_use = False
+
+    # Sessions and transactions
+
+    def session(self, lsid, connection):
+        key = lsid[0]
+        session = self.sessions.get(key)
+        if session is None:
+            account = self.engine.account
+            user = (
+                f"{account.username}@{account.database}"
+                if account and connection.get("authenticated")
+                else ""
+            )
+            session = Session(key, hashlib.sha256(user.encode()).digest())
+            row = self.sql.execute(
+                "SELECT txn_number, state, statements FROM mongo_sessions WHERE lsid=?", (key,)
+            ).fetchone()
+            if row is not None:
+                session.number, session.state = row[0], row[1]
+                session.statements = decode_bson(row[2])[0]
+            self.sessions[key] = session
+        session.used = time.monotonic()
+        return session
+
+    def reap(self):
+        now = time.monotonic()
+        for session in list(self.active.values()):
+            if now - session.txn.started > self.lifetime:
+                self.finish(session, "aborted")
+        if now - self.swept > 60:
+            self.swept = now
+            for key, session in list(self.sessions.items()):
+                if session.txn is None and now - session.used > SESSION_IDLE_SECONDS:
+                    del self.sessions[key]
+
+    def end_sessions(self, keys=None):
+        for key, session in list(self.active.items()):
+            if keys is None or key in keys:
+                self.finish(session, "aborted")
+
+    def finish(self, session, state):
+        txn = session.txn
+        session.txn = None
+        session.state = state
+        self.active.pop(session.key, None)
+        if txn is None:
+            return
+        for key in txn.locks:
+            if self.locks.get(key) is txn:
+                del self.locks[key]
+        for cursor_id in txn.cursors:
+            self.engine.cursors.pop(cursor_id, None)
+        while len(self.cursor_txn) > SESSION_RECORD_LIMIT:
+            del self.cursor_txn[next(iter(self.cursor_txn))]
+        self.prune_history()
+        self.engine.changed.notify_all()
+
+    def transaction_command(
+        self, db, command, connection, name, execute, lsid, number, start, started, timeout
+    ):
+        engine = self.engine
+        first = next(iter(command))
+        if name not in TXN_COMMANDS:
+            if name == "count":
+                message = (
+                    "Cannot run 'count' in a multi-document transaction. Please see "
+                    "http://dochub.mongodb.org/core/transaction-count for a recommended alternative."
+                )
+            elif name in SESSIONLESS_COMMANDS:
+                message = "This command is not supported in transactions"
+            else:
+                message = f"Cannot run '{first}' in a multi-document transaction."
+            raise MongoError(message, 263)
+        if db in ("config", "local"):
+            raise MongoError(f"Cannot run command against the {db} database in a transaction.", 263)
+        if start and name in ("committransaction", "aborttransaction"):
+            raise MongoError(
+                f"Cannot start a transaction with {'a commit' if name[0] == 'c' else 'an abort'}", 263
+            )
+        if start and name == "killcursors":
+            raise MongoError(
+                "Cannot run killCursors as the first operation in a multi-document transaction.", 263
+            )
+        if "writeConcern" in command and name not in ("committransaction", "aborttransaction"):
+            raise MongoError("writeConcern is not allowed within a multi-statement transaction", 72)
+        session = self.session(lsid, connection)
+        if number < session.number:
+            raise MongoError(
+                f"Cannot start transaction with {{ txnNumber: {number} }} on session {session.name} because a newer "
+                f"transaction with txnNumberAndRetryCounter {{ txnNumber: {session.number}, txnRetryCounter: 0 }} "
+                "has already started on this session.",
+                225,
+            )
+        if start:
+            if number == session.number:
+                raise MongoError(
+                    "Only servers in a sharded cluster can start a new transaction at the active transaction number",
+                    117,
+                )
+            level, at = self.read_concern(command)
+            if level not in ("local", "majority", "snapshot"):
+                raise MongoError(
+                    "The readConcern level must be either 'local' (default), 'majority' or 'snapshot' in order "
+                    "to run in a transaction",
+                    72,
+                )
+            read_ts = self.clock if at is None else at
+            self.check_floor(read_ts)
+            self.finish(session, None)
+            session.number, session.state, session.statements = number, "active", {}
+            session.txn = Transaction(self, session, read_ts)
+            self.active[session.key] = session
+        else:
+            if number > session.number or session.state in (None, "retryable"):
+                active = session.number if session.state not in (None, "retryable") else -1
+                raise MongoError(
+                    f"Given transaction number {number} does not match any in-progress transactions. "
+                    f"The active transaction number is {active}",
+                    251,
+                )
+            if "readConcern" in command:
+                raise MongoError("Only the first command in a transaction may specify a readConcern", 72)
+            if session.state == "committed":
+                if name == "committransaction":
+                    return {"ok": 1.0}
+                raise MongoError(f"Transaction with {{ txnNumber: {number} }} has been committed.", 256)
+            if session.state == "aborted":
+                raise MongoError(f"Transaction with {{ txnNumber: {number} }} has been aborted.", 251)
+        txn = session.txn
+        if name == "committransaction":
+            return self.commit(txn, db, command, connection, started, timeout)
+        if name == "aborttransaction":
+            self.finish(session, "aborted")
+            return {"ok": 1.0}
+        self.check_transaction_command(db, command, name, txn)
+        engine.catalog = txn.store
+        try:
+            response = engine.run_command(db, command, connection, name, execute, started, timeout)
+        except _Conflict as conflict:
+            self.finish(session, "aborted")
+            raise conflict.error from None
+        except MongoError:
+            self.finish(session, "aborted")
+            raise
+        finally:
+            engine.catalog = self.catalog
+        if response.get("writeErrors") or response.get("nErrors"):
+            self.finish(session, "aborted")
+        cursor = response.get("cursor")
+        if isinstance(cursor, dict) and session.txn is txn:
+            if cursor.get("id"):
+                txn.cursors.add(cursor["id"])
+                self.cursor_txn[cursor["id"]] = txn
+            elif name == "getmore":
+                txn.cursors.discard(argument(command))
+                self.cursor_txn.pop(argument(command), None)
+        return response
+
+    def check_transaction_command(self, db, command, name, txn):
+        first = next(iter(command))
+        if name == "getmore" and isinstance(argument(command), int):
+            cursor_id = argument(command)
+            owner = self.cursor_txn.get(cursor_id)
+            if owner is None and cursor_id in self.engine.cursors:
+                raise MongoError(
+                    f"Cannot run getMore on cursor {cursor_id}, which was not created in a transaction, "
+                    "in a transaction",
+                    50741,
+                )
+            if owner is not None and (owner is not txn or cursor_id not in self.engine.cursors):
+                raise MongoError(f"cursor id {cursor_id} not found", 43)
+        if name in ("insert", "update", "delete", "findandmodify", "create", "createindexes"):
+            target = command_collection(command)
+            if target.startswith("system."):
+                raise MongoError(
+                    f"Cannot write to system collection {db}.{target} within a transaction.", 50791
+                )
+            if name == "create" and txn.store.collection(db, target) is not None:
+                raise MongoError(f"Collection {db}.{target} already exists.", 48)
+        if name == "find" and command.get("tailable"):
+            raise MongoError("It is illegal to open a tailable cursor in a transaction", 72)
+        if name == "aggregate":
+            for stage in require_list(command.get("pipeline"), "pipeline"):
+                if isinstance(stage, dict) and stage:
+                    op = next(iter(stage))
+                    if op in ("$out", "$merge"):
+                        raise MongoError(f"{op} cannot be used in a transaction", 263)
+                    if op == "$changeStream":
+                        raise MongoError(
+                            "Operation not permitted in transaction :: caused by :: Aggregation stage "
+                            "$changeStream cannot run within a multi-document transaction.",
+                            263,
+                        )
+        if command.get("explain"):
+            raise MongoError(f"Cannot run '{first}' with explain in a multi-document transaction.", 263)
+
+    def commit(self, txn, db, command, connection, started, timeout):
+        session = txn.session
+        if not txn.store.ops:
+            self.finish(session, "committed")
+            return {"ok": 1.0}
+
+        def apply(_db, _command, _connection):
+            store = txn.store
+            for ns in store.created:
+                if self.catalog.collection(*ns) is not None:
+                    raise _Conflict(
+                        f"Caused by :: Collection namespace '{ns[0]}.{ns[1]}' is already in use. "
+                        ":: Please retry your operation or multi-document transaction."
+                    )
+            writers, records = {}, {}
+
+            def writer(ns):
+                if ns not in writers:
+                    writers[ns] = CollectionWriter(self.catalog, self.catalog.collection(*ns), bypass=True)
+                return writers[ns]
+
+            for op in store.ops:
+                kind, ns = op[0], op[1]
+                if kind == "create":
+                    created = store.created[ns]
+                    self.catalog.create(*ns, created.options, created.indexes, uuid=created.uuid)
+                elif kind == "insert":
+                    target = writer(ns)
+                    data, keys = target.prepare(op[3], None, None)
+                    records[op[2]] = self.catalog.insert_record(target.collection, data, op[3])
+                    target.set_record(records[op[2]], op[3], data, keys)
+                elif kind == "update":
+                    writer(ns).replace(records.get(op[2], op[2]), op[3], update=op[4])
+                else:
+                    writer(ns).delete(records.get(op[2], op[2]))
+            return {}
+
+        self.committing = txn
+        try:
+            self.engine.run_command(db, command, connection, "committransaction", apply, started, timeout)
+        except _Conflict as conflict:
+            self.finish(session, "aborted")
+            raise conflict.error from None
+        except MongoError as error:
+            self.finish(session, "aborted")
+            if error.code == 11000:
+                raise MongoError(_WRITE_CONFLICT, 112) from None
+            raise
+        finally:
+            self.committing = None
+        return {"ok": 1.0}
+
+    # Retryable writes
+
+    def retryable_write(self, db, command, connection, name, execute, lsid, number, started, timeout):
+        first = next(iter(command))
+        if name not in RETRYABLE_WRITES:
+            if name in ("committransaction", "aborttransaction"):
+                raise MongoError(f"{first} must be run within a transaction", 125)
+            raise MongoError(
+                "txnNumber may only be provided for multi-document transactions and retryable write commands. "
+                f"autocommit:false was not provided, and {first} is not a retryable write command.",
+                50768,
+            )
+        self.write_read_concern(command, name)
+        session = self.session(lsid, connection)
+        if number < session.number:
+            newer = "retryable write" if session.state == "retryable" else "transaction"
+            raise MongoError(
+                f"Retryable write with txnNumber {number} is prohibited on session {session.name} "
+                f"because a newer {newer} with txnNumber {session.number} has already started on this session.",
+                225,
+            )
+        if number == session.number and session.state not in (None, "retryable"):
+            raise MongoError("Cannot retry a retryable write that has been converted into a transaction", 217)
+        if number > session.number:
+            self.finish(session, None)
+            session.number, session.state, session.statements = number, "retryable", {}
+        field = RETRYABLE_WRITES[name]
+        ops = [command] if field is None else command.get(field)
+        if not isinstance(ops, list) or not ops:
+            return self.run(db, command, connection, name, execute, started, timeout)
+        ids = command.get("stmtIds")
+        if field is None:
+            ids = [command.get("stmtId", 0)]
+        elif not (isinstance(ids, list) and len(ids) == len(ops) and all(isinstance(i, int) for i in ids)):
+            ids = list(range(len(ops)))
+        plan = []
+        for op in ops:
+            plan.append(None)
+            if name == "update" and isinstance(op, dict) and op.get("multi") is True:
+                plan[-1] = MongoError("Cannot use (or request) retryable writes with multi=true", 72)
+            elif name == "delete" and isinstance(op, dict) and op.get("limit") == 0:
+                plan[-1] = MongoError("Cannot use (or request) retryable writes with limit=0", 72)
+            elif name == "bulkwrite" and isinstance(op, dict) and op.get("multi") is True:
+                plan[-1] = MongoError("Cannot use (or request) retryable writes with multi=true", 72)
+        for index, stmt in enumerate(ids):
+            if str(stmt) in session.statements:
+                plan[index] = "retried"
+        if not any(plan):
+            return self.recorded(db, command, connection, name, execute, session, ids, started, timeout)
+        if name == "findandmodify":
+            return {"ok": 1.0, **session.statements[str(ids[0])]["reply"], "retriedStmtId": ids[0]}
+        ordered = command.get("ordered", True) is not False
+        stop = (
+            next((i for i, step in enumerate(plan) if isinstance(step, MongoError)), len(ops))
+            if ordered
+            else len(ops)
+        )
+        run = [i for i, step in enumerate(plan) if step is None and i < stop]
+        outcome = {}
+        if run:
+            sub = {**command, field: [ops[i] for i in run]}
+            if name == "bulkwrite":
+                sub["cursor"] = {"batchSize": MAX_WRITE_BATCH}
+            response = self.recorded(
+                db, sub, connection, name, execute, session, [ids[i] for i in run], started, timeout
+            )
+            failures = response.get("writeErrors", [])
+            if name == "bulkwrite":
+                failures = [
+                    dict(row, index=row["idx"])
+                    for row in response["cursor"]["firstBatch"]
+                    if not row.get("ok")
+                ]
+            for failure in failures:
+                original = run[failure["index"]]
+                outcome[original] = ("error", {**failure, "index": original})
+        for index, step in enumerate(plan):
+            if isinstance(step, MongoError):
+                outcome[index] = ("error", self.engine.write_errors(step, index))
+            elif index not in outcome and str(ids[index]) in session.statements:
+                outcome[index] = (
+                    "retried" if step == "retried" else "ok",
+                    session.statements[str(ids[index])],
+                )
+        return self.retried_reply(db, command, name, ids, outcome, ordered, len(ops))
+
+    def recorded(self, db, command, connection, name, execute, session, ids, started, timeout):
+        self.recording = session, ids, name
+        self.engine.statements = {}
+        try:
+            return self.run(db, command, connection, name, execute, started, timeout)
+        finally:
+            self.recording = None
+            self.engine.statements = None
+
+    def retried_reply(self, db, command, name, ids, outcome, ordered, count):
+        processed = []
+        for index in range(count):
+            if index in outcome:
+                processed.append((index, *outcome[index]))
+                if ordered and outcome[index][0] == "error":
+                    break
+        results = [(index, value) for index, kind, value in processed if kind != "error"]
+        errors = [value for _, kind, value in processed if kind == "error"]
+        retried = [ids[index] for index, kind, _ in processed if kind == "retried"]
+        if name == "bulkwrite":
+            rows, totals = [], dict.fromkeys(
+                ("nErrors", "nInserted", "nMatched", "nModified", "nUpserted", "nDeleted"), 0
+            )
+            for index, kind, value in processed:
+                if kind == "error":
+                    totals["nErrors"] += 1
+                    rows.append({key: item for key, item in value.items() if key != "index"})
+                    continue
+                result = {
+                    "ok": 1.0,
+                    "idx": index,
+                    **{key: item for key, item in value.items() if key != "kind"},
+                }
+                if value["kind"] == "insert":
+                    totals["nInserted"] += 1
+                elif value["kind"] == "update":
+                    totals["nMatched"] += value["n"] - ("upserted" in value)
+                    totals["nModified"] += value.get("nModified", 0)
+                    totals["nUpserted"] += "upserted" in value
+                else:
+                    totals["nDeleted"] += value["n"]
+                if not command.get("errorsOnly"):
+                    rows.append(result)
+            size = require_integer(
+                require_document(command.get("cursor", {}), "cursor").get("batchSize", 101), "batchSize", 0
+            )
+            reply = {
+                "ok": 1.0,
+                **self.engine.cursor_response(db, "$cmd.bulkWrite", rows, command, size),
+                **totals,
+            }
+        elif name == "insert":
+            reply = {"ok": 1.0, "n": len(results)}
+        elif name == "delete":
+            reply = {"ok": 1.0, "n": sum(value["n"] for _, value in results)}
+        else:
+            reply = {
+                "ok": 1.0,
+                "n": sum(value["n"] for _, value in results),
+                "nModified": sum(value["nModified"] for _, value in results),
+            }
+            upserted = [
+                {"index": index, "_id": value["upserted"]} for index, value in results if "upserted" in value
+            ]
+            if upserted:
+                reply["upserted"] = upserted
+        if errors and name != "bulkwrite":
+            reply["writeErrors"] = errors
+        if retried:
+            reply["retriedStmtIds"] = retried
+        return reply
+
+    # Commit staging: change events, history for snapshots, and session records
+
+    def prepare_commit(self, response):
+        """Called inside the SQLite transaction after a command succeeded."""
+        entries = self.catalog.journal
+        if self.engine.catalog is not self.catalog or (not entries and self.recording is None):
+            return
+        txn = self.committing
+        if txn is None:
+            self.check_blocked(entries)
+        clock = self.clock
+        shared = None
+        if txn is not None and entries:
+            clock = shared = self.tick(clock)
+        stage = {"undo": [], "catalog": [], "keys": {}, "ddl": {}, "session": None}
+        wall = DateTime.now()
+        rows = []
+        for entry in entries:
+            ts = shared or self.tick(clock)
+            clock = ts
+            for event in self.entry_events(entry, stage, wall, ts):
+                if txn is not None:
+                    event = {"txnNumber": Int64(txn.number), "lsid": txn.session.lsid, **event}
+                rows.append((ts, event))
+        for ts, event in rows:
+            self.sql.execute("INSERT INTO mongo_changes (ts, event) VALUES (?, ?)", (ts, encode_bson(event)))
+        stage["ts"] = clock
+        pruned = None
+        if rows:
+            last = self.sql.execute("SELECT max(seq) FROM mongo_changes").fetchone()[0]
+            if last - self.log_limit > self.pruned_seq:
+                cut = last - self.log_limit
+                cut_ts = self.sql.execute(
+                    "SELECT ts FROM mongo_changes WHERE seq <= ? ORDER BY seq DESC LIMIT 1", (cut,)
+                ).fetchone()
+                self.sql.execute("DELETE FROM mongo_changes WHERE seq <= ?", (cut,))
+                pruned = cut, max(self.pruned_ts, cut_ts[0] if cut_ts else 0)
+                self.sql.executemany(
+                    "INSERT OR REPLACE INTO mongo_replset VALUES (?, ?)",
+                    (("pruned_seq", pruned[0]), ("pruned_ts", pruned[1])),
+                )
+        self.sql.execute("INSERT OR REPLACE INTO mongo_replset VALUES ('cluster_time', ?)", (clock,))
+        stage["pruned"] = pruned
+        if txn is not None:
+            stage["session"] = txn.session, txn.number, "committed", {}
+        elif self.recording is not None:
+            session, ids, name = self.recording
+            done = dict(session.statements)
+            if name == "findandmodify":
+                done[str(ids[0])] = {
+                    "reply": {key: response[key] for key in ("lastErrorObject", "value") if key in response}
+                }
+            else:
+                for index, result in self.engine.statements.items():
+                    done[str(ids[index])] = result
+            stage["session"] = session, session.number, "retryable", done
+        if stage["session"] is not None:
+            session, number, state, done = stage["session"]
+            self.sql.execute(
+                "INSERT OR REPLACE INTO mongo_sessions VALUES (?, ?, ?, ?, ?)",
+                (session.key, number, state, encode_bson(done), time.time()),
+            )
+            if len(self.sessions) > SESSION_RECORD_LIMIT:
+                self.sql.execute(
+                    "DELETE FROM mongo_sessions WHERE lsid NOT IN "
+                    "(SELECT lsid FROM mongo_sessions ORDER BY used DESC LIMIT ?)",
+                    (SESSION_RECORD_LIMIT,),
+                )
+        self.staged = stage
+
+    def discard(self):
+        self.catalog.journal.clear()
+        self.staged = None
+
+    def finish_commit(self):
+        stage, self.staged = self.staged, None
+        self.catalog.journal.clear()
+        if stage is None:
+            return
+        self.clock = max(self.clock, stage["ts"])
+        if stage["pruned"]:
+            self.pruned_seq, self.pruned_ts = stage["pruned"]
+        self.undo.extend(stage["undo"])
+        self.catalog_undo.extend(stage["catalog"])
+        if self.active:
+            self.key_commits.update(stage["keys"])
+            self.catalog_changes.update(stage["ddl"])
+        if stage["session"] is not None:
+            session, number, state, done = stage["session"]
+            if state == "committed":
+                self.finish(session, "committed")
+            elif session.number == number:
+                session.statements = done
+        self.prune_history()
+        self.engine.changed.notify_all()
+
+    def check_blocked(self, entries):
+        if not self.active:
+            return
+        for entry in entries:
+            kind = entry[0]
+            if kind in ("insert", "update", "delete"):
+                documents = entry[3:5] if kind == "update" else entry[3:4]
+                for key in conflict_keys(entry[1], *documents):
+                    if (holder := self.locks.get(key)) is not None:
+                        raise _Blocked(holder)
+            elif kind != "create" and kind != "dropDatabase":
+                names = {(entry[1].database, entry[1].name)}
+                if kind == "rename":
+                    names.add((entry[2].database, entry[2].name))
+                for session in self.active.values():
+                    if names & session.txn.store.collections.keys():
+                        raise _Blocked(session.txn)
+
+    def locked(self, collection, document):
+        return any(key in self.locks for key in conflict_keys(collection, document))
+
+    def entry_events(self, entry, stage, wall, ts):
+        kind, collection = entry[0], entry[1]
+        if kind == "dropDatabase":
+            return [{"operationType": "dropDatabase", "ns": {"db": collection}, "wallTime": wall}]
+        ns = collection.database, collection.name
+        base = {
+            "ns": {"db": ns[0], "coll": ns[1]},
+            "collectionUUID": Binary(collection.uuid, 4),
+            "wallTime": wall,
+        }
+        images = collection.options.get("changeStreamPreAndPostImages", {}).get("enabled")
+        undo, catalog = stage["undo"], stage["catalog"]
+        if kind in ("insert", "update", "delete"):
+            record, previous = entry[2], entry[3] if kind != "insert" else None
+            document = entry[3] if kind == "insert" else entry[4] if kind == "update" else None
+            undo.append((ts, ns, record, None if previous is None else encode_bson(previous)))
+            if self.active:
+                stage["keys"].update(dict.fromkeys(conflict_keys(collection, previous, document), ts))
+            if collection.is_view:
+                return []
+            key = {"documentKey": {"_id": (document or previous)["_id"]}}
+            if kind == "insert":
+                return [{"operationType": "insert", **base, "fullDocument": document, **key}]
+            event = {**base, **key}
+            if images:
+                event["preImage"] = previous
+            if kind == "delete":
+                return [{"operationType": "delete", **event}]
+            if images:
+                event["postImage"] = document
+            delta = update_description(previous, document, entry[5])
+            if delta is None:
+                return [{"operationType": "replace", **event, "fullDocument": document}]
+            description = {
+                "updatedFields": delta.updated,
+                "removedFields": delta.removed,
+                "truncatedArrays": delta.truncated,
+            }
+            return [
+                {
+                    "operationType": "update",
+                    **event,
+                    "updateDescription": description,
+                    "disambiguatedPaths": delta.paths,
+                }
+            ]
+        stage["ddl"][ns] = ts
+        if kind == "create":
+            catalog.append((ts, ns, None))
+            if collection.is_view:
+                description = {
+                    "viewOn": collection.options["viewOn"],
+                    "pipeline": collection.options["pipeline"],
+                }
+            else:
+                description = {**collection.options, "idIndex": collection.indexes.get("_id_", id_index())}
+            nature = "view" if collection.is_view else "collection"
+            return [
+                {"operationType": "create", **base, "operationDescription": description, "nsType": nature}
+            ]
+        if kind == "drop":
+            catalog.append((ts, ns, collection))
+            undo.extend((ts, ns, record, data) for record, data in entry[2])
+            return [] if collection.is_view else [{"operationType": "drop", **base}]
+        if kind == "rename":
+            target, rows, dropped, dropped_rows = entry[2], entry[3], entry[4], entry[5]
+            destination = target.database, target.name
+            stage["ddl"][destination] = ts
+            catalog.extend(((ts, destination, dropped), (ts, ns, collection)))
+            undo.extend((ts, destination, record, data) for record, data in dropped_rows)
+            for record, data in rows:
+                undo.extend(((ts, destination, record, None), (ts, ns, record, data)))
+            to = {"db": destination[0], "coll": destination[1]}
+            if destination[0] != ns[0]:
+                # Across databases MongoDB copies into a temporary collection, renames it, then drops
+                # the source.
+                suffix = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(5))
+                copy = {**base, "ns": {"db": destination[0], "coll": f"tmp{suffix}.renameCollection"}}
+                copy["collectionUUID"] = Binary(target.uuid, 4)
+                description = {**target.options, "idIndex": target.indexes.get("_id_", id_index())}
+                create = {"operationType": "create", **copy, "operationDescription": description}
+                events = [{**create, "nsType": "collection"}]
+                for _, data in rows:
+                    document = decode_bson(data)[0]
+                    key = {"documentKey": {"_id": document["_id"]}}
+                    events.append({"operationType": "insert", **copy, "fullDocument": document, **key})
+                events.append({"to": to, "operationType": "rename", **copy})
+                events.append({"operationType": "drop", **base})
+                return events
+            events = [{"to": to, "operationType": "rename", **base}]
+            if dropped is not None:
+                events.append(
+                    {
+                        "operationType": "drop",
+                        "ns": {"db": destination[0], "coll": destination[1]},
+                        "collectionUUID": Binary(dropped.uuid, 4),
+                        "wallTime": wall,
+                    }
+                )
+            return events
+        catalog.append((ts, ns, collection))
+        before = {"collectionOptions": {"uuid": Binary(collection.uuid, 4), **collection.options}}
+        if kind == "options":
+            changed = {key: value for key, value in entry[2].items() if collection.options.get(key) != value}
+            return [
+                {
+                    "operationType": "modify",
+                    **base,
+                    "operationDescription": changed,
+                    "stateBeforeChange": before,
+                }
+            ]
+        spec = entry[2]
+        if kind == "dropIndex":
+            return [{"operationType": "dropIndexes", **base, "operationDescription": {"indexes": [spec]}}]
+        if spec["name"] in collection.indexes:
+            change = {
+                "name": spec["name"],
+                **{key: spec[key] for key in INDEX_PARAMETER_NAMES if key in spec},
+            }
+            return [
+                {
+                    "operationType": "modify",
+                    **base,
+                    "operationDescription": {"index": change},
+                    "stateBeforeChange": before,
+                }
+            ]
+        return [{"operationType": "createIndexes", **base, "operationDescription": {"indexes": [spec]}}]
+
+    # Point-in-time reads
+
+    def check_floor(self, ts):
+        self.prune_history()
+        if ts < self.floor:
+            raise MongoError(
+                f"Read timestamp Timestamp({ts >> 32}, {ts & 0xFFFFFFFF}) is older than the oldest available "
+                f"timestamp Timestamp({self.floor >> 32}, {self.floor & 0xFFFFFFFF}).",
+                239,
+            )
+
+    def collection_at(self, db, name, ts):
+        self.check_floor(ts)
+        current = self.catalog.collection(db, name)
+        for stamp, ns, before in reversed(self.catalog_undo):
+            if stamp <= ts:
+                break
+            if ns == (db, name):
+                current = deepcopy(before)
+        return current
+
+    def records_at(self, db, name, ts):
+        rows = dict(self.catalog.record_rows(db, name))
+        for stamp, ns, record, before in reversed(self.undo):
+            if stamp <= ts:
+                break
+            if ns == (db, name):
+                if before is None:
+                    rows.pop(record, None)
+                else:
+                    rows[record] = before
+        return dict(sorted(rows.items()))
+
+    def prune_history(self):
+        horizon = min((session.txn.store.read_ts for session in self.active.values()), default=None)
+        limit = (int(time.time()) - self.window) << 32
+        if horizon is not None:
+            limit = min(limit, horizon)
+        for history in (self.undo, self.catalog_undo):
+            while history and (history[0][0] <= limit or len(history) > SNAPSHOT_HISTORY_LIMIT):
+                self.floor = max(self.floor, history.popleft()[0])
+        if horizon is None:
+            self.key_commits.clear()
+            self.catalog_changes.clear()
+        elif len(self.key_commits) > SNAPSHOT_HISTORY_LIMIT:
+            self.key_commits = {key: ts for key, ts in self.key_commits.items() if ts > horizon}
+
+    # Change streams
+
+    def open_stream(self, db, command):
+        engine = self.engine
+        pipeline = require_list(command.get("pipeline"), "pipeline")
+        spec = require_document(pipeline[0]["$changeStream"], "$changeStream")
+        cursor = require_document(command.get("cursor", {}), "cursor")
+        size = require_integer(cursor.get("batchSize", 101), "batchSize", 0)
+        if unknown := spec.keys() - CHANGE_STREAM_OPTIONS:
+            raise MongoError(f"BSON field '$changeStream.{min(unknown)}' is an unknown field.", 40415)
+        full = spec.get("fullDocument", "default")
+        if full not in ("default", "updateLookup", "whenAvailable", "required"):
+            raise MongoError(
+                f"Enumeration value '{full}' for field '$changeStream.fullDocument' is not a valid value.", 2
+            )
+        before = spec.get("fullDocumentBeforeChange", "off")
+        if before not in ("off", "whenAvailable", "required"):
+            raise MongoError(
+                f"Enumeration value '{before}' for field '$changeStream.fullDocumentBeforeChange' is not a valid value.",
+                2,
+            )
+        expanded = require_bool(spec.get("showExpandedEvents", False), "showExpandedEvents")
+        cluster = require_bool(spec.get("allChangesForCluster", False), "allChangesForCluster")
+        target = argument(command)
+        collectionless = isinstance(target, int) and not isinstance(target, bool) and target == 1
+        if cluster:
+            if db != "admin" or not collectionless:
+                found = f"{db}.$cmd.aggregate" if collectionless else f"{db}.{target}"
+                raise MongoError(
+                    "A $changeStream with 'allChangesForCluster:true' may only be opened on the 'admin' database, "
+                    f"and with no collection name; found {found}",
+                    72,
+                )
+            scope, name = ("cluster",), "$cmd.aggregate"
+        elif collectionless:
+            if db in INTERNAL_DATABASES:
+                raise MongoError(f"$changeStream may not be opened on the internal {db} database", 73)
+            scope, name = ("database", db), "$cmd.aggregate"
+        else:
+            name = collection_name(target)
+            if db in INTERNAL_DATABASES or name.startswith("system."):
+                raise MongoError(
+                    f"$changeStream may not be opened on the internal {db}.{name} collection", 73
+                )
+            existing = engine.collection(db, name)
+            if existing is not None and existing.is_view:
+                raise MongoError(f"Namespace {db}.{name} is a view, not a collection", 166)
+            scope = ("collection", db, name)
+        stages = pipeline[1:]
+        for stage in stages:
+            op = next(iter(stage), None) if isinstance(stage, dict) else None
+            if op == "$changeStream":
+                raise MongoError("$changeStream is only valid as the first stage in a pipeline", 40602)
+            if op not in CHANGE_STREAM_STAGES:
+                raise MongoError(f"{op} is not permitted in a $changeStream pipeline", 20)
+        validate_pipeline(stages, allow_write=False)
+        resume = [
+            option for option in ("resumeAfter", "startAfter", "startAtOperationTime") if option in spec
+        ]
+        if {"resumeAfter", "startAfter"} <= set(resume):
+            raise MongoError(
+                "Do not specify both 'resumeAfter' and 'startAfter' in a $changeStream stage", 50865
+            )
+        if len(resume) > 1:
+            raise MongoError("Only one type of resume option is allowed, but multiple were found.", 40674)
+        last = self.sql.execute("SELECT max(seq) FROM mongo_changes").fetchone()[0] or self.pruned_seq
+        stream = ChangeStream(scope, stages, full, before, expanded, last, self.clock)
+        if resume and resume[0] == "startAtOperationTime":
+            start = ts_value(spec["startAtOperationTime"], "startAtOperationTime")
+            if start <= self.pruned_ts:
+                raise MongoError(
+                    "Resume of change stream was not possible, as the resume point may no longer be in the oplog.",
+                    286,
+                )
+            row = self.sql.execute("SELECT max(seq) FROM mongo_changes WHERE ts < ?", (start,)).fetchone()
+            stream.position, stream.start = row[0] or self.pruned_seq, start
+        elif resume:
+            ts, seq, invalidate = parse_resume_token(spec[resume[0]])
+            if invalidate and resume[0] == "resumeAfter":
+                raise MongoError(
+                    "Attempting to resume a change stream using 'resumeAfter' is not allowed from an "
+                    "invalidate notification",
+                    260,
+                )
+            if seq is None:
+                row = self.sql.execute("SELECT max(seq) FROM mongo_changes WHERE ts <= ?", (ts,)).fetchone()
+                seq = row[0] or self.pruned_seq
+            if seq < self.pruned_seq:
+                raise MongoError(
+                    "Resume of change stream was not possible, as the resume point may no longer be in the oplog.",
+                    286,
+                )
+            if seq > last:
+                raise MongoError(
+                    f"cannot resume stream; the resume token was not found. {spec[resume[0]]!r}", 280
+                )
+            stream.position, stream.ts = seq, max(ts, stream.ts)
+            row = self.sql.execute("SELECT ts, event FROM mongo_changes WHERE seq=?", (seq,)).fetchone()
+            if not invalidate and row is not None:
+                event = decode_bson(row[1])[0]
+                if self.in_scope(scope, event) and self.invalidates(scope, event):
+                    stream.invalidate = row[0], seq, event["wallTime"]
+        return engine.cursor_response(db, name, [], command, size, tail=stream)
+
+    @staticmethod
+    def in_scope(scope, event):
+        ns, to = event["ns"], event.get("to")
+        db, coll = ns["db"], ns.get("coll")
+        if scope[0] == "collection":
+            return (db, coll) == scope[1:] or (to is not None and (to["db"], to["coll"]) == scope[1:])
+        if coll is not None and coll.startswith("system."):
+            return False
+        if scope[0] == "database":
+            return db == scope[1] or (to is not None and to["db"] == scope[1])
+        return db not in INTERNAL_DATABASES
+
+    @staticmethod
+    def invalidates(scope, event):
+        op = event["operationType"]
+        return (
+            op in ("drop", "rename")
+            if scope[0] == "collection"
+            else op == "dropDatabase" and scope[0] == "database"
+        )
+
+    def stream_batch(self, cursor, size, field):
+        stream = cursor.tail
+        cursor.last_used = time.monotonic()
+        events, used, lookups = [], 0, {}
+        if stream.position < self.pruned_seq:
+            raise MongoError(
+                "Resume of change stream was not possible, as the resume point may no longer be in the oplog.",
+                286,
+            )
+        while stream.remaining != 0 and (size is None or len(events) < size):
+            if stream.invalidate is not None:
+                ts, seq, wall = stream.invalidate
+                stream.remaining = 0
+                invalidate = {
+                    "_id": resume_token(ts, seq, True),
+                    "operationType": "invalidate",
+                    "clusterTime": ts_stamp(ts),
+                    "wallTime": wall,
+                }
+                events.append(invalidate)
+                stream.ts = ts
+                break
+            rows = self.sql.execute(
+                "SELECT seq, ts, event FROM mongo_changes WHERE seq > ? ORDER BY seq LIMIT 256",
+                (stream.position,),
+            ).fetchall()
+            if not rows:
+                stream.ts = max(stream.ts, self.clock)
+                break
+            for seq, ts, data in rows:
+                stream.position, stream.ts = seq, ts
+                if ts < stream.start:
+                    continue
+                event = decode_bson(data)[0]
+                if not self.in_scope(stream.scope, event):
+                    continue
+                if event["operationType"] in EXPANDED_EVENTS and not stream.expanded:
+                    continue
+                try:
+                    outputs = self.render(stream, seq, ts, event, lookups)
+                except MongoError as error:
+                    if error.code in (47, 280):
+                        prefix = (
+                            "PlanExecutor error during aggregation"
+                            if field == "firstBatch"
+                            else "Executor error during getMore"
+                        )
+                        raise MongoError(f"{prefix} :: caused by :: {error}", error.code) from None
+                    raise
+                for output in outputs:
+                    length = self.engine.batch_entry_size(output, len(events))
+                    if used + length > MAX_BSON_SIZE and events:
+                        stream.position = seq - 1
+                        return {
+                            "ns": cursor.ns,
+                            field: events,
+                            "postBatchResumeToken": resume_token(ts, seq - 1),
+                        }
+                    used += length
+                    events.append(output)
+                if self.invalidates(stream.scope, event):
+                    stream.invalidate = ts, seq, event["wallTime"]
+                    break
+                if size is not None and len(events) >= size:
+                    break
+        return {
+            "ns": cursor.ns,
+            field: events,
+            "postBatchResumeToken": resume_token(stream.ts, stream.position),
+        }
+
+    def render(self, stream, seq, ts, event, lookups):
+        op = event["operationType"]
+        output = {}
+        if "lsid" in event:
+            output.update(txnNumber=event["txnNumber"], lsid=event["lsid"])
+        if op == "rename":
+            output["to"] = event["to"]
+        token = resume_token(ts, seq)
+        output.update(_id=token, operationType=op, clusterTime=ts_stamp(ts))
+        if stream.expanded and "collectionUUID" in event:
+            output["collectionUUID"] = event["collectionUUID"]
+        output["wallTime"] = event["wallTime"]
+        if op in ("insert", "replace"):
+            output["fullDocument"] = event["fullDocument"]
+        elif op == "update" and stream.full_document != "default":
+            if stream.full_document == "updateLookup":
+                output["fullDocument"] = self.lookup(event, lookups)
+            else:
+                output["fullDocument"] = self.image(
+                    stream.full_document, event, "postImage", "post-image", ts_stamp(ts)
+                )
+        output["ns"] = event["ns"]
+        if "documentKey" in event:
+            output["documentKey"] = event["documentKey"]
+        if op == "update":
+            description = dict(event["updateDescription"])
+            if stream.expanded:
+                description["disambiguatedPaths"] = event.get("disambiguatedPaths", {})
+            output["updateDescription"] = description
+        if op in ("update", "replace", "delete") and stream.before != "off":
+            output["fullDocumentBeforeChange"] = self.image(
+                stream.before, event, "preImage", "pre-image", ts_stamp(ts)
+            )
+        if stream.expanded:
+            for key in ("operationDescription", "nsType", "stateBeforeChange"):
+                if key in event:
+                    output[key] = event[key]
+        if not stream.pipeline:
+            return [output]
+        results = run_pipeline([output], stream.pipeline, read_collection=lambda *_args: [])
+        for result in results:
+            if not _same_bson(result.get("_id"), token):
+                raise MongoError(
+                    "Encountered an event whose _id field, which contains the resume token, was modified by the "
+                    "pipeline. Modifying the _id field of an event makes it impossible to resume the stream from "
+                    "that point. Only transformations that retain the unmodified _id field are allowed.",
+                    280,
+                )
+        return results
+
+    def lookup(self, event, lookups):
+        ns = event["ns"]["db"], event["ns"]["coll"]
+        if ns not in lookups:
+            lookups[ns] = {value_key(doc["_id"]): doc for doc, _ in self.catalog.records(*ns).values()}
+        return lookups[ns].get(value_key(event["documentKey"]["_id"]))
+
+    @staticmethod
+    def image(mode, event, field, label, clock):
+        image = event.get(field)
+        if image is None and mode == "required":
+            op = event["operationType"]
+            ns = event["ns"]
+            raise MongoError(
+                f"Change stream was configured to require a {label} for all {op} events, but the {label} was not "
+                f'found for event: {{operationType: "{op}", ns: {{db: "{ns["db"]}", coll: "{ns["coll"]}"}}, '
+                f"clusterTime: Timestamp({clock.time}, {clock.increment})}}",
+                47,
+            )
+        return image
+
+
 class MongoEngine:
     def __init__(self, filename=None, *, account=None, settings=None):
         self.catalog = Catalog(filename)
@@ -5521,6 +7495,8 @@ class MongoEngine:
         self.ttl_enabled = bool(ttl_interval)
         self.ttl_interval = ttl_interval or 60
         self.ttl_changed = threading.Event()
+        self.statements = None
+        self.replset = ReplicaSet(self) if self.settings.get("replica_set") else None
 
     def close(self):
         with self.changed:
@@ -5542,10 +7518,13 @@ class MongoEngine:
             raise MongoError(f"Command {next(iter(command))} requires authentication", 13)
         if name in ADMIN_COMMANDS and db != "admin":
             raise MongoError(f"{next(iter(command))} may only be run against the admin database", 13)
-        if any(field in command for field in ("txnNumber", "startTransaction", "autocommit")):
+        transaction_fields = ("txnNumber", "startTransaction", "autocommit")
+        if self.replset is None and any(field in command for field in transaction_fields):
             raise MongoError("Transaction numbers are only allowed on a replica set member or mongos", 20)
         check_api_version(name, command)
         session_id(command)
+        if self.replset is not None:
+            return self.replset.dispatch(db, command, connection, name, getattr(self, methods))
         check_read_concern(command)
         if name in WRITE_COMMANDS:
             check_write_concern(command)
@@ -5586,10 +7565,16 @@ class MongoEngine:
             response = {"ok": 1.0, **result}
             if len(encode_bson(response)) + 32 > MAX_MESSAGE_SIZE:
                 raise MongoError("reply exceeds maximum message size", 10334)
+            if self.replset is not None:
+                self.replset.prepare_commit(response)
             self.catalog.sql.commit()
         except BaseException:
             self.catalog.sql.rollback()
+            if self.replset is not None:
+                self.replset.discard()
             raise
+        if self.replset is not None:
+            self.replset.finish_commit()
         if name in WRITE_COMMANDS or name in {"killcursors", "endsessions", "killsessions"}:
             self.changed.notify_all()
         self.commands_run += 1
@@ -5604,7 +7589,9 @@ class MongoEngine:
     def forget_cursors(self, db, name=None):
         for cursor_id, cursor in list(self.cursors.items()):
             if cursor.database == db and (not name or cursor.collection == name):
-                del self.cursors[cursor_id]
+                # Change streams outlive the collection and report the drop themselves.
+                if not isinstance(cursor.tail, ChangeStream):
+                    del self.cursors[cursor_id]
 
     @staticmethod
     def batch_entry_size(document, index):
@@ -5614,6 +7601,8 @@ class MongoEngine:
         return length + len(str(index)) + 2
 
     def batch(self, cursor, size, field):
+        if isinstance(cursor.tail, ChangeStream):
+            return self.replset.stream_batch(cursor, size, field)
         if cursor.tail is not None:
             documents = self.tail_batch(cursor, size)
             cursor.last_used = time.monotonic()
@@ -5737,12 +7726,44 @@ class MongoEngine:
         for cursor_id, cursor in list(self.cursors.items()):
             if cursor.session in ids:
                 del self.cursors[cursor_id]
+        if self.replset is not None:
+            self.replset.end_sessions({identifier for identifier, _ in ids})
         return {}
 
     def cmd_refresh_sessions(self, _db, command, _connection):
         for session in require_list(argument(command), "sessions"):
             session_id({"lsid": session})
         return {}
+
+    def cmd_kill_all_sessions(self, _db, command, _connection):
+        require_list(argument(command), "killAllSessions")
+        for cursor_id, cursor in list(self.cursors.items()):
+            if cursor.session is not None:
+                del self.cursors[cursor_id]
+        if self.replset is not None:
+            self.replset.end_sessions()
+        return {}
+
+    def cmd_commit_transaction(self, _db, _command, _connection):
+        raise MongoError("commitTransaction must be run within a transaction", 125)
+
+    def cmd_abort_transaction(self, _db, _command, _connection):
+        raise MongoError("abortTransaction must be run within a transaction", 125)
+
+    def require_replset(self):
+        if self.replset is None:
+            raise MongoError("not running with --replSet", 76)
+        return self.replset
+
+    def cmd_repl_set_get_status(self, _db, _command, _connection):
+        return self.require_replset().status()
+
+    def cmd_repl_set_get_config(self, _db, _command, _connection):
+        return self.require_replset().config()
+
+    def cmd_repl_set_initiate(self, _db, _command, _connection):
+        self.require_replset()
+        raise MongoError("already initialized", 23)
 
     def cmd_hello(self, _db, command, connection):
         writable_field = "isWritablePrimary" if next(iter(command)).lower() == "hello" else "ismaster"
@@ -5759,6 +7780,8 @@ class MongoEngine:
             "maxWireVersion": WIRE_VERSION,
             "readOnly": False,
         }
+        if self.replset is not None:
+            result = self.replset.hello(writable_field, result)
         account = self.account
         if "saslSupportedMechs" in command:
             result["saslSupportedMechs"] = (
@@ -5805,6 +7828,7 @@ class MongoEngine:
             "ttlMonitorSleepSecs": self.ttl_interval,
             "logicalSessionRefreshMillis": 300_000,
             "authenticationMechanisms": list(self.account.mechanisms) if self.account else [],
+            **(self.replset.parameters() if self.replset else {}),
         }
         if argument(command) == "*":
             return parameters
@@ -5817,8 +7841,13 @@ class MongoEngine:
         names = {"ttlMonitorEnabled": "ttl_enabled", "ttlMonitorSleepSecs": "ttl_interval"}
         enabled, interval = self.ttl_enabled, self.ttl_interval
         values = {}
+        replica = {}
         for key, value in list(command.items())[1:]:
             if key in COMMAND_METADATA:
+                continue
+            if self.replset is not None and key in self.replset.parameters():
+                values[key] = self.replset.parameters()[key]
+                replica[key] = value
                 continue
             if key not in names:
                 raise MongoError(f"unrecognized parameter: {key}")
@@ -5829,6 +7858,8 @@ class MongoEngine:
                 interval = require_integral_number(value, key, 1, 2_147_483_647)
         if not values:
             raise MongoError("no option found to set")
+        for key, value in replica.items():
+            self.replset.set_parameter(key, value)
         self.ttl_enabled, self.ttl_interval = enabled, interval
         self.ttl_changed.set()
         return {"was": next(iter(values.values()))}
@@ -5843,6 +7874,7 @@ class MongoEngine:
                 },
                 "storage": {"engine": "sqlite", **({"dbPath": str(self.filename)} if self.filename else {})},
                 "security": {"authorization": "enabled" if self.account else "disabled"},
+                **({"replication": {"replSet": self.replset.name}} if self.replset else {}),
             },
         }
 
@@ -5880,7 +7912,7 @@ class MongoEngine:
         return {"you": f"[{host}]:{port}" if ":" in host else f"{host}:{port}"}
 
     def cmd_server_status(self, _db, _command, _connection):
-        return {
+        status = {
             "host": platform.node(),
             "version": "8.0.0",
             "process": "mongo_test_server",
@@ -5893,6 +7925,10 @@ class MongoEngine:
                 "commands": {"total": self.commands_run},
             },
         }
+        if self.replset is not None:
+            hello = self.replset.hello("isWritablePrimary", {})
+            status["repl"] = {**hello, "rbid": 1}
+        return status
 
     def cmd_list_commands(self, _db, _command, _connection):
         return {
@@ -5951,6 +7987,8 @@ class MongoEngine:
             "collation",
             "idIndex",
         }
+        if self.replset is not None:
+            supported.add("changeStreamPreAndPostImages")
         for option in supported & command.keys():
             options[option] = command[option]
         extras = command.keys() - supported - COMMAND_METADATA - {next(iter(command))}
@@ -5958,6 +7996,9 @@ class MongoEngine:
             raise MongoError(f"unsupported create option: {min(extras)}", 72)
         simple_collation(options.get("collation"))
         options.pop("collation", None)
+        images = options.get("changeStreamPreAndPostImages")
+        if images is not None and not images_option(images):
+            del options["changeStreamPreAndPostImages"]
         if "viewOn" in options:
             source = collection_name(options["viewOn"])
             if options.keys() - {"viewOn", "pipeline"}:
@@ -5999,7 +8040,7 @@ class MongoEngine:
         return {"ns": collection.ns, "nIndexesWas": len(collection.indexes)}
 
     def cmd_drop_database(self, db, _command, _connection):
-        self.catalog.sql.execute("DELETE FROM mongo_collections WHERE db=?", (db,))
+        self.catalog.drop_database(db)
         self.forget_cursors(db)
         return {"dropped": db}
 
@@ -6009,14 +8050,9 @@ class MongoEngine:
         self.collection(source_db, source, required=True, writable=True)
         if (target_db, target) == (source_db, source):
             raise MongoError("source and target namespaces must differ")
-        if self.catalog.collection(target_db, target):
-            if not command.get("dropTarget"):
-                raise MongoError(f"target namespace exists: {target_db}.{target}", 48)
-            self.catalog.drop(target_db, target)
-        self.catalog.sql.execute(
-            "UPDATE mongo_collections SET db=?, name=? WHERE db=? AND name=?",
-            (target_db, target, source_db, source),
-        )
+        if self.catalog.collection(target_db, target) and not command.get("dropTarget"):
+            raise MongoError(f"target namespace exists: {target_db}.{target}", 48)
+        self.catalog.rename(source_db, source, target_db, target)
         self.forget_cursors(source_db, source)
         self.forget_cursors(target_db, target)
         return {}
@@ -6089,11 +8125,14 @@ class MongoEngine:
                     raise MongoError(f"equivalent index already exists as {other['name']}", 85)
             writer.build_index(index)
             self.catalog.set_index(collection, index)
-        return {
+        result = {
             "numIndexesBefore": before,
             "numIndexesAfter": len(collection.indexes),
             "createdCollectionAutomatically": created,
         }
+        if self.replset is not None:
+            result["commitQuorum"] = "votingMembers"
+        return result
 
     def cmd_list_indexes(self, db, command, _connection):
         name = command_collection(command)
@@ -6138,12 +8177,19 @@ class MongoEngine:
             if collection.is_view
             else COLLECTION_VALIDATION_OPTIONS | {"index", "cappedSize", "cappedMax"}
         )
+        if self.replset is not None and not collection.is_view:
+            allowed = allowed | {"changeStreamPreAndPostImages"}
         extras = command.keys() - allowed - COMMAND_METADATA - {next(iter(command))}
         if extras:
             raise MongoError(f"unsupported collMod option: {min(extras)}", 72)
         options = dict(collection.options)
         for option in (COLLECTION_VALIDATION_OPTIONS | {"viewOn", "pipeline"}) & command.keys():
             options[option] = command[option]
+        if "changeStreamPreAndPostImages" in command:
+            if images_option(command["changeStreamPreAndPostImages"]):
+                options["changeStreamPreAndPostImages"] = {"enabled": True}
+            else:
+                options.pop("changeStreamPreAndPostImages", None)
         if collection.is_view:
             self.check_view_cycle(db, collection.name, collection_name(options["viewOn"]))
             validate_pipeline(options["pipeline"], allow_write=False)
@@ -6204,6 +8250,11 @@ class MongoEngine:
 
         return writer
 
+    def note_statement(self, index, **result):
+        """Record one statement's outcome while replica set mode tracks a retryable write."""
+        if self.statements is not None:
+            self.statements[index] = result
+
     @staticmethod
     def write_errors(error, index):
         fields = error.document()
@@ -6229,6 +8280,7 @@ class MongoEngine:
             try:
                 writer(db, name, create=True).insert(document)
                 inserted += 1
+                self.note_statement(index)
             except MongoError as error:
                 errors.append(self.write_errors(error, index))
                 if ordered:
@@ -6284,7 +8336,7 @@ class MongoEngine:
             after = modified_document(
                 before, update, query=filter_, array_filters=array_filters, variables=variables
             )
-            modified += target.replace(record, after)
+            modified += target.replace(record, after, update=update)
         if upsert and not records:
             base = upsert_base(filter_)
             new = modified_document(
@@ -6331,6 +8383,9 @@ class MongoEngine:
                 modified += changed
                 if inserted is not MISSING:
                     upserts.append({"index": index, "_id": inserted})
+                    self.note_statement(index, n=1, nModified=0, upserted=inserted)
+                else:
+                    self.note_statement(index, n=count, nModified=changed)
             except MongoError as error:
                 errors.append(self.write_errors(error, index))
                 if ordered:
@@ -6353,6 +8408,7 @@ class MongoEngine:
             try:
                 count, _ = self.delete_operation(writer, db, name, operation, variables)
                 removed += count
+                self.note_statement(index, n=count)
             except MongoError as error:
                 errors.append(self.write_errors(error, index))
                 if ordered:
@@ -6465,6 +8521,8 @@ class MongoEngine:
                     n, _ = self.delete_operation(writer, target_db, target, statement, variables)
                     totals["nDeleted"] += n
                     result["n"] = n
+                outcome = {key: value for key, value in result.items() if key not in ("ok", "idx")}
+                self.note_statement(index, kind=kind, **outcome)
                 if not errors_only:
                     results.append(result)
             except MongoError as error:
@@ -6662,14 +8720,14 @@ class MongoEngine:
             old = self.collection(target_db, name, writable=True)
             if old is not None and old.capped:
                 raise MongoError("$out cannot target a capped collection")
-            if old is not None:
-                self.catalog.drop(target_db, name)
+            temporary = f"tmp.agg_out.{uuid4()}"
             target = self.catalog.create(
-                target_db, name, old.options if old else {}, old.indexes if old else None
+                target_db, temporary, old.options if old else {}, old.indexes if old else None
             )
             writer = CollectionWriter(self.catalog, target, bypass=bypass)
             for doc in documents:
                 writer.insert(doc)
+            self.catalog.rename(target_db, temporary, target_db, name)
             self.forget_cursors(target_db, name)
             return
         if isinstance(spec, str):
@@ -6733,10 +8791,13 @@ class MongoEngine:
                 raise MongoError("$merge matched an existing document", 11000)
             if when_matched == "keepExisting":
                 continue
+            update = when_matched
             if when_matched == "merge":
                 replacement = {**previous, **doc}
+                update = {"$set": doc}
             elif when_matched == "replace":
                 replacement = {"_id": previous["_id"], **doc}
+                update = None
             else:
                 scope = (
                     {"new": doc}
@@ -6748,7 +8809,7 @@ class MongoEngine:
                 not bson_equal(get_path(replacement, field), get_path(previous, field)) for field in fields
             ):
                 raise MongoError("$merge cannot change fields in the 'on' key", 66)
-            writer.replace(record, replacement)
+            writer.replace(record, replacement, update=update)
 
     def aggregation_documents(self, db, command, *, allow_write):
         query_options(command)
@@ -6757,6 +8818,8 @@ class MongoEngine:
         name = "$cmd.aggregate" if collectionless else collection_name(name)
         pipeline = require_list(command.get("pipeline"), "pipeline")
         if pipeline and isinstance(pipeline[0], dict) and "$changeStream" in pipeline[0]:
+            if self.replset is not None:
+                raise MongoError("explain is unavailable for $changeStream", 115)
             raise MongoError("The $changeStream stage is only supported on replica sets", 40573)
         validate_pipeline(pipeline, allow_write=allow_write)
         variables = command_variables(command)
@@ -6789,6 +8852,13 @@ class MongoEngine:
     def cmd_aggregate(self, db, command, _connection):
         if command.get("explain"):
             return self.cmd_explain(db, {"explain": command}, _connection)
+        pipeline = command.get("pipeline")
+        if self.replset is not None and isinstance(pipeline, list) and pipeline:
+            stages = [stage for stage in pipeline if isinstance(stage, dict) and "$changeStream" in stage]
+            if stages and stages[0] is not pipeline[0]:
+                raise MongoError("$changeStream is only valid as the first stage in a pipeline", 40602)
+            if stages:
+                return self.replset.open_stream(db, command)
         cursor = require_document(command.get("cursor", {}), "cursor")
         size = require_integer(cursor.get("batchSize", 101), "batchSize", 0)
         name, documents, _ = self.aggregation_documents(db, command, allow_write=True)
@@ -6948,12 +9018,18 @@ class MongoEngine:
                             for index in indexes
                             for key in index_values(doc, index)
                         )
-                        if expired:
-                            self.catalog.sql.execute("DELETE FROM mongo_documents WHERE record=?", (record,))
+                        if expired and not (self.replset and self.replset.locked(collection, doc)):
+                            self.catalog.delete_record(collection, record, doc)
+                if self.replset is not None:
+                    self.replset.prepare_commit({})
                 self.catalog.sql.commit()
             except BaseException:
                 self.catalog.sql.rollback()
+                if self.replset is not None:
+                    self.replset.discard()
                 raise
+            if self.replset is not None:
+                self.replset.finish_commit()
 
     def monitor_ttl(self):
         while True:
@@ -7713,6 +9789,23 @@ def ttl_seconds(value):
     return seconds
 
 
+def advertised_host(value):
+    if not value or (value.count(":") > 1 and not value.startswith("[")):
+        raise argparse.ArgumentTypeError("use HOST, HOST:PORT, or [IPv6]:PORT")
+    if value.startswith("[") and not (value.endswith("]") or re.fullmatch(r"\[[^\]]+\]:\d+", value)):
+        raise argparse.ArgumentTypeError("use HOST, HOST:PORT, or [IPv6]:PORT")
+    if ":" in value and not value.endswith("]"):
+        port_number(value.rpartition(":")[2])
+    return value
+
+
+def positive_integer(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("value must be at least 1")
+    return number
+
+
 def serve_main(argv):
     script = Path(sys.argv[0]).name
     parser = argparse.ArgumentParser(
@@ -7730,6 +9823,25 @@ def serve_main(argv):
         metavar="SECONDS",
         help="seconds between TTL checks (default: %(default)s, 0 disables)",
     )
+    parser.add_argument(
+        "--replica-set",
+        metavar="NAME",
+        help="serve as the primary of a one-member replica set "
+        "(transactions, retryable writes, change streams)",
+    )
+    parser.add_argument(
+        "--advertised-host",
+        type=advertised_host,
+        metavar="HOST[:PORT]",
+        help="member address reported to clients (default: the listen address and port)",
+    )
+    parser.add_argument(
+        "--change-log-size",
+        type=positive_integer,
+        default=10_000,
+        metavar="EVENTS",
+        help="change stream events kept for resuming (default: %(default)s)",
+    )
     add_credential_arguments(parser)
     parser.add_argument("--tls-cert", type=Path, help="PEM server certificate, optionally with private key")
     parser.add_argument("--tls-key", type=Path, help="separate PEM private key for --tls-cert")
@@ -7740,6 +9852,10 @@ def serve_main(argv):
     )
     if args.tls_key and not args.tls_cert:
         parser.error("--tls-key requires --tls-cert")
+    if args.advertised_host and not args.replica_set:
+        parser.error("--advertised-host requires --replica-set")
+    if args.replica_set is not None and (not args.replica_set or "/" in args.replica_set):
+        parser.error("--replica-set requires a name without '/'")
     try:
         account = context = None
         password = resolve_password(args, required=args.username is not None)
@@ -7750,6 +9866,12 @@ def serve_main(argv):
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(args.tls_cert, args.tls_key)
         settings = {"host": args.host, "port": args.port, "ttl_interval": args.ttl_interval}
+        if args.replica_set:
+            settings.update(
+                replica_set=args.replica_set,
+                advertised_host=args.advertised_host,
+                change_log_size=args.change_log_size,
+            )
         engine = MongoEngine(args.db_file, account=account, settings=settings)
     except (OSError, ValueError, sqlite3.Error, MongoError, EOFError) as exc:
         parser.error(str(exc) or "password input ended")
@@ -7767,7 +9889,8 @@ def serve_main(argv):
             monitor.start()
             signal.signal(signal.SIGTERM, request_shutdown)
             uri_host = f"[{host}]" if ":" in host else host
-            print(f"MongoDB test server listening on mongodb://{uri_host}:{port}", flush=True)
+            suffix = f"/?replicaSet={quote(args.replica_set, safe='')}" if args.replica_set else ""
+            print(f"MongoDB test server listening on mongodb://{uri_host}:{port}{suffix}", flush=True)
             try:
                 server.serve_forever()
             except KeyboardInterrupt:
