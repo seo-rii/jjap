@@ -3,15 +3,19 @@
 
 import argparse
 import base64
+import datetime
 import hashlib
 import hmac
 import http.client
 import json
+import math
 import os
 import re
 import secrets
 import sqlite3
 import struct
+import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -72,7 +76,7 @@ class Deployment:
     tool_arguments: dict
 
     @classmethod
-    def from_config(cls, row):
+    def from_config(cls, row, *, resolve_credentials=True):
         row = object_value(row, "model_list entry")
         params = object_value(row.get("litellm_params"), "litellm_params")
         info = object_value(row.get("model_info", {}), "model_info")
@@ -98,7 +102,7 @@ class Deployment:
             token = params.get("api_key", "")
             if not isinstance(token, str):
                 raise GatewayError("api_key must be a string or an os.environ/ reference")
-            if token.startswith("os.environ/"):
+            if token.startswith("os.environ/") and resolve_credentials:
                 variable = token.split("/", 1)[1]
                 if not os.environ.get(variable):
                     raise GatewayError(f"Missing upstream credential in {variable}")
@@ -629,14 +633,201 @@ class Server(ThreadingHTTPServer):
     daemon_threads = False
 
 
-def main():
+# LiteLLM proxy configuration and virtual key export
+
+
+MASTER_KEY_REFERENCE = "os.environ/LITELLM_MASTER_KEY"
+MOCK_TEXT = "This is a mock request"
+MOCK_DIMENSIONS = 16
+# PyYAML rejects these characters unescaped, or folds them as YAML 1.1 line breaks.
+YAML_UNPRINTABLE = re.compile("[\x7f-\x9f\u2028\u2029\ud800-\udfff\ufeff\ufffe\uffff]")
+GATEWAY_COLUMNS = {
+    "gateway_keys": {"token", "alias", "models", "expires"},
+    "gateway_usage": {"id", "model", "token", "at", "prompt_tokens", "completion_tokens"},
+    "gateway_responses": {"id", "token", "payload"},
+}
+
+
+def yaml_json(value, indent=0):
+    """Return JSON that PyYAML's YAML 1.1 loader, used by the LiteLLM proxy, reads back as the same value."""
+    pad = " " * (indent + 2)
+    if isinstance(value, dict) and value:
+        items = []
+        for key, item in value.items():
+            if len(json.dumps(key)) > 1000:
+                raise ValueError("YAML limits mapping keys to 1024 characters")
+            items.append(f"{pad}{yaml_json(key)}: {yaml_json(item, indent + 2)}")
+        return "{\n" + ",\n".join(items) + "\n" + " " * indent + "}"
+    if isinstance(value, list) and any(isinstance(item, (dict, list)) and item for item in value):
+        return "[\n" + ",\n".join(pad + yaml_json(item, indent + 2) for item in value) + "\n" + " " * indent + "]"
+    if isinstance(value, list):
+        return "[" + ", ".join(map(yaml_json, value)) + "]"
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("The configuration contains a non-finite number")
+        text = repr(value)
+        # YAML 1.1 reads a float without a fractional part, such as 1e+20, as a string.
+        return text.replace("e", ".0e", 1) if "e" in text and "." not in text else text
+    if isinstance(value, str):
+        return YAML_UNPRINTABLE.sub(lambda match: f"\\u{ord(match[0]):04x}", json.dumps(value, ensure_ascii=False))
+    return json.dumps(value)
+
+
+def litellm_deployment(row, warnings):
+    alias, deployment = Deployment.from_config(row, resolve_credentials=False)
+    entry = json.loads(json.dumps(row))
+    params = entry["litellm_params"]
+    # jjap sends every upstream request in OpenAI format with the model id after any openai/ prefix.
+    params["model"] = "openai/" + deployment.model
+    if deployment.base is not None:
+        # LiteLLM's OpenAI client requires a key; jjap sends no Authorization header without one.
+        params.setdefault("api_key", "none")
+        for field in ("mock_response", "mock_tool_arguments"):
+            if params.pop(field, None) is not None:
+                warnings.append(f"removed {field} from upstream deployment {alias!r}, which jjap ignores there")
+        return entry
+    if params.pop("mock_tool_arguments", None):
+        warnings.append(f"dropped mock_tool_arguments of {alias!r}; LiteLLM mocks cannot answer forced tool calls")
+    if deployment.endpoints == ("/embeddings",):
+        params["mock_response"] = [0.0] * MOCK_DIMENSIONS
+        warnings.append(f"mock deployment {alias!r} returns one constant {MOCK_DIMENSIONS}-dimension embedding "
+                        "in LiteLLM instead of a vector per input")
+        return entry
+    if "/embeddings" in deployment.endpoints:
+        warnings.append(f"mock deployment {alias!r} cannot serve embeddings in LiteLLM alongside text responses")
+    if deployment.response is None:
+        params["mock_response"] = MOCK_TEXT
+        warnings.append(f"mock deployment {alias!r} echoes input in jjap; LiteLLM returns {MOCK_TEXT!r}")
+    return entry
+
+
+def litellm_config(config, warnings):
+    config = object_value(config, "Settings")
+    models = config.get("model_list")
+    if not isinstance(models, list) or not models:
+        raise GatewayError("Settings require a nonempty model_list")
+    result = json.loads(json.dumps(config, allow_nan=False))
+    result["model_list"] = [litellm_deployment(row, warnings) for row in models]
+    general = result.get("general_settings", {})
+    if not isinstance(general, dict):
+        raise GatewayError("general_settings must be an object")
+    if general.get("master_key", MASTER_KEY_REFERENCE) != MASTER_KEY_REFERENCE:
+        warnings.append(f"replaced general_settings.master_key with {MASTER_KEY_REFERENCE}")
+    result["general_settings"] = {**general, "master_key": MASTER_KEY_REFERENCE}
+    return result
+
+
+def read_gateway_snapshot(filename):
+    path = Path(filename).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"LiteLLM test server database not found: {path}")
+    connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, isolation_level=None)
+    try:
+        try:
+            connection.execute("BEGIN")
+            for table, columns in GATEWAY_COLUMNS.items():
+                if not columns <= {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}:
+                    raise ValueError
+            keys = connection.execute("SELECT token, alias, models, expires FROM gateway_keys ORDER BY rowid").fetchall()
+            usage, responses = connection.execute(
+                "SELECT (SELECT count(*) FROM gateway_usage), (SELECT count(*) FROM gateway_responses)").fetchone()
+        except (ValueError, sqlite3.DatabaseError) as exc:
+            raise ValueError(f"{path} is not a LiteLLM test server SQLite persistence file") from exc
+    finally:
+        connection.close()
+    return keys, usage, responses
+
+
+def sql_text(value):
+    if "\0" in value:
+        raise ValueError("PostgreSQL text cannot contain NUL characters")
+    return "'" + value.replace("'", "''") + "'"
+
+
+def verification_token_sql(keys):
+    """Insert statements for LiteLLM_VerificationToken in the LiteLLM proxy's Prisma schema on PostgreSQL."""
+    lines = ["-- Virtual keys exported from the jjap LiteLLM test server.",
+             "-- token holds SHA-256 hex digests of the sk- keys, which is LiteLLM's hash_token, so clients keep their keys.",
+             "BEGIN;"]
+    for token, alias, models, expires in keys:
+        models = json.loads(models) if isinstance(models, str) else None
+        if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token):
+            raise ValueError("A stored key is not a SHA-256 hex digest compatible with LiteLLM's hash_token")
+        if not isinstance(models, list) or any(not isinstance(model, str) for model in models):
+            raise ValueError("A stored key has an invalid model list")
+        if alias is not None and not isinstance(alias, str) or expires is not None and type(expires) not in (int, float):
+            raise ValueError("A stored key has an invalid alias or expiry")
+        array = "ARRAY[" + ", ".join(map(sql_text, models)) + "]::TEXT[]" if models else "'{}'::TEXT[]"
+        moment = "NULL"
+        if expires is not None:
+            moment = datetime.datetime.fromtimestamp(expires, datetime.timezone.utc).replace(tzinfo=None)
+            moment = f"TIMESTAMP '{moment.isoformat(' ', 'milliseconds')}'"
+        lines.append('INSERT INTO "LiteLLM_VerificationToken" ("token", "key_alias", "models", "expires")')
+        lines.append(f"VALUES ({sql_text(token)}, {'NULL' if alias is None else sql_text(alias)}, {array}, {moment})")
+        lines.append('ON CONFLICT ("token") DO NOTHING;')
+    lines.append("COMMIT;")
+    return "\n".join(lines) + "\n"
+
+
+def export_main(argv):
+    parser = argparse.ArgumentParser(prog="litellm_server.py export",
+                                     description="Write a LiteLLM proxy config.yaml and the virtual keys as SQL.")
+    parser.add_argument("--config", type=Path, help="JSON file containing model_list (default: the mock models)")
+    parser.add_argument("--db-file", type=Path, help="existing SQLite persistence file with virtual keys")
+    parser.add_argument("--out", type=Path, required=True, help="new output directory")
+    args = parser.parse_args(argv)
+    destination = args.out.expanduser().absolute()
+    warnings, keys = [], []
+    try:
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Output directory already exists: {destination}")
+        config = json.loads(args.config.read_text(encoding="utf-8")) if args.config else DEFAULT_MODELS
+        settings = litellm_config(config, warnings)
+        if args.db_file is not None:
+            keys, usage, responses = read_gateway_snapshot(args.db_file)
+            if usage or responses:
+                warnings.append(f"skipped {usage} usage records and {responses} stored responses; LiteLLM_SpendLogs "
+                                "needs the call type and timing jjap does not record, and responses are not portable")
+        files = {"config.yaml": "# LiteLLM proxy configuration exported from the jjap LiteLLM test server.\n"
+                                + yaml_json(settings) + "\n"}
+        if keys:
+            files["keys.sql"] = verification_token_sql(keys)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".litellm-export-", dir=destination.parent) as temporary:
+            staged = Path(temporary) / "litellm"
+            staged.mkdir(mode=0o700)
+            for name, text in files.items():
+                with (staged / name).open("x", encoding="utf-8") as file:
+                    file.write(text)
+            if os.name == "nt":
+                staged.rename(destination)
+            else:
+                destination.mkdir(mode=0o700)
+                try:
+                    staged.replace(destination)
+                except BaseException:
+                    destination.rmdir()
+                    raise
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        parser.exit(1, f"LiteLLM export failed: {exc}\n")
+    for warning in warnings:
+        print(f"LiteLLM export warning: {warning}", file=sys.stderr)
+    print(f"Exported {len(settings['model_list'])} deployments to config.yaml"
+          + (f" and {len(keys)} virtual keys to keys.sql" if keys else "") + f" in {destination}")
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["export"]:
+        return export_main(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=4000)
     parser.add_argument("--db-file", type=Path, help="SQLite path for keys, response fixtures, and usage")
     parser.add_argument("--config", type=Path, help="JSON file containing model_list")
     parser.add_argument("--password-file", type=Path, help="File containing the optional master API key")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
     gateway = None
@@ -662,4 +853,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -566,7 +567,286 @@ class SparkHandler(BaseHTTPRequestHandler):
     do_GET = do_POST = _dispatch
 
 
+# PySpark script export
+
+
+ICEBERG_PACKAGE = "org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.11.0"
+ICEBERG_CATALOG = "iceberg"
+
+# Fixed body of every exported script; JOB_NAME, JOB, and SPARK_CONFIG are defined above it as literals.
+PYSPARK_JOB = r'''
+
+INTEGER_BOUNDS = {"int": (-2**31, 2**31 - 1), "long": (-2**63, 2**63 - 1)}
+SPARK_TYPES = {"string": "string", "int": "int", "long": "bigint", "double": "double", "boolean": "boolean"}
+HADOOP_GLOB = re.compile(r"([\\*?\[\]{}])")
+
+
+def input_uri(path):
+    if not Path(path).is_file():
+        raise ValueError(f"Input relation is not a regular file: {path}")
+    # Hadoop expands glob characters in input paths.
+    return "file://" + HADOOP_GLOB.sub(r"\\\1", path)
+
+
+def checked(name, kind, valid, value):
+    column = F.col(name)
+    error = F.raise_error(F.lit(f"Invalid {kind} value in column {name}"))
+    return F.when(column.isNull(), F.lit(None).cast(SPARK_TYPES[kind])).when(valid, value).otherwise(error)
+
+
+def csv_value(name, kind):
+    # The rules of jjap's CSV conversion: empty means NULL, integers are plain decimal digits.
+    text = F.col(name)
+    if kind == "string":
+        return F.when(text != "", text)
+    if kind in INTEGER_BOUNDS:
+        number = text.try_cast("bigint")
+        valid = text.rlike(r"^[+-]?[0-9]+\z") & number.between(*INTEGER_BOUNDS[kind])
+        value = number.cast(SPARK_TYPES[kind])
+    elif kind == "double":
+        value = text.try_cast("double")
+        valid = value.isNotNull() & ~F.isnan(value) & (F.abs(value) != float("inf"))
+    else:
+        word = F.lower(F.regexp_replace(text, r"^\s+|\s+\z", ""))
+        valid, value = word.isin("0", "1", "false", "true"), word.isin("1", "true")
+    return F.when(text == "", F.lit(None).cast(SPARK_TYPES[kind])).otherwise(checked(name, kind, valid, value))
+
+
+def conform(frame, schema, exact):
+    """Project the schema columns and convert values the way jjap accepts SQLite results."""
+    names = [name for name, _ in schema]
+    if exact and (len(frame.columns) != len(names) or set(frame.columns) != set(names)):
+        raise ValueError("SQL projection must match the registered output schema")
+    columns = []
+    for name, kind in schema:
+        if name not in frame.columns:
+            raise ValueError(f"Column {name} was not found")
+        actual = frame.schema[name].dataType
+        column = F.col(name)
+        integral = isinstance(actual, T.IntegralType) or (isinstance(actual, T.DecimalType) and actual.scale == 0)
+        if isinstance(actual, T.NullType):
+            value = F.lit(None).cast(SPARK_TYPES[kind])
+        elif kind == "string" and isinstance(actual, T.StringType):
+            value = column
+        elif kind in INTEGER_BOUNDS and integral:
+            value = checked(name, kind, column.between(*INTEGER_BOUNDS[kind]), column.cast(SPARK_TYPES[kind]))
+        elif kind == "double" and isinstance(actual, T.NumericType):
+            number = column.cast("double")
+            value = checked(name, kind, ~F.isnan(number) & (F.abs(number) != float("inf")), number)
+        elif kind == "boolean" and isinstance(actual, T.BooleanType):
+            value = column
+        elif kind == "boolean" and integral:
+            value = checked(name, kind, column.isin(0, 1), column == 1)
+        else:
+            raise ValueError(f"Column {name} has Spark type {actual.simpleString()}, not a {kind} value")
+        columns.append(value.alias(name))
+    return frame.select(columns)
+
+
+def iceberg_table(identifier):
+    return ".".join(f"`{part}`" for part in [ICEBERG_CATALOG, *identifier.split(".")])
+
+
+def read_relation(spark, relation):
+    schema = relation["schema"]
+    if relation["format"] == "iceberg":
+        reader = spark.read
+        if "snapshot_id" in relation:
+            reader = reader.option("snapshot-id", str(relation["snapshot_id"]))
+        return conform(reader.table(iceberg_table(relation["table"])), schema, exact=False)
+    if relation["format"] == "jsonl":
+        types = ", ".join(f"`{name}` {SPARK_TYPES[kind]}" for name, kind in schema)
+        return (spark.read.schema(types).options(mode="FAILFAST", allowSingleQuotes=False, allowNonNumericNumbers=False)
+                .json(input_uri(relation["path"])))
+    names = [name for name, _ in schema]
+    reader = spark.read.options(sep=relation["delimiter"], quote='"', escape='"', multiLine=True, mode="FAILFAST",
+                                encoding="UTF-8", ignoreLeadingWhiteSpace=False, ignoreTrailingWhiteSpace=False)
+    if relation["header"]:
+        frame = reader.option("header", True).csv(input_uri(relation["path"]))
+        if len(frame.columns) != len(names) or set(frame.columns) != set(names):
+            raise ValueError("CSV header does not match schema")
+    else:
+        frame = reader.schema(", ".join(f"`{name}` string" for name in names)).csv(input_uri(relation["path"]))
+    return frame.select([csv_value(name, kind).alias(name) for name, kind in schema])
+
+
+def write_file(frame, relation, timer):
+    target = Path(relation["path"])
+    staging = Path(tempfile.mkdtemp(prefix=".jjap-spark-", dir=target.parent))
+    try:
+        writer = frame.coalesce(1).write.mode("errorifexists")
+        location = "file://" + str(staging / "output")
+        if relation["format"] == "csv":
+            writer.options(sep=relation["delimiter"], quote='"', escape='"', header=relation["header"], nullValue="",
+                           emptyValue="", ignoreLeadingWhiteSpace=False, ignoreTrailingWhiteSpace=False).csv(location)
+        else:
+            writer.option("ignoreNullFields", False).json(location)
+        parts = [path for path in (staging / "output").iterdir() if path.name.startswith("part-")]
+        if len(parts) != 1:
+            raise ValueError(f"Spark wrote {len(parts)} output files where one was expected")
+        publish(timer)
+        if relation["overwrite"]:
+            os.replace(parts[0], target)
+        elif os.path.lexists(target):
+            raise ValueError(f"Output file already exists: {target}")
+        else:
+            os.link(parts[0], target)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def publish(timer):
+    timer.cancel()
+    if timer.expired.is_set():
+        raise ValueError("SQL job timed out")
+
+
+def run(spark, timer):
+    for name, relation in JOB["inputs"].items():
+        frame = read_relation(spark, relation).persist()
+        # jjap loads every input value before the query; check columns the query would prune as well.
+        frame.write.format("noop").mode("overwrite").save()
+        frame.createOrReplaceTempView(name)
+    output = JOB["output"]
+    result = conform(spark.sql(JOB["sql"]), output["schema"], exact=True).persist()
+    count = result.count()
+    if output["format"] != "iceberg":
+        write_file(result, output, timer)
+    else:
+        publish(timer)
+        if count:
+            result.writeTo(iceberg_table(output["table"])).append()
+    return count
+
+
+def main():
+    builder = SparkSession.builder.appName(JOB_NAME)
+    for key, value in SPARK_CONFIG.items():
+        builder = builder.config(key, value)
+    spark = builder.getOrCreate()
+    timer = threading.Timer(JOB["timeout_seconds"], lambda: (timer.expired.set(), spark.sparkContext.cancelAllJobs()))
+    timer.expired = threading.Event()
+    timer.daemon = True
+    timer.start()
+    try:
+        count = run(spark, timer)
+    except Exception as exc:
+        message = "SQL job timed out" if timer.expired.is_set() else (str(exc).strip().splitlines() or [repr(exc)])[0]
+        print(f"{JOB_NAME}: {message}", file=sys.stderr)
+        return 1
+    finally:
+        timer.cancel()
+        spark.stop()
+    print(f"{JOB_NAME}: Local SQL job finished with {count} output rows.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+def uses_iceberg(job):
+    return any(relation["format"] == "iceberg" for relation in (*job["inputs"].values(), job["output"]))
+
+
+def iceberg_catalogs(jobs):
+    catalogs = {}
+    for name, job in jobs.items():
+        for relation in (*job["inputs"].values(), job["output"]):
+            if relation["format"] == "iceberg":
+                warehouse = relation["warehouse"]
+                db_file = relation.get("db_file", str(Path(warehouse) / ".iceberg-catalog.sqlite3"))
+                catalogs.setdefault((warehouse, db_file), []).append(name)
+    return catalogs
+
+
+def python_literal(value, indent=0):
+    if isinstance(value, dict) and value:
+        items = [f"{' ' * (indent + 4)}{key!r}: {python_literal(item, indent + 4)}," for key, item in value.items()]
+        return "{\n" + "\n".join(items) + "\n" + " " * indent + "}"
+    return repr(value)
+
+
+def pyspark_script(name, job, iceberg_uri):
+    config = {}
+    if uses_iceberg(job):
+        prefix = f"spark.sql.catalog.{ICEBERG_CATALOG}"
+        config = {prefix: "org.apache.iceberg.spark.SparkCatalog", f"{prefix}.type": "rest", f"{prefix}.uri": iceberg_uri}
+    lines = [
+        '"""PySpark job exported from the jjap Spark test server."""', "",
+        "import os", "from pathlib import Path", "import re", "import shutil", "import sys", "import tempfile",
+        "import threading", "", "from pyspark.sql import SparkSession, functions as F, types as T", "", "",
+        f"JOB_NAME = {name!r}",
+        f"JOB = {python_literal(job)}",
+    ]
+    if config:
+        lines.append("# The REST catalog must serve the local Iceberg tables, e.g. iceberg_server.py --warehouse W serve")
+    lines += [f"SPARK_CONFIG = {python_literal(config)}", f"ICEBERG_CATALOG = {ICEBERG_CATALOG!r}"]
+    return "\n".join(lines) + PYSPARK_JOB
+
+
+def submit_script(jobs):
+    lines = ["#!/bin/sh", "# spark-submit commands for the jobs exported from the jjap Spark test server.",
+             "# Arguments are passed to every spark-submit, for example: ./submit.sh --master 'local[2]'",
+             "set -eu", 'cd "$(dirname "$0")"']
+    for name, job in jobs.items():
+        options = ["--name", shlex.quote(name)]
+        if uses_iceberg(job):
+            options += ["--packages", ICEBERG_PACKAGE]
+        lines.append(f'"${{SPARK_SUBMIT:-spark-submit}}" {" ".join(options)} "$@" {shlex.quote(name + ".py")}')
+    return "\n".join(lines) + "\n"
+
+
+def export_main(argv):
+    parser = argparse.ArgumentParser(prog="spark_server.py export",
+                                     description="Write registered SQL jobs as PySpark scripts and a submit.sh.")
+    parser.add_argument("--config", required=True, type=Path, help="JSON file containing locally registered SQL jobs")
+    parser.add_argument("--out", required=True, type=Path, help="new output directory")
+    parser.add_argument("--iceberg-uri", default="http://127.0.0.1:8181",
+                        help="Iceberg REST catalog serving the jobs' local Iceberg tables (default: %(default)s)")
+    args = parser.parse_args(argv)
+    destination = args.out.expanduser().absolute()
+    try:
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Output directory already exists: {destination}")
+        location = urlsplit(args.iceberg_uri)
+        if location.scheme not in ("http", "https") or not location.hostname or location.username is not None:
+            raise ValueError("--iceberg-uri must be an HTTP(S) URL without user information")
+        jobs = load_jobs(args.config.expanduser())
+        catalogs = iceberg_catalogs(jobs)
+        if len(catalogs) > 1:
+            names = sorted({name for users in catalogs.values() for name in users})
+            raise ValueError(f"Jobs {', '.join(names)} use {len(catalogs)} local Iceberg catalogs; "
+                             "one --iceberg-uri can serve only one of them")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".spark-export-", dir=destination.parent) as temporary:
+            staged = Path(temporary) / "jobs"
+            staged.mkdir(mode=0o700)
+            for name, job in jobs.items():
+                (staged / f"{name}.py").write_text(pyspark_script(name, job, args.iceberg_uri), encoding="utf-8")
+            submit = staged / "submit.sh"
+            submit.write_text(submit_script(jobs), encoding="utf-8")
+            submit.chmod(0o755)
+            if os.name == "nt":
+                staged.rename(destination)
+            else:
+                destination.mkdir(mode=0o700)
+                try:
+                    staged.replace(destination)
+                except BaseException:
+                    destination.rmdir()
+                    raise
+    except (OSError, ValueError) as exc:
+        parser.exit(1, f"Spark export failed: {exc}\n")
+    print(f"Exported {len(jobs)} PySpark jobs and submit.sh to {destination}")
+    return 0
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["export"]:
+        return export_main(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path, help="JSON file containing locally registered SQL jobs")
     parser.add_argument("--host", default="127.0.0.1")

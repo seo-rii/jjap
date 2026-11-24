@@ -10,10 +10,12 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -750,7 +752,209 @@ def read_token(filename):
     return token
 
 
+# Airflow 3 DAG file export
+
+
+EXPORT_TABLES = {
+    "dags": {"dag_id", "spec", "paused", "active", "next_run"},
+    "runs": {"dag_id", "run_id", "state"},
+    "tasks": {"dag_id", "run_id", "task_id", "attempt"},
+    "attempts": {"dag_id", "run_id", "task_id", "attempt", "log"},
+}
+TAG_MAX_LENGTH = 100
+# Templates rather than literal ids, which would load as template files when they end in .sh or .bash.
+TASK_ENVIRONMENT = {"JJAP_AIRFLOW_DAG_ID": "{{ ti.dag_id }}", "JJAP_AIRFLOW_RUN_ID": "{{ run_id }}",
+                    "JJAP_AIRFLOW_TASK_ID": "{{ ti.task_id }}", "JJAP_AIRFLOW_TRY_NUMBER": "{{ ti.try_number }}"}
+BASH_ARGUMENT_LIMIT = 128 * 1024
+
+
+def jinja_literal(text, suffix):
+    # BashOperator renders its fields with Jinja and loads a value ending in .sh or .bash as a template file.
+    if text.endswith((".sh", ".bash")):
+        text += suffix
+    return text.replace("{", "{{ '{' }}")
+
+
+def export_bash_command(command):
+    # exec looks argv[0] up on PATH like subprocess does, never as a keyword, builtin, function, or NAME=value word.
+    script = "exec -- " + shlex.join(command)
+    # Linux caps the one bash -c argument, with a possible trailing space and its NUL, at 128 KiB.
+    if len(script.encode("utf-8", "surrogatepass")) + 2 > BASH_ARGUMENT_LIMIT:
+        raise ValueError("its command exceeds the 128 KiB limit of the bash -c argument BashOperator passes")
+    return jinja_literal(script, " ")
+
+
+def python_timedelta(seconds):
+    return f"datetime.timedelta(seconds={seconds!r})"
+
+
+def python_datetime(value):
+    moment = dt.datetime.fromtimestamp(value, dt.timezone.utc)
+    fields = ", ".join(str(getattr(moment, name)) for name in
+                       ("year", "month", "day", "hour", "minute", "second", "microsecond"))
+    return f"datetime.datetime({fields}, tzinfo=datetime.timezone.utc)"
+
+
+def airflow_dag_source(dag, start, paused, cwd=None):
+    """Return an Airflow 3 DAG file; every value is written as a Python literal."""
+    dag_id, tasks = dag["dag_id"], dag["tasks"]
+    lines = ['"""Airflow 3 DAG exported from the jjap Airflow test server. Run history is not included."""', "",
+             "import datetime", "", "from airflow.providers.standard.operators.bash import BashOperator",
+             "from airflow.sdk import DAG"]
+    schedule = "None"
+    if dag["schedule_seconds"] is not None:
+        # DeltaDataIntervalTimetable keeps jjap's data intervals whatever [scheduler] create_delta_data_intervals says.
+        lines += ["", "try:", "    from airflow.sdk import DeltaDataIntervalTimetable",
+                  "except ImportError:  # Airflow 3.0 and 3.1",
+                  "    from airflow.timetables.interval import DeltaDataIntervalTimetable"]
+        schedule = f"DeltaDataIntervalTimetable({python_timedelta(dag['schedule_seconds'])})"
+    if any(task["inputs"] or task["outputs"] for task in tasks.values()):
+        lines += ["", "try:", "    from openlineage.client.event_v2 import Dataset",
+                  "except ImportError:  # Lineage requires apache-airflow-providers-openlineage",
+                  "    Dataset = None", "", "",
+                  "def datasets(*names):",
+                  "    return [Dataset(namespace, name) for namespace, name in names] if Dataset else []"]
+    settings = {"dag_id": repr(dag_id)}
+    if dag["description"] is not None:
+        settings["description"] = repr(dag["description"])
+    settings["schedule"] = schedule
+    if start is not None:
+        settings["start_date"] = python_datetime(start)
+    settings.update(catchup="False", is_paused_upon_creation=repr(paused), max_active_runs="1",
+                    max_active_tasks="1", tags=repr(dag["tags"]))
+    lines += ["", "", "with DAG("]
+    lines += [f"    {name}={value}," for name, value in settings.items()]
+    lines += [") as dag:", "    tasks = {}"]
+    for ordinal, (task_id, task) in enumerate(tasks.items()):
+        try:
+            command = export_bash_command(task["command"])
+        except ValueError as exc:
+            raise ValueError(f"Task {dag_id}.{task_id} cannot be exported: {exc}") from None
+        options = {
+            "task_id": repr(task_id), "bash_command": repr(command), "env": repr(TASK_ENVIRONMENT), "append_env": "True",
+            "skip_on_exit_code": "None", "retries": repr(task["retries"]),
+            "retry_delay": python_timedelta(task["retry_delay_seconds"]),
+            "execution_timeout": python_timedelta(task["timeout_seconds"]),
+            # The single jjap worker starts ready tasks in file order.
+            "priority_weight": repr(len(tasks) - ordinal), "weight_rule": repr("absolute"),
+        }
+        if cwd is not None:
+            options["cwd"] = repr(jinja_literal(cwd, "/"))
+        for field, name in (("inputs", "inlets"), ("outputs", "outlets")):
+            if task[field]:
+                pairs = ", ".join(repr((item["namespace"], item["name"])) for item in task[field])
+                options[name] = f"datasets({pairs})"
+        lines.append(f"    tasks[{task_id!r}] = BashOperator(")
+        lines += [f"        {name}={value}," for name, value in options.items()]
+        lines.append("    )")
+    for task_id, task in tasks.items():
+        if task["upstream"]:
+            parents = ", ".join(f"tasks[{parent!r}]" for parent in dict.fromkeys(task["upstream"]))
+            lines.append(f"    tasks[{task_id!r}].set_upstream([{parents}])")
+    return "\n".join(lines) + "\n"
+
+
+def read_airflow_snapshot(filename):
+    """Return (dag, start, paused) triples, stale DAG ids, and history counts from one read transaction."""
+    path = Path(filename).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"Airflow test server database not found: {path}")
+    connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, isolation_level=None)
+    try:
+        try:
+            connection.execute("BEGIN")
+            for table, columns in EXPORT_TABLES.items():
+                if not columns <= {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}:
+                    raise ValueError
+            rows = connection.execute("SELECT dag_id, spec, paused, active, next_run FROM dags ORDER BY dag_id").fetchall()
+            history = connection.execute("SELECT (SELECT count(*) FROM runs), (SELECT count(*) FROM attempts)").fetchone()
+        except (ValueError, sqlite3.DatabaseError) as exc:
+            raise ValueError(f"{path} is not an Airflow test server SQLite persistence file") from exc
+    finally:
+        connection.close()
+    exported, stale = [], []
+    for dag_id, spec, paused, active, next_run in rows:
+        if not active:
+            stale.append(dag_id)
+            continue
+        try:
+            spec = json.loads(spec)
+            entry = {key: spec[key] for key in ("dag_id", "description", "schedule_seconds", "tags")}
+            entry["tasks"] = [{"task_id": task_id, **task} for task_id, task in spec["tasks"].items()]
+            dag = normalize_dag(entry, spec["fileloc"])
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise ValueError(f"DAG {dag_id} has an invalid stored definition: {exc}") from None
+        schedule = dag["schedule_seconds"]
+        start = None if schedule is None else (time.time() if next_run is None else next_run - schedule)
+        exported.append((dag, start, bool(paused)))
+    return exported, stale, history
+
+
+def _publish_export(staged, destination):
+    if os.name == "nt":
+        staged.rename(destination)
+        return
+    destination.mkdir(mode=0o700)
+    try:
+        staged.replace(destination)
+    except BaseException:
+        destination.rmdir()
+        raise
+
+
+def export_main(argv):
+    parser = argparse.ArgumentParser(prog="airflow_server.py export",
+                                     description="Write registered DAGs as Airflow 3 DAG files.")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--dag-file", action="append", help="JSON DAG or DAG array, repeatable")
+    source.add_argument("--db-file", type=Path, help="existing SQLite persistence file")
+    parser.add_argument("--out", type=Path, required=True, help="new DAG folder")
+    parser.add_argument("--cwd", help="working directory for exported tasks (default: a new temporary directory)")
+    args = parser.parse_args(argv)
+    destination = args.out.expanduser().absolute()
+    warnings = []
+    try:
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Output directory already exists: {destination}")
+        cwd = None if args.cwd is None else os.path.abspath(os.path.expanduser(args.cwd))
+        if args.db_file is not None:
+            dags, stale, (runs, attempts) = read_airflow_snapshot(args.db_file)
+            if stale:
+                warnings.append(f"skipped DAGs that are no longer registered: {', '.join(stale)}")
+            if runs:
+                warnings.append(f"run history is not portable to Airflow; {runs} DAG runs with {attempts} "
+                                "task attempts and their logs were not exported")
+        else:
+            now = float(int(time.time()))
+            dags = [(dag, None if dag["schedule_seconds"] is None else now, dag["is_paused"])
+                    for dag in read_dags(args.dag_file).values()]
+        if not dags:
+            raise ValueError("No registered DAGs to export")
+        for dag, _, _ in dags:
+            if oversized := [tag for tag in dag["tags"] if len(tag) > TAG_MAX_LENGTH]:
+                raise ValueError(f"DAG {dag['dag_id']} has a tag longer than Airflow's {TAG_MAX_LENGTH} characters: "
+                                 f"{oversized[0][:40]!r}...")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".airflow-export-", dir=destination.parent) as temporary:
+            staged = Path(temporary) / "dags"
+            staged.mkdir(mode=0o700)
+            for dag, start, paused in dags:
+                with (staged / f"{dag['dag_id']}.py").open("x", encoding="utf-8") as file:
+                    file.write(airflow_dag_source(dag, start, paused, cwd))
+            _publish_export(staged, destination)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        parser.exit(1, f"Airflow export failed: {exc}\n")
+    for warning in warnings:
+        print(f"Airflow export warning: {warning}", file=sys.stderr)
+    tasks = sum(len(dag["tasks"]) for dag, _, _ in dags)
+    print(f"Exported {len(dags)} DAGs with {tasks} tasks to {destination}")
+    return 0
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["export"]:
+        return export_main(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
