@@ -21,6 +21,7 @@ import itertools
 import math
 import os
 import re
+import shlex
 import signal
 import socket
 import socketserver
@@ -565,7 +566,9 @@ class Parser:
                 left = ("literal", decode_string(value))
             else:
                 name = self.identifier()
-                if self.accept("("):
+                if kind == "name" and name.upper() in {"NAN", "INF", "INFINITY"} and self.ahead() != "(":
+                    left = ("literal", math.nan if name.upper() == "NAN" else math.inf)
+                elif self.accept("("):
                     if name.lower() in {"all", "any", "none", "single"} and self.peek_name() and self.ahead(1) == "IN":
                         variable = self.identifier()
                         self.require("IN")
@@ -1077,9 +1080,50 @@ def compare(op, left, right):
     return left / right if op == "/" else math.fmod(left, right)
 
 
+DURATION_UNITS = {"hours": 3600 * 10**9, "minutes": 60 * 10**9, "seconds": 10**9, "milliseconds": 10**6,
+                  "microseconds": 10**3, "nanoseconds": 1}
+
+
+def duration_from_map(value):
+    unknown = set(value) - {"years", "quarters", "months", "weeks", "days", *DURATION_UNITS}
+    if unknown:
+        raise CypherError(f"Unsupported duration component(s): {', '.join(sorted(unknown))}", TYPE_ERROR)
+    calendar = [value.get(key, 0) for key in ("years", "quarters", "months", "weeks", "days")]
+    if not all(isinstance(item, int) and not isinstance(item, bool) for item in calendar):
+        raise CypherError("Duration years, quarters, months, weeks, and days must be integers", TYPE_ERROR)
+    years, quarters, months, weeks, days = calendar
+    total = 0
+    for key, scale in DURATION_UNITS.items():
+        item = value.get(key, 0)
+        if not is_number(item):
+            raise CypherError(f"Duration {key} must be a number", TYPE_ERROR)
+        total += item * scale if isinstance(item, int) else round(item * scale)
+    seconds, nanos = divmod(total, 1_000_000_000)
+    return Structure(0x45, (years * 12 + quarters * 3 + months, weeks * 7 + days, seconds, nanos))
+
+
 def temporal_function(name, args):
-    if name in {"date", "datetime", "localdatetime"} and len(args) > 1:
+    if name in {"date", "datetime", "localdatetime", "time", "localtime", "duration"} and len(args) > 1:
         raise CypherError(f"{name}() takes at most one argument")
+    if name == "duration":
+        if not args:
+            raise CypherError("duration() requires a string or a map")
+        if isinstance(args[0], dict):
+            return duration_from_map(args[0])
+        if not isinstance(args[0], str):
+            raise CypherError("duration() requires a string or a map", TYPE_ERROR)
+    if args and isinstance(args[0], str) and name != "point":
+        try:
+            return admin_scalar(name, args[0])
+        except (ValueError, KeyError) as exc:
+            if name in {"time", "localtime", "duration"}:
+                raise CypherError(f"Cannot parse {name}({args[0]!r}): {exc}", TYPE_ERROR) from None
+    if name in {"time", "localtime"}:
+        if args:
+            raise CypherError(f"{name}() takes an ISO string", TYPE_ERROR)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        nanos = ((now.hour * 60 + now.minute) * 60 + now.second) * 1_000_000_000 + now.microsecond * 1000
+        return Structure(0x54, (nanos, 0)) if name == "time" else Structure(0x74, (nanos,))
     if name == "date":
         value = datetime.date.today() if not args else datetime.date.fromisoformat(args[0])
         return Structure(0x44, ((value - datetime.date(1970, 1, 1)).days,))
@@ -1109,7 +1153,7 @@ def temporal_function(name, args):
 
 
 def scalar_function(name, args):
-    if name in {"date", "datetime", "localdatetime", "point"}:
+    if name in {"date", "datetime", "localdatetime", "time", "localtime", "duration", "point"}:
         return None if None in args else temporal_function(name, args)
     if name == "timestamp":
         if args:
@@ -1709,10 +1753,28 @@ class Query:
             del self.graph.schema[name]
             self.record("constraints-removed" if object_kind == "constraint" else "indexes-removed")
 
+    def reset(self):
+        """Test control: return the graph to the empty state of a fresh server, including id counters."""
+        graph = self.graph
+        self.write_query = True
+        self.record("relationships-deleted", len(graph.edges))
+        self.record("nodes-deleted", len(graph.nodes))
+        self.record("constraints-removed", sum(item["kind"] == "constraint" for item in graph.schema.values()))
+        self.record("indexes-removed", sum(item["kind"] == "index" for item in graph.schema.values()))
+        if not self.stats and (graph.next_node or graph.next_edge):
+            self.record("system-updates")
+        graph.nodes.clear()
+        graph.edges.clear()
+        graph.schema.clear()
+        graph.next_node = graph.next_edge = 0
+
     def metadata(self, name, args, default_database):
         graph = self.graph
         if args:
             raise CypherError(f"{name} does not take arguments")
+        if name == "jjap.reset":
+            self.reset()
+            return [], []
         if name == "db.labels":
             return ["label"], [{"label": label} for label in sorted(set().union(
                 *(node.labels for node in graph.nodes.values())
@@ -1764,13 +1826,13 @@ class Query:
             return ["name"], [
                 {"name": item} for item in (
                     "db.labels", "db.relationshipTypes", "db.propertyKeys", "dbms.components",
-                    "db.indexes", "db.constraints"
+                    "db.indexes", "db.constraints", "jjap.reset"
                 )
             ]
         if name == "FUNCTIONS":
             return ["name"], [{"name": item} for item in sorted(AGGREGATES | {
                 "id", "elementId", "labels", "type", "properties", "keys", "size", "length",
-                "range", "coalesce", "date", "datetime", "point",
+                "range", "coalesce", "date", "datetime", "localdatetime", "time", "localtime", "duration", "point",
             })]
         raise CypherError(f"Unknown procedure {name!r}", "Neo.ClientError.Procedure.ProcedureNotFound")
 
@@ -2621,18 +2683,17 @@ def csv_header(name):
 
 
 def write_csv_files(prefix, entities, fixed, directory, delimiter, warnings):
-    """Group entities whose property types agree, since one header types a whole file.
+    """Split entities into files where property types change, since one header types a whole file.
 
+    Only the latest file grows, so neo4j-admin, which reads files in order, keeps the creation order.
     Returns the file names and whether any field spans lines."""
     groups = []
     for entity in entities:
         values = {key: csv_property(key, item, warnings) for key, item in entity.props.items()}
         signature = {key: kind for key, (kind, _) in values.items()}
-        for columns, members in groups:
-            if all(columns.get(key, kind) == kind for key, kind in signature.items()):
-                columns.update(signature)
-                members.append((entity, values))
-                break
+        if groups and all(groups[-1][0].get(key, kind) == kind for key, kind in signature.items()):
+            groups[-1][0].update(signature)
+            groups[-1][1].append((entity, values))
         else:
             groups.append((dict(signature), [(entity, values)]))
     if not groups:
@@ -2741,10 +2802,545 @@ def export_main(argv):
     return 0
 
 
+# Import from neo4j-admin database import CSV files and cypher-shell scripts
+
+ADMIN_TYPES = {"int", "long", "short", "byte", "float", "double", "boolean", "char", "string", "point", "date",
+               "localtime", "time", "localdatetime", "datetime", "duration"}
+ADMIN_SPECIAL = {"ID", "START_ID", "END_ID", "TYPE", "LABEL", "IGNORE"}
+ADMIN_IGNORED_OPTIONS = {"bad-tolerance", "report-file", "high-parallel-io", "max-off-heap-memory", "threads",
+                         "read-buffer-size", "normalize-types", "strict", "format", "verbose", "expand-commands",
+                         "overwrite-destination", "skip-bad-entries-logging", "additional-config", "input-type",
+                         "multiline-fields-format", "auto-skip-subsequent-headers"}
+ISO_DATE = re.compile(r"([+-]?\d{4,9})-(\d{2})-(\d{2})")
+ISO_TIME = re.compile(r"(\d{2}):(\d{2})(?::(\d{2})(?:[.,](\d{1,9}))?)?")
+ISO_OFFSET = re.compile(r"(Z|[+-]\d{2}(?::?\d{2}(?::?\d{2})?)?)?(?:\[([^\]]+)\])?")
+ISO_DURATION = re.compile(r"P(?:([+-]?\d+)Y)?(?:([+-]?\d+)M)?(?:([+-]?\d+)W)?(?:([+-]?\d+)D)?"
+                          r"(?:T(?:([+-]?\d+)H)?(?:([+-]?\d+)M)?(?:([+-]?\d+)(?:[.,](\d{1,9}))?S)?)?", re.IGNORECASE)
+CRS_SRIDS = {name: srid for srid, name in CRS_NAMES.items()}
+
+
+def admin_char(value, option):
+    if value.upper() == "TAB" or value == "\\t":
+        return "\t"
+    if re.fullmatch(r"[Uu]\+[0-9A-Fa-f]{4,6}", value):
+        return chr(int(value[2:], 16))
+    if len(value) != 1:
+        raise ValueError(f"{option} must be one character, TAB, or U+XXXX")
+    return value
+
+
+def admin_flag(value):
+    if value.lower() not in {"true", "false"}:
+        raise ValueError(f"Expected true or false, not {value!r}")
+    return value.lower() == "true"
+
+
+def parse_admin_options(arguments, base):
+    """Read neo4j-admin database import options; relative file names resolve against base."""
+    settings = {"delimiter": ",", "array-delimiter": ";", "quote": '"', "multiline-fields": False,
+                "ignore-empty-strings": False, "trim-strings": False, "id-type": "string",
+                "skip-bad-relationships": False, "skip-duplicate-nodes": False, "ignore-extra-columns": False,
+                "legacy-style-quoting": False, "input-encoding": "utf-8", "nodes": [], "relationships": []}
+    items = iter(arguments)
+    for item in items:
+        if not item.startswith("--"):
+            continue  # The database name.
+        name, has_value, value = item[2:].partition("=")
+        flags = {"multiline-fields", "ignore-empty-strings", "trim-strings", "skip-bad-relationships",
+                 "skip-duplicate-nodes", "ignore-extra-columns", "legacy-style-quoting"}
+        if not has_value and name not in flags | {"verbose", "expand-commands", "overwrite-destination", "strict",
+                                                  "normalize-types", "skip-bad-entries-logging",
+                                                  "auto-skip-subsequent-headers"}:
+            value = next(items, None)
+            if value is None:
+                raise ValueError(f"--{name} needs a value")
+        if name in ("nodes", "relationships"):
+            label, separator, files = value.rpartition("=") if "=" in value else ("", "", value)
+            paths = [base / part for part in files.split(",") if part]
+            settings[name].append((label if separator else "", paths))
+        elif name in ("delimiter", "array-delimiter", "quote"):
+            settings[name] = admin_char(value, f"--{name}")
+        elif name in flags:
+            settings[name] = admin_flag(value) if has_value else True
+        elif name == "id-type":
+            if value.lower() not in {"string", "integer"}:
+                raise ValueError("--id-type must be string or integer (actual node ids are not supported)")
+            settings[name] = value.lower()
+        elif name == "input-encoding":
+            settings[name] = value
+        elif name not in ADMIN_IGNORED_OPTIONS:
+            raise ValueError(f"Unsupported neo4j-admin import option --{name}")
+    if settings["legacy-style-quoting"]:
+        raise ValueError("--legacy-style-quoting is not supported")
+    if not settings["nodes"]:
+        raise ValueError("neo4j-admin import needs at least one --nodes source")
+    return settings
+
+
+def admin_files(paths):
+    """Expand neo4j-admin file names, which may be regular expressions on the file name."""
+    result = []
+    for path in paths:
+        if path.is_file():
+            result.append(path)
+            continue
+        pattern = re.compile(path.name)
+        matches = sorted(item for item in path.parent.iterdir() if item.is_file() and pattern.fullmatch(item.name)) \
+            if path.parent.is_dir() else []
+        if not matches:
+            raise ValueError(f"Import file not found: {path}")
+        result.extend(matches)
+    return result
+
+
+def csv_records(text, delimiter, quote, multiline, source):
+    """Yield (line number, [(value, quoted), ...]); a bare empty field is missing, a quoted one is a value."""
+    position, line, size = 0, 1, len(text)
+    if text.startswith("﻿"):
+        position = 1
+    while position < size:
+        start_line, fields = line, []
+        while True:
+            if position < size and text[position] == quote:
+                position += 1
+                parts = []
+                while True:
+                    end = text.find(quote, position)
+                    if end < 0:
+                        raise ValueError(f"{source}:{start_line}: unterminated quoted field")
+                    chunk = text[position:end]
+                    if not multiline and ("\n" in chunk or "\r" in chunk):
+                        raise ValueError(f"{source}:{start_line}: a field spans lines; pass --multiline-fields=true")
+                    line += chunk.count("\n")
+                    parts.append(chunk)
+                    position = end + 1
+                    if position < size and text[position] == quote:
+                        parts.append(quote)
+                        position += 1
+                        continue
+                    break
+                value, quoted = "".join(parts), True
+                stop = position
+                while stop < size and text[stop] not in (delimiter, "\n", "\r"):
+                    stop += 1
+                value += text[position:stop]
+                position = stop
+            else:
+                stop = position
+                while stop < size and text[stop] not in (delimiter, "\n", "\r"):
+                    stop += 1
+                value, quoted = text[position:stop], False
+                position = stop
+            fields.append((value, quoted))
+            if position < size and text[position] == delimiter:
+                position += 1
+                continue
+            if position < size and text[position] == "\r":
+                position += 1
+            if position < size and text[position] == "\n":
+                position += 1
+            line += 1
+            break
+        if fields != [("", False)]:
+            yield start_line, fields
+
+
+def parse_header_entry(entry, source):
+    options = None
+    if entry.endswith("}") and "{" in entry:
+        entry, options = entry[:entry.index("{")], entry[entry.index("{"):]
+    name, separator, kind = entry.rpartition(":")
+    group = None
+    if separator and (match := re.fullmatch(r"([A-Za-z_]+(?:\[\])?)(?:\(([^)]*)\))?", kind)):
+        kind, group = match[1], match[2]
+        if kind.upper() in ADMIN_SPECIAL:
+            kind = kind.upper()
+        elif kind.removesuffix("[]").lower() in ADMIN_TYPES:
+            kind = kind.lower()
+        else:
+            name, kind = entry, "string"
+    else:
+        name, kind = entry, "string"
+    if options is not None and kind not in ("ID", "START_ID", "END_ID"):
+        raise ValueError(f"{source}: header options {options} are not supported")
+    return name, kind, group or ""
+
+
+def parse_iso_date(text):
+    match = ISO_DATE.fullmatch(text)
+    if not match:
+        raise ValueError(f"Unsupported date {text!r}; expected YYYY-MM-DD")
+    return (datetime.date(int(match[1]), int(match[2]), int(match[3])) - UNIX_EPOCH.date()).days
+
+
+def parse_iso_time(text):
+    match = ISO_TIME.match(text)
+    if not match:
+        raise ValueError(f"Unsupported time {text!r}")
+    hours, minutes, seconds = int(match[1]), int(match[2]), int(match[3] or 0)
+    if hours > 23 or minutes > 59 or seconds > 59:
+        raise ValueError(f"Time {text!r} is out of range")
+    nanos = int((match[4] or "").ljust(9, "0") or 0)
+    return ((hours * 60 + minutes) * 60 + seconds) * 1_000_000_000 + nanos, text[match.end():]
+
+
+def parse_iso_offset(text):
+    match = ISO_OFFSET.fullmatch(text)
+    if not match:
+        raise ValueError(f"Unsupported time zone {text!r}")
+    offset, zone = match[1], match[2]
+    seconds = None
+    if offset:
+        seconds = 0
+        if offset != "Z":
+            digits = offset[1:].replace(":", "")
+            seconds = int(digits[:2]) * 3600 + int(digits[2:4] or 0) * 60 + int(digits[4:6] or 0)
+            seconds = -seconds if offset[0] == "-" else seconds
+    return seconds, zone
+
+
+def admin_scalar(kind, text):
+    """Convert one neo4j-admin CSV value to the value this server stores; the inverse of csv_scalar."""
+    if kind in ("int", "long", "short", "byte"):
+        return int(text)
+    if kind in ("float", "double"):
+        return float(text)
+    if kind == "boolean":
+        return text.lower() == "true"
+    if kind in ("string", "char"):
+        return text
+    if kind == "date":
+        return Structure(0x44, (parse_iso_date(text),))
+    if kind in ("localtime", "time"):
+        nanos, rest = parse_iso_time(text)
+        if kind == "localtime":
+            if rest:
+                raise ValueError(f"Unexpected time zone in localtime {text!r}")
+            return Structure(0x74, (nanos,))
+        offset, zone = parse_iso_offset(rest)
+        if zone is not None:
+            raise ValueError(f"time values take an offset, not a zone: {text!r}")
+        return Structure(0x54, (nanos, offset or 0))
+    if kind in ("localdatetime", "datetime"):
+        day, separator, rest = text.partition("T")
+        if not separator:
+            raise ValueError(f"Expected a date and time, not {text!r}")
+        nanos, rest = parse_iso_time(rest)
+        local = parse_iso_date(day) * 86400 + nanos // 1_000_000_000
+        nanos %= 1_000_000_000
+        if kind == "localdatetime":
+            if rest:
+                raise ValueError(f"Unexpected time zone in localdatetime {text!r}")
+            return Structure(0x64, (local, nanos))
+        offset, zone = parse_iso_offset(rest)
+        if zone is None:
+            return Structure(0x49, (local - (offset or 0), nanos, offset or 0))
+        if offset is None:
+            wall = UNIX_EPOCH + datetime.timedelta(seconds=local)
+            offset = int(wall.replace(tzinfo=ZoneInfo(zone)).utcoffset().total_seconds())
+        else:
+            ZoneInfo(zone)
+        return Structure(0x69, (local - offset, nanos, zone))
+    if kind == "duration":
+        match = ISO_DURATION.fullmatch(text)
+        if not match or text.upper() in ("P", "PT"):
+            raise ValueError(f"Unsupported duration {text!r}")
+        years, months, weeks, days, hours, minutes, seconds = (int(item or 0) for item in match.groups()[:7])
+        fraction = int((match[8] or "").ljust(9, "0") or 0)
+        total = ((hours * 60 + minutes) * 60 + seconds) * 1_000_000_000
+        total += -fraction if (match[7] or "").startswith("-") else fraction
+        whole, nanos = divmod(total, 1_000_000_000)
+        return Structure(0x45, (years * 12 + months, weeks * 7 + days, whole, nanos))
+    if kind == "point":
+        body = text.strip()
+        if not (body.startswith("{") and body.endswith("}")):
+            raise ValueError(f"Unsupported point {text!r}")
+        values = {}
+        for item in filter(None, (part.strip() for part in body[1:-1].split(","))):
+            key, separator, value = item.partition(":")
+            if not separator:
+                raise ValueError(f"Unsupported point {text!r}")
+            values[key.strip().lower()] = value.strip().strip("'\"")
+        crs = values.pop("crs", None)
+        srid = int(values.pop("srid")) if "srid" in values else None
+        geographic = "longitude" in values or "latitude" in values
+        names = ("longitude", "latitude", "height") if geographic else ("x", "y", "z")
+        if crs is not None:
+            srid = CRS_SRIDS.get(crs.lower())
+            if srid is None:
+                raise ValueError(f"Unknown coordinate reference system {crs!r}")
+        coordinates = [float(values.pop(name)) for name in names if name in values]
+        if values or len(coordinates) not in (2, 3):
+            raise ValueError(f"Unsupported point {text!r}")
+        if srid is None:
+            srid = (4326 if len(coordinates) == 2 else 4979) if geographic else (7203 if len(coordinates) == 2 else 9157)
+        value = Structure(0x58 if len(coordinates) == 2 else 0x59, (srid, *coordinates))
+        structure_text(value)
+        return value
+    raise ValueError(f"Unsupported property type {kind!r}")
+
+
+class CsvGraphImport:
+    def __init__(self, settings):
+        self.settings = settings
+        self.graph = Graph()
+        self.ids = {}
+        self.warnings = []
+
+    def records(self, label, paths):
+        files = admin_files(paths)
+        header = None
+        for path in files:
+            text = path.read_text(encoding=self.settings["input-encoding"])
+            for line, fields in csv_records(text, self.settings["delimiter"], self.settings["quote"],
+                                            self.settings["multiline-fields"], path.name):
+                if header is None:
+                    header = [parse_header_entry(value, path.name) for value, _ in fields]
+                    continue
+                if len(fields) > len(header) and not self.settings["ignore-extra-columns"]:
+                    raise ValueError(f"{path.name}:{line}: {len(fields)} fields for {len(header)} header columns")
+                yield f"{path.name}:{line}", header, fields
+        if header is None:
+            raise ValueError(f"{files[0].name} has no header line")
+
+    def value(self, kind, text, quoted):
+        if self.settings["trim-strings"]:
+            text = text.strip()
+        if not quoted and text == "":
+            return None
+        if text == "" and (kind != "string" or self.settings["ignore-empty-strings"]):
+            return None
+        if kind == "byte[]":
+            return bytes(int(item) & 255 for item in text.split(self.settings["array-delimiter"]))
+        if kind.endswith("[]"):
+            items = text.split(self.settings["array-delimiter"])
+            return [admin_scalar(kind[:-2], item.strip() if kind != "string[]" else item) for item in items]
+        return admin_scalar(kind, text.strip() if kind not in ("string", "char") else text)
+
+    def properties(self, where, header, fields, skip):
+        props = {}
+        for (name, kind, _), (text, quoted) in zip(header, fields):
+            if kind in skip or kind == "IGNORE":
+                continue
+            try:
+                value = self.value(kind, text, quoted)
+            except (ValueError, KeyError, OverflowError) as exc:
+                raise ValueError(f"{where}: column {name}:{kind}: {exc}") from None
+            if value is not None:
+                props[name] = property_value(value)
+        return props
+
+    def node_id(self, text):
+        return int(text) if self.settings["id-type"] == "integer" else text
+
+    def add_nodes(self, labels, paths):
+        file_labels = set(filter(None, labels.split(":")))
+        for where, header, fields in self.records(labels, paths):
+            props = self.properties(where, header, fields, {"ID", "LABEL"})
+            node_labels = set(file_labels)
+            key = None
+            for (name, kind, group), (text, quoted) in zip(header, fields):
+                if kind == "LABEL" and text:
+                    node_labels.update(filter(None, text.split(self.settings["array-delimiter"])))
+                elif kind == "ID":
+                    if text == "":
+                        raise ValueError(f"{where}: missing node id")
+                    key = (group, self.node_id(text))
+                    if name:
+                        props[name] = key[1]
+            if key is not None and key in self.ids:
+                if self.settings["skip-duplicate-nodes"]:
+                    self.warnings.append(f"{where}: skipped duplicate node id {key[1]!r}")
+                    continue
+                raise ValueError(f"{where}: duplicate node id {key[1]!r}")
+            node = self.graph.add_node(node_labels, props)
+            if key is not None:
+                self.ids[key] = node
+
+    def add_relationships(self, kind_name, paths):
+        for where, header, fields in self.records(kind_name, paths):
+            props = self.properties(where, header, fields, {"START_ID", "END_ID", "TYPE"})
+            ends, kind = {}, kind_name
+            for (name, column, group), (text, quoted) in zip(header, fields):
+                if column in ("START_ID", "END_ID"):
+                    ends[column] = self.ids.get((group, self.node_id(text))) if text else None
+                elif column == "TYPE" and text:
+                    kind = text
+            if not kind:
+                raise ValueError(f"{where}: relationship has no type")
+            if ends.get("START_ID") is None or ends.get("END_ID") is None:
+                if self.settings["skip-bad-relationships"]:
+                    self.warnings.append(f"{where}: skipped relationship with a missing node")
+                    continue
+                raise ValueError(f"{where}: relationship refers to a missing node")
+            self.graph.add_edge(ends["START_ID"], ends["END_ID"], kind, props)
+
+
+def script_units(text):
+    """Split a cypher-shell script into ("command", line) and ("statement", text) units."""
+    units, buffer, position, size = [], [], 0, len(text)
+    while position < size:
+        char = text[position]
+        if char == ":" and not "".join(buffer).strip():
+            end = text.find("\n", position)
+            end = size if end < 0 else end
+            units.append(("command", text[position:end].strip()))
+            buffer, position = [], end + 1
+            continue
+        if char in "'\"`":
+            end = position + 1
+            while end < size:
+                if text[end] == "\\" and char != "`":
+                    end += 2
+                    continue
+                if text[end] == char:
+                    if char == "`" and text[end + 1:end + 2] == "`":
+                        end += 2
+                        continue
+                    break
+                end += 1
+            buffer.append(text[position:end + 1])
+            position = end + 1
+            continue
+        if text.startswith("//", position):
+            end = text.find("\n", position)
+            position = size if end < 0 else end
+            continue
+        if text.startswith("/*", position):
+            end = text.find("*/", position + 2)
+            position = size if end < 0 else end + 2
+            continue
+        if char == ";":
+            statement = "".join(buffer).strip()
+            if statement:
+                units.append(("statement", statement))
+            buffer, position = [], position + 1
+            continue
+        buffer.append(char)
+        position += 1
+    if "".join(buffer).strip():
+        units.append(("statement", "".join(buffer).strip()))
+    return units
+
+
+def run_cypher_script(graph, text, source, warnings):
+    """Execute a cypher-shell script, such as export or apoc.export.cypher output, against graph."""
+    params = {}
+
+    def evaluate_expression(expression):
+        clauses, unions, _, _ = Parser(f"RETURN {expression} AS value").parse()
+        return Query(Graph(), params, "neo4j").run(clauses, unions, False, False, "neo4j").rows[0][0]
+
+    for kind, unit in script_units(text):
+        try:
+            if kind == "command":
+                command, _, rest = unit.partition(" ")
+                command, rest = command.lower(), rest.strip()
+                if command in (":begin", ":commit", ":use"):
+                    continue
+                if command == ":rollback":
+                    raise ValueError(":rollback is not supported when importing a script")
+                if command in (":param", ":params"):
+                    if rest.lower() in ("clear", "--clear"):
+                        params.clear()
+                    elif "=>" in rest:
+                        name, _, expression = rest.partition("=>")
+                        params[name.strip().strip("`")] = evaluate_expression(expression.strip())
+                    else:
+                        value = evaluate_expression(rest)
+                        if not isinstance(value, dict):
+                            raise ValueError(f"{command} expects a map or name => value")
+                        params.update(value)
+                    continue
+                raise ValueError(f"Unsupported cypher-shell command {command}")
+            if re.fullmatch(r"(?is)CALL\s+db\.await(?:Indexes|Index)\s*\(.*\)", unit):
+                continue
+            clauses, unions, explain, profile = Parser(unit).parse()
+            missing = sorted(set(query_parameters(clauses)) - params.keys())
+            if missing:
+                raise CypherError("Expected parameter(s): " + ", ".join(missing))
+            Query(graph, params, "neo4j").run(clauses, unions, explain, profile, "neo4j")
+        except (CypherError, AttributeError, KeyError, OverflowError, ProtocolError, RecursionError, TypeError,
+                ValueError, re.error, ZeroDivisionError) as exc:
+            raise ValueError(f"{source}: {exc} in: {unit[:120]}") from None
+
+
+def write_graph_file(graph, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".neo4j-import-", dir=destination.parent) as temporary:
+        staged = Path(temporary) / "graph.sqlite3"
+        store = Store(staged)
+        try:
+            store.commit(graph, 0, True)
+        finally:
+            store.close()
+        # A hard link publishes the complete file and, unlike rename, refuses an existing destination.
+        (os.rename if os.name == "nt" else os.link)(staged, destination)
+
+
+def import_main(argv):
+    parser = argparse.ArgumentParser(
+        description="Build a Neo4j test server SQLite file from neo4j-admin import CSV files or cypher-shell scripts.")
+    parser.add_argument("--db-file", type=Path, required=True, help="new SQLite persistence file")
+    parser.add_argument("--csv", type=Path, metavar="DIR",
+                        help="directory written by 'export --format csv' (import.args, then schema.cypher)")
+    parser.add_argument("--args-file", type=Path, metavar="FILE",
+                        help="neo4j-admin argument file; its file names resolve against its directory")
+    parser.add_argument("--nodes", action="append", default=[], metavar="[LABELS=]FILES",
+                        help="neo4j-admin --nodes value; may repeat")
+    parser.add_argument("--relationships", action="append", default=[], metavar="[TYPE=]FILES",
+                        help="neo4j-admin --relationships value; may repeat")
+    parser.add_argument("--cypher", type=Path, action="append", default=[], metavar="FILE",
+                        help="cypher-shell script to run after any CSV input, such as export output or "
+                             "apoc.export.cypher; may repeat")
+    args, extra = parser.parse_known_args(argv)
+    destination = args.db_file.expanduser().absolute()
+    warnings = []
+    try:
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Output file already exists: {destination}")
+        arguments, base, scripts = [], Path.cwd(), list(args.cypher)
+        if args.csv is not None:
+            args.args_file = args.csv / "import.args"
+            if (args.csv / "schema.cypher").is_file():
+                scripts.insert(0, args.csv / "schema.cypher")
+        if args.args_file is not None:
+            arguments += shlex.split(args.args_file.read_text(encoding="utf-8"), comments=True)
+            base = args.args_file.parent
+        arguments += [f"--nodes={value}" for value in args.nodes]
+        arguments += [f"--relationships={value}" for value in args.relationships] + extra
+        if arguments:
+            settings = parse_admin_options(arguments, base)
+            loader = CsvGraphImport(settings)
+            for labels, paths in settings["nodes"]:
+                loader.add_nodes(labels, paths)
+            for kind, paths in settings["relationships"]:
+                loader.add_relationships(kind, paths)
+            loader.graph.validate_constraints()
+            graph, warnings = loader.graph, loader.warnings
+        elif scripts:
+            graph = Graph()
+        else:
+            raise ValueError("Pass --csv, --args-file, --nodes, or --cypher")
+        for script in scripts:
+            run_cypher_script(graph, script.read_text(encoding="utf-8"), script.name, warnings)
+        graph.validate_constraints()
+        write_graph_file(graph, destination)
+    except (OSError, ValueError, CypherError, sqlite3.Error) as exc:
+        parser.exit(1, f"Neo4j import failed: {exc}\n")
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    print(f"Imported {len(graph.nodes)} nodes, {len(graph.edges)} relationships, and "
+          f"{len(graph.schema)} indexes/constraints into {destination}")
+    return 0
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["export"]:
         return export_main(argv[1:])
+    if argv[:1] == ["import"]:
+        return import_main(argv[1:])
     return serve_main(argv[1:] if argv[:1] == ["serve"] else argv)
 
 

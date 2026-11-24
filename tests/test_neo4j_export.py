@@ -279,5 +279,133 @@ class Neo4jExportTests(unittest.TestCase):
         self.assertNotIn("CREATE", (self.directory / "cypher" / "neo4j.cypher").read_text(encoding="utf-8"))
 
 
+    def graph_shape(self, graph):
+        nodes = sorted(graph.nodes.values(), key=lambda node: node.id)
+        position = {node.id: index for index, node in enumerate(nodes)}
+        nan = lambda props: {key: "NaN" if value != value else value for key, value in props.items()}
+        return ([(node.labels, nan(node.props)) for node in nodes],
+                [(position[edge.start], position[edge.end], edge.type, edge.props)
+                 for edge in sorted(graph.edges.values(), key=lambda edge: edge.id)], graph.schema)
+
+    def import_command(self, *args, check=True):
+        return subprocess.run([sys.executable, "-I", "-S", "-B", str(self.script), "import", *args],
+                              cwd=self.directory, check=check, text=True, capture_output=True, timeout=30)
+
+    def test_import_restores_both_export_formats_exactly(self):
+        S, graph = self.S, self.neo4j["Graph"]()
+        removed = graph.add_node({"Gone"}, {})
+        first = graph.add_node({"Person", "Admin"}, {
+            "name": "O'Brien \\ \"q\"\nline 😀", "age": 41, "empty": "", "nan": float("nan"), "low": -(1 << 63),
+            "tags": ["a;b", "c|d", ""], "born": S(0x44, (-1000,)), "seen": S(0x49, (1700000000, 123000000, 3600)),
+            "zone": S(0x69, (1700000000, 5, "Europe/Paris")), "clock": S(0x54, (3723000000001, -19800)),
+            "local": S(0x74, (1,)), "wall": S(0x64, (-1, 999)), "span": S(0x45, (14, 3, -2, 500000000)),
+            "home": S(0x58, (4326, 12.5, 55.25)), "box": S(0x59, (9157, 1.0, 2.0, 3.0)), "days": [S(0x44, (0,))],
+        })
+        second = graph.add_node(set(), {"age": "forty"})
+        third = graph.add_node({"Person"}, {"age": 7})
+        del graph.nodes[removed.id]
+        graph.add_edge(first, first, "SELF", {"weight": 0.5})
+        graph.add_edge(first, second, "KNOWS `x`", {"since": 2020})
+        graph.add_edge(third, second, "KNOWS `x`", {"since": "always"})
+        graph.schema["person_name"] = self.schema("person_name", "constraint", "Person", ["name"], unique=True)
+        graph.schema["admin_key"] = self.schema("admin_key", "constraint", "Admin", ["name", "age"], True, True)
+        graph.schema["person_age"] = self.schema("person_age", "index", "Person", ["age"])
+        self.save(graph)
+        expected = self.graph_shape(graph)
+        for fmt, source in (("csv", ("--csv", "csv")), ("cypher", ("--cypher", "cypher/neo4j.cypher"))):
+            with self.subTest(fmt=fmt):
+                self.command("--out", str(self.directory / fmt), "--format", fmt)
+                target = self.directory / f"from-{fmt}.sqlite3"
+                result = self.import_command("--db-file", str(target), *source)
+                self.assertIn("Imported 3 nodes, 3 relationships, and 3 indexes/constraints", result.stdout)
+                self.assertEqual(self.graph_shape(self.neo4j["read_graph_snapshot"](target)), expected)
+
+    def test_import_reads_neo4j_admin_csv_headers_groups_and_arrays(self):
+        (self.directory / "people-header.csv").write_text("personId:ID(Person),name,age:int,tags:string[],:IGNORE\n",
+                                                          encoding="utf-8")
+        (self.directory / "people.csv").write_text('p1,"Ann, A.",30,a;b,x\np2,"",,,y\n', encoding="utf-8")
+        (self.directory / "cities.csv").write_text(":ID(City),name,:LABEL\np1,Paris,Capital;City\n", encoding="utf-8")
+        (self.directory / "lives.csv").write_text(":START_ID(Person),:END_ID(City),since:long\np1,p1,2020\n",
+                                                  encoding="utf-8")
+        target = self.directory / "admin.sqlite3"
+        self.import_command("--db-file", str(target), "--nodes=Person=people-header.csv,people.csv",
+                            "--nodes=cities.csv", "--relationships=LIVES_IN=lives.csv")
+        graph = self.neo4j["read_graph_snapshot"](target)
+        nodes = sorted(graph.nodes.values(), key=lambda node: node.id)
+        self.assertEqual([(node.labels, node.props) for node in nodes], [
+            ({"Person"}, {"personId": "p1", "name": "Ann, A.", "age": 30, "tags": ["a", "b"]}),
+            ({"Person"}, {"personId": "p2", "name": ""}),
+            ({"Capital", "City"}, {"name": "Paris"}),
+        ])
+        edge, = graph.edges.values()
+        self.assertEqual((edge.start, edge.end, edge.type, edge.props), (0, 2, "LIVES_IN", {"since": 2020}))
+
+        (self.directory / "bad.csv").write_text(":START_ID(Person),:END_ID(City)\np1,nowhere\n", encoding="utf-8")
+        result = self.import_command("--db-file", str(self.directory / "bad.sqlite3"), "--nodes=Person=people-header.csv,people.csv",
+                                     "--nodes=cities.csv", "--relationships=LIVES_IN=bad.csv", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("bad.csv:2: relationship refers to a missing node", result.stderr)
+        self.assertFalse((self.directory / "bad.sqlite3").exists())
+
+    def test_import_runs_apoc_style_cypher_shell_scripts(self):
+        (self.directory / "apoc.cypher").write_text("""\
+:begin
+CREATE CONSTRAINT UNIQUE_IMPORT_NAME FOR (node:`UNIQUE IMPORT LABEL`) REQUIRE (node.`UNIQUE IMPORT ID`) IS UNIQUE;
+:commit
+CALL db.awaitIndexes(300);
+:param rows => [{_id:0, properties:{name:"Ann; \\"A\\"", score:Infinity}}, {_id:1, properties:{name:"Bo"}}]
+:begin
+UNWIND $rows AS row
+CREATE (n:`UNIQUE IMPORT LABEL`{`UNIQUE IMPORT ID`: row._id}) SET n += row.properties SET n:Person;
+:commit
+:begin
+UNWIND [{start: {_id:0}, end: {_id:1}, properties:{span:duration({days: 3, hours: 4})}}] AS row
+MATCH (start:`UNIQUE IMPORT LABEL`{`UNIQUE IMPORT ID`: row.start._id})
+MATCH (end:`UNIQUE IMPORT LABEL`{`UNIQUE IMPORT ID`: row.end._id})
+CREATE (start)-[r:KNOWS]->(end) SET r += row.properties;
+:commit
+:begin
+MATCH (n:`UNIQUE IMPORT LABEL`)  WITH n LIMIT 20000 REMOVE n:`UNIQUE IMPORT LABEL` REMOVE n.`UNIQUE IMPORT ID`;
+:commit
+DROP CONSTRAINT UNIQUE_IMPORT_NAME;
+""", encoding="utf-8")
+        target = self.directory / "apoc.sqlite3"
+        self.import_command("--db-file", str(target), "--cypher", "apoc.cypher")
+        graph = self.neo4j["read_graph_snapshot"](target)
+        self.assertEqual([node.props for node in graph.nodes.values()],
+                         [{"name": 'Ann; "A"', "score": float("inf")}, {"name": "Bo"}])
+        self.assertEqual([edge.props for edge in graph.edges.values()],
+                         [{"span": self.S(0x45, (0, 3, 14400, 0))}])
+        self.assertEqual(graph.schema, {})
+
+    def test_import_refuses_existing_destination_and_reports_bad_scripts(self):
+        existing = self.directory / "existing.sqlite3"
+        existing.write_bytes(b"keep")
+        (self.directory / "bad.cypher").write_text("CREATE (n:Thing {when: time('25:00')});\n", encoding="utf-8")
+        result = self.import_command("--db-file", str(existing), "--cypher", "bad.cypher", check=False)
+        self.assertIn("already exists", result.stderr)
+        self.assertEqual(existing.read_bytes(), b"keep")
+        result = self.import_command("--db-file", str(self.directory / "new.sqlite3"), "--cypher", "bad.cypher",
+                                     check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Neo4j import failed: bad.cypher:", result.stderr)
+        self.assertFalse((self.directory / "new.sqlite3").exists())
+        self.assertEqual(list(self.directory.glob(".neo4j-import-*")), [])
+
+    def test_reset_procedure_clears_the_persisted_graph(self):
+        target = self.directory / "live.sqlite3"
+        with running_server(self.script, self.directory, "--db-file", str(target)) as port:
+            with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+                client = BoltClient(sock)
+                client.run("CREATE INDEX person_name FOR (n:Person) ON (n.name)")
+                client.run("CREATE (:Person {name: 'a'})-[:KNOWS]->(:Person {name: 'b'})")
+                client.run("CALL jjap.reset()")
+                client.run("CREATE (:Fresh)")
+        graph = self.neo4j["read_graph_snapshot"](target)
+        self.assertEqual(([node.labels for node in graph.nodes.values()], graph.edges, graph.schema),
+                         ([{"Fresh"}], {}, {}))
+        self.assertEqual(list(graph.nodes), [0])
+
+
 if __name__ == "__main__":
     unittest.main()
