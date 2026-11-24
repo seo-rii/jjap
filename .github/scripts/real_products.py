@@ -36,8 +36,10 @@ IMAGES = {
 def run(*command, cwd=None, check=True, timeout=600):
     print("+", " ".join(map(str, command)), flush=True)
     result = subprocess.run([str(part) for part in command], cwd=cwd, text=True, capture_output=True, timeout=timeout)
-    if result.stderr.strip():
-        print(result.stderr.strip()[-4000:], file=sys.stderr, flush=True)
+    error = result.stderr.strip()
+    if error:
+        # Keep the start too: Java servers put the message first and a long stack trace after it.
+        print(error if len(error) <= 6000 else f"{error[:3000]}\n[...]\n{error[-3000:]}", file=sys.stderr, flush=True)
     if check and result.returncode:
         raise AssertionError(f"{command[0]} exited with {result.returncode}: {result.stdout[-2000:]}")
     return result.stdout
