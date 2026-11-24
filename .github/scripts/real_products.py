@@ -198,7 +198,9 @@ def cypher(name, query, port):
 def neo4j_summary(name, port):
     return {
         "counts": cypher(name, "MATCH (n) WITH count(n) AS nodes MATCH ()-[r]->() RETURN nodes, count(r)", port),
-        "labels": cypher(name, "MATCH (n) RETURN n.name, labels(n) ORDER BY n.name", port),
+        # Labels are a set; Neo4j returns them in token order, which differs between the two load paths.
+        "labels": cypher(name, "MATCH (n) RETURN n.name, COLLECT { UNWIND labels(n) AS label RETURN label "
+                               "ORDER BY label } ORDER BY n.name", port),
         "types": cypher(name, NEO4J_TYPES, port),
         "constraints": cypher(name, "SHOW CONSTRAINTS YIELD name RETURN name ORDER BY name", port),
         "indexes": cypher(name, "SHOW INDEXES YIELD name, type WHERE type = 'RANGE' RETURN name ORDER BY name", port),
@@ -377,8 +379,9 @@ def check_iceberg(work):
     if process.returncode:
         raise AssertionError(process.stderr)
     expected = jjap("iceberg_server.py", "--warehouse", warehouse, "scan", "demo.events")
-    options = ["--network", "host", "-v", f"{work}:{work}", "-e", f"CATALOG_WAREHOUSE={warehouse.as_uri()}",
-               "--user", f"{os.getuid()}:{os.getgid()}"]
+    # The fixture only reads the world-readable warehouse files. Hadoop's login fails for a uid without a
+    # passwd entry, so the container keeps its own user.
+    options = ["--network", "host", "-v", f"{work}:{work}", "-e", f"CATALOG_WAREHOUSE={warehouse.as_uri()}"]
     with container("jjap-iceberg", IMAGES["iceberg"], *options):
         target = "http://127.0.0.1:8181"
         wait_until("Iceberg REST fixture", lambda: http("GET", f"{target}/v1/config")[0] == 200)
