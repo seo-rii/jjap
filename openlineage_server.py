@@ -5,11 +5,18 @@ import argparse
 import gzip
 import hashlib
 import hmac
+import http.client
 import io
 import json
+import os
 import re
 import sqlite3
+import sys
+import tempfile
 import threading
+import time
+import urllib.error
+import urllib.request
 import uuid
 import zlib
 from collections import defaultdict, deque
@@ -449,13 +456,154 @@ class Server(ThreadingHTTPServer):
     daemon_threads = False
 
 
-def main():
+# NDJSON export and replay into another OpenLineage collector such as Marquez
+
+
+def read_token(path):
+    token = path.expanduser().read_text(encoding="utf-8").strip()
+    if not token or not token.isascii() or any(char.isspace() for char in token):
+        raise ValueError(f"{path} must contain one nonempty ASCII token")
+    return token
+
+
+def snapshot_events(filename):
+    """Yield (seq, payload) from one read transaction, in the order the collector stored them."""
+    source = Path(filename).expanduser().resolve(strict=True)
+    if not source.is_file():
+        raise ValueError(f"Expected a SQLite persistence file: {source}")
+    connection = sqlite3.connect(f"{source.as_uri()}?mode=ro", uri=True, isolation_level=None)
+    with closing(connection):
+        connection.execute("BEGIN")
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(lineage_events)")}
+        if not {"seq", "digest", "occurred", "run_id", "payload"} <= columns:
+            raise ValueError("Expected an OpenLineage test server SQLite persistence file")
+        for seq, payload in connection.execute("SELECT seq, payload FROM lineage_events ORDER BY seq"):
+            if not isinstance(payload, str) or not isinstance(json.loads(payload), dict):
+                raise ValueError(f"Stored event {seq} is not a JSON object")
+            yield seq, payload
+
+
+def export_events(filename, destination):
+    count = 0
+    with destination.open("xb") as raw:
+        stream = gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) if destination.name.endswith(".gz") else raw
+        for _, payload in snapshot_events(filename):
+            stream.write(payload.encode("utf-8") + b"\n")
+            count += 1
+        if stream is not raw:
+            stream.close()
+    return count
+
+
+def export_main(argv):
+    parser = argparse.ArgumentParser(prog="openlineage_server.py export",
+                                     description="Export stored OpenLineage events as NDJSON (gzip when OUT ends with .gz).")
+    parser.add_argument("--db-file", type=Path, required=True, help="existing SQLite persistence file")
+    parser.add_argument("--out", type=Path, required=True, help="new .ndjson or .ndjson.gz file")
+    args = parser.parse_args(argv)
+    destination = args.out.expanduser().absolute()
+    try:
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Output file already exists: {destination}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".openlineage-export-", dir=destination.parent) as temporary:
+            staged = Path(temporary) / destination.name
+            count = export_events(args.db_file, staged)
+            if os.name == "nt":
+                staged.rename(destination)
+            else:
+                os.link(staged, destination)
+    except (OSError, ValueError, sqlite3.Error) as error:
+        parser.exit(1, f"OpenLineage export failed: {error}\n")
+    print(f"Exported {count} OpenLineage events to {destination}")
+    return 0
+
+
+def post_events(url, body, headers, retries, timeout):
+    """POST once, retrying 429/5xx responses and connection failures with a bounded backoff."""
+    for attempt in range(retries + 1):
+        request = urllib.request.Request(url, data=body, method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                response.read()
+                return None
+        except urllib.error.HTTPError as error:
+            detail = error.read(500).decode("utf-8", "replace").strip()
+            problem = f"HTTP {error.code}{': ' + detail if detail else ''}"
+            if error.code != 429 and error.code < 500:
+                return problem
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
+            problem = ConnectionError(f"{url}: {getattr(error, 'reason', error)}")
+        if attempt < retries:
+            time.sleep(min(0.25 * 2 ** attempt, 4))
+    return problem
+
+
+def migrate_main(argv):
+    parser = argparse.ArgumentParser(prog="openlineage_server.py migrate",
+                                     description="Replay stored OpenLineage events, in stored order, into a running collector.")
+    parser.add_argument("--db-file", type=Path, required=True, help="existing SQLite persistence file")
+    parser.add_argument("--target", required=True, help="collector base URL, for example http://localhost:5000")
+    parser.add_argument("--token-file", type=Path, help="file containing a bearer token for the target")
+    parser.add_argument("--endpoint", default="api/v1/lineage", help="event endpoint below the target (default: %(default)s)")
+    parser.add_argument("--batch-size", type=int, default=0,
+                        help="POST arrays of up to N events to ENDPOINT/batch instead of one event per request "
+                             "(default: 100 when ENDPOINT ends with /batch, else one per request)")
+    parser.add_argument("--retries", type=int, default=3, help="retries per request on 429, 5xx, or connection errors")
+    parser.add_argument("--timeout", type=float, default=30, help="seconds per HTTP request")
+    args = parser.parse_args(argv)
+    target = args.target.rstrip("/")
+    if urlsplit(target).scheme not in {"http", "https"} or args.batch_size < 0 or args.retries < 0 or args.timeout <= 0:
+        parser.error("--target must be an http(s) URL, --batch-size and --retries not negative, --timeout positive")
+    endpoint = args.endpoint.strip("/")
+    batch_size = args.batch_size or (100 if endpoint.endswith("/batch") else 0)
+    if batch_size and not endpoint.endswith("/batch"):
+        endpoint += "/batch"
+    url = f"{target}/{endpoint}"
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    sent = failed = 0
+    try:
+        if args.token_file:
+            headers["Authorization"] = f"Bearer {read_token(args.token_file)}"
+        pending = []
+
+        def flush():
+            nonlocal sent, failed
+            batch = [payload for _, payload in pending]
+            body = ("[" + ",".join(batch) + "]" if batch_size else batch[0]).encode("utf-8")
+            problem = post_events(url, body, headers, args.retries, args.timeout)
+            if isinstance(problem, ConnectionError):
+                raise problem
+            if problem:
+                first, last = pending[0][0], pending[-1][0]
+                label = f"event seq {first}" if first == last else f"events seq {first}-{last}"
+                print(f"OpenLineage migrate: {label} rejected: {problem}", file=sys.stderr)
+                failed += len(pending)
+            else:
+                sent += len(pending)
+            pending.clear()
+
+        for item in snapshot_events(args.db_file):
+            pending.append(item)
+            if len(pending) >= max(batch_size, 1):
+                flush()
+        if pending:
+            flush()
+    except (OSError, ValueError, sqlite3.Error) as error:
+        parser.exit(1, f"OpenLineage migrate failed after {sent} events: {error}\n")
+    if failed:
+        parser.exit(1, f"OpenLineage migrate failed: {failed} of {sent + failed} events were rejected by {url}\n")
+    print(f"Migrated {sent} OpenLineage events to {url}")
+    return 0
+
+
+def serve_main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--db-file", type=Path, help="SQLite file for lineage events")
     parser.add_argument("--password-file", type=Path, help="File containing the bearer token")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     token = None
     if args.password_file:
         try:
@@ -474,7 +622,17 @@ def main():
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["export"]:
+        return export_main(argv[1:])
+    if argv[:1] == ["migrate"]:
+        return migrate_main(argv[1:])
+    return serve_main(argv)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

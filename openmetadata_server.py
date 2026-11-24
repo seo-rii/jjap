@@ -7,18 +7,24 @@ import binascii
 import copy
 import fnmatch
 import hmac
+import http.client
 import json
+import os
 import re
 import sqlite3
+import sys
+import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections import defaultdict, deque
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 
 API_VERSION = "2.0.9"
@@ -726,14 +732,356 @@ class Server(ThreadingHTTPServer):
     daemon_threads = False
 
 
-def main():
+# Export as OpenMetadata Create* request bodies and replay them into a running server
+
+EXPORT_ORDER = ("user", "databaseService", "pipelineService", "messagingService",
+                "database", "databaseSchema", "table", "pipeline", "topic")
+SERVICE_FIELDS = {"name", "displayName", "description", "tags", "style", "serviceType", "connection", "owners",
+                  "dataProducts", "domains", "ingestionRunner"}
+ASSET_FIELDS = {"name", "displayName", "description", "tags", "owners", "dataProducts", "domains", "extension",
+                "sourceUrl", "lifeCycle", "sourceHash"}
+# Properties of the OpenMetadata 2.0 Create*Request schemas, which reject anything else.
+CREATE_FIELDS = {
+    "databaseService": SERVICE_FIELDS,
+    "pipelineService": SERVICE_FIELDS | {"scheduleInterval", "lifeCycle"},
+    "messagingService": SERVICE_FIELDS,
+    "database": ASSET_FIELDS | {"service", "default", "retentionPeriod"},
+    "databaseSchema": ASSET_FIELDS | {"database", "retentionPeriod"},
+    "table": ASSET_FIELDS | {"databaseSchema", "tableType", "columns", "dataModel", "locationPath", "tableConstraints",
+                             "aliases", "tablePartition", "tableProfilerConfig", "schemaDefinition", "retentionPeriod",
+                             "fileFormat", "tableSharding"},
+    "pipeline": ASSET_FIELDS | {"service", "concurrency", "pipelineLocation", "startDate", "tasks", "state", "scheduleInterval"},
+    "topic": ASSET_FIELDS | {"service", "messageSchema", "partitions", "cleanupPolicies", "replicationFactor", "retentionTime",
+                             "maximumMessageSize", "minimumInSyncReplicas", "retentionSize", "topicConfig"},
+    # Passwords and authentication mechanisms are secrets that OpenMetadata never returns; they are not exported.
+    "user": {"name", "description", "displayName", "externalId", "scimUserName", "email", "timezone", "isBot", "botName",
+             "isAdmin", "profile", "domains"},
+}
+SERVER_FIELDS = {"id", "href", "version", "updatedAt", "updatedBy", "fullyQualifiedName", "changeDescription",
+                 "incrementalChangeDescription", "deleted", "usageSummary", "serviceType", "service", "database",
+                 "databaseSchema"}
+REFERENCE_COLLECTIONS = {**{kind: entity.collection for kind, entity in TYPES.items()}, "team": "teams"}
+
+
+def warn(message):
+    print(f"warning: {message}", file=sys.stderr)
+
+
+def fqn_list(values):
+    if not isinstance(values, list):
+        return values
+    return [value["fullyQualifiedName"] if isinstance(value, dict) and isinstance(value.get("fullyQualifiedName"), str)
+            else value for value in values]
+
+
+def without_derived_fqn(items, nested=None):
+    if not isinstance(items, list):
+        return items
+    result = []
+    for item in items:
+        if isinstance(item, dict):
+            item = {key: value for key, value in item.items() if key != "fullyQualifiedName"}
+            if nested in item:
+                item[nested] = without_derived_fqn(item[nested], nested)
+        result.append(item)
+    return result
+
+
+def catalog_requests(filename, include_deleted=False):
+    """Read one snapshot and return the ordered REST requests that recreate it, plus skipped-item counts."""
+    source = Path(filename).expanduser().resolve(strict=True)
+    if not source.is_file():
+        raise ValueError(f"Expected a SQLite persistence file: {source}")
+    connection = sqlite3.connect(f"{source.as_uri()}?mode=ro", uri=True, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    with closing(connection):
+        connection.execute("BEGIN")
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if not {"metadata_entities", "metadata_versions", "metadata_lineage"} <= tables:
+            raise ValueError("Expected an OpenMetadata test server SQLite persistence file")
+        rows = {row["id"]: row for row in connection.execute("SELECT * FROM metadata_entities")}
+        versions, = connection.execute("SELECT COUNT(*) FROM metadata_versions").fetchone()
+        links = connection.execute("SELECT source, target, details FROM metadata_lineage ORDER BY rowid").fetchall()
+    skipped = {"deletedEntities": 0, "orphans": 0, "lineageEdges": 0, "versionHistory": max(versions - len(rows), 0)}
+    ordered = sorted((row for row in rows.values() if row["kind"] in EXPORT_ORDER),
+                     key=lambda row: (EXPORT_ORDER.index(row["kind"]), row["fqn"]))
+    for row in rows.values():
+        if row["kind"] not in EXPORT_ORDER:
+            warn(f"{row['kind']} {row['fqn']} has no supported Create request; skipped")
+    exported, dropped, requests, deletions = {}, defaultdict(int), [], []
+    for row in ordered:
+        kind, fqn = row["kind"], row["fqn"]
+        parent = rows.get(row["parent_id"]) if row["parent_id"] else None
+        if row["deleted"] and not include_deleted:
+            skipped["deletedEntities"] += 1
+            continue
+        if row["parent_id"] and row["parent_id"] not in exported:
+            warn(f"{kind} {fqn} was skipped because its parent is not exported")
+            skipped["orphans"] += 1
+            continue
+        content = json.loads(row["content"])
+        entity_type = TYPES[kind]
+        allowed = CREATE_FIELDS[kind]
+        body = {}
+        for key, value in content.items():
+            if key == entity_type.parent_field or key not in allowed:
+                if key not in SERVER_FIELDS:
+                    dropped[kind, key] += 1
+                continue
+            if key == "owners" and isinstance(value, list):
+                value = owner_references(rows, exported, value, f"{kind} {fqn}")
+            elif key in {"domains", "dataProducts"}:
+                value = fqn_list(value)
+            elif key == "columns":
+                value = without_derived_fqn(value, "children")
+            elif key == "tasks":
+                value = without_derived_fqn(value)
+            body[key] = value
+        if parent is not None:
+            body[entity_type.parent_field] = parent["fqn"]
+        exported[row["id"]] = row
+        requests.append({"method": "PUT", "path": f"v1/{entity_type.collection}", "entityType": kind,
+                         "fullyQualifiedName": fqn, "body": body})
+        if row["deleted"]:
+            deletions.append({"method": "DELETE", "path": f"v1/{entity_type.collection}/{{id}}",
+                              "query": "hardDelete=false&recursive=true", "entityType": kind, "fullyQualifiedName": fqn})
+    for (kind, key), count in sorted(dropped.items()):
+        warn(f"dropped [{key}] from {count} {kind} entities: not accepted by the OpenMetadata Create request")
+    for link in links:
+        ends = [exported.get(link["source"]), exported.get(link["target"])]
+        if None in ends:
+            skipped["lineageEdges"] += 1
+            continue
+        edge = {"fromEntity": {"type": ends[0]["kind"], "fullyQualifiedName": ends[0]["fqn"]},
+                "toEntity": {"type": ends[1]["kind"], "fullyQualifiedName": ends[1]["fqn"]}}
+        annotations = json.loads(link["details"]) if link["details"] else {}
+        if "description" in annotations:
+            edge["description"] = annotations["description"]
+        if "lineageDetails" in annotations:
+            details = dict(annotations["lineageDetails"])
+            pipeline = details.get("pipeline")
+            if isinstance(pipeline, dict) and isinstance(pipeline.get("id"), str):
+                if (row := exported.get(pipeline["id"])) is None:
+                    warn(f"lineage {ends[0]['fqn']} -> {ends[1]['fqn']}: pipeline {pipeline['id']} is not exported; reference dropped")
+                    del details["pipeline"]
+                else:
+                    details["pipeline"] = {"type": row["kind"], "fullyQualifiedName": row["fqn"]}
+            edge["lineageDetails"] = details
+        requests.append({"method": "PUT", "path": "v1/lineage", "body": {"edge": edge}})
+    if skipped["deletedEntities"]:
+        warn(f"skipped {skipped['deletedEntities']} soft-deleted entities (use --include-deleted to keep them)")
+    if skipped["lineageEdges"]:
+        warn(f"skipped {skipped['lineageEdges']} lineage edges that touch entities which are not exported")
+    if skipped["versionHistory"]:
+        warn(f"{skipped['versionHistory']} earlier entity versions are not migratable; the target starts a new version history")
+    return requests + deletions[::-1], skipped
+
+
+def owner_references(rows, exported, owners, label):
+    result = []
+    for owner in owners:
+        owner_id = owner.get("id") if isinstance(owner, dict) else None
+        if isinstance(owner_id, str) and owner_id in exported:
+            result.append({"type": rows[owner_id]["kind"], "fullyQualifiedName": rows[owner_id]["fqn"]})
+        elif owner_id is None and isinstance(owner, dict) and all(isinstance(owner.get(key), str)
+                                                                  for key in ("type", "fullyQualifiedName")):
+            result.append({"type": owner["type"], "fullyQualifiedName": owner["fullyQualifiedName"]})
+        else:
+            warn(f"{label}: owner {json.dumps(owner)[:200]} is not an exported entity; dropped")
+    return result
+
+
+def export_catalog(filename, destination, include_deleted):
+    requests, skipped = catalog_requests(filename, include_deleted)
+    destination.mkdir(mode=0o700)
+    (destination / "requests").mkdir()
+    manifest = {
+        "format": "jjap-openmetadata-export", "formatVersion": 1, "apiVersion": API_VERSION,
+        "includeDeleted": include_deleted,
+        "references": ("Owners, lineage endpoints and lineageDetails.pipeline name entities by type and fullyQualifiedName. "
+                       "Set each id from the target (GET /v1/<collection>/name/<fqn>) before sending, and replace {id} "
+                       "in DELETE paths the same way."),
+        "requests": [], "skipped": skipped,
+    }
+    for position, request in enumerate(requests, 1):
+        entry = {key: value for key, value in request.items() if key != "body"}
+        if "body" in request:
+            kind = request.get("entityType", "lineage")
+            entry["body"] = f"requests/{position:05d}-{kind}.json"
+            with (destination / entry["body"]).open("x", encoding="utf-8") as file:
+                file.write(json.dumps(request["body"], indent=2, ensure_ascii=False, allow_nan=False) + "\n")
+        manifest["requests"].append(entry)
+    with (destination / "manifest.json").open("x", encoding="utf-8") as file:
+        file.write(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+    entities = sum(request["method"] == "PUT" and "entityType" in request for request in requests)
+    return entities, sum(request["path"] == "v1/lineage" for request in requests)
+
+
+def export_main(argv):
+    parser = argparse.ArgumentParser(prog="openmetadata_server.py export",
+                                     description="Write OpenMetadata Create* and AddLineage request bodies in dependency order.")
+    parser.add_argument("--db-file", type=Path, required=True, help="existing SQLite persistence file")
+    parser.add_argument("--out", type=Path, required=True, help="new output directory")
+    parser.add_argument("--include-deleted", action="store_true", help="also export soft-deleted entities and their lineage")
+    args = parser.parse_args(argv)
+    destination = args.out.expanduser().absolute()
+    try:
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Output directory already exists: {destination}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".openmetadata-export-", dir=destination.parent) as temporary:
+            staged = Path(temporary) / "export"
+            entities, edges = export_catalog(args.db_file, staged, args.include_deleted)
+            if os.name == "nt":
+                staged.rename(destination)
+            else:
+                destination.mkdir(mode=0o700)
+                try:
+                    staged.replace(destination)
+                except BaseException:
+                    destination.rmdir()
+                    raise
+    except (OSError, ValueError, KeyError, sqlite3.Error) as error:
+        parser.exit(1, f"OpenMetadata export failed: {error}\n")
+    print(f"Exported {entities} entities and {edges} lineage edges to {destination}")
+    return 0
+
+
+class Catalog:
+    def __init__(self, url, token, timeout, retries):
+        self.url, self.timeout, self.retries = url, timeout, retries
+        self.headers = {"Accept": "application/json"}
+        if token:
+            self.headers["Authorization"] = f"Bearer {token}"
+        self.ids = {}
+
+    def call(self, method, path, body=None):
+        data = None if body is None else dump(body).encode()
+        headers = {**self.headers, **({"Content-Type": "application/json"} if data is not None else {})}
+        for attempt in range(self.retries + 1):
+            request = urllib.request.Request(f"{self.url}/{path}", data=data, method=method, headers=headers)
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    status, raw = response.status, response.read()
+            except urllib.error.HTTPError as error:
+                status, raw = error.code, error.read()
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
+                if attempt == self.retries:
+                    raise ConnectionError(f"{method} {self.url}/{path}: {getattr(error, 'reason', error)}") from None
+                time.sleep(min(0.25 * 2 ** attempt, 4))
+                continue
+            if status in {502, 503, 504} and attempt < self.retries:
+                time.sleep(min(0.25 * 2 ** attempt, 4))
+                continue
+            try:
+                payload = json.loads(raw) if raw else {}
+            except ValueError:
+                payload = {"message": raw[:300].decode("utf-8", "replace")}
+            if 200 <= status < 300:
+                if method == "DELETE" or path == "v1/lineage" or isinstance(payload, dict) and isinstance(payload.get("id"), str):
+                    return payload
+                raise RequestError(status, f"{method} {path}: HTTP {status} response carries no entity id")
+            message = payload.get("message", payload) if isinstance(payload, dict) else payload
+            raise RequestError(status, f"{method} {path}: HTTP {status} {str(message)[:300]}")
+
+    def resolve(self, reference):
+        kind, fqn = reference.get("type"), reference.get("fullyQualifiedName")
+        if (kind, fqn) not in self.ids:
+            if kind not in REFERENCE_COLLECTIONS or not isinstance(fqn, str):
+                raise RequestError(400, f"cannot resolve a {kind} reference")
+            entity = self.call("GET", f"v1/{REFERENCE_COLLECTIONS[kind]}/name/{quote(fqn, safe='')}")
+            self.ids[kind, fqn] = entity["id"]
+        return {"id": self.ids[kind, fqn], "type": kind}
+
+
+def migrate_main(argv):
+    parser = argparse.ArgumentParser(prog="openmetadata_server.py migrate",
+                                     description="Create or update the stored catalog in a running OpenMetadata server.")
+    parser.add_argument("--db-file", type=Path, required=True, help="existing SQLite persistence file")
+    parser.add_argument("--target", required=True, help="API base URL, for example http://localhost:8585/api")
+    parser.add_argument("--token-file", type=Path, help="file containing a bot or personal access JWT")
+    parser.add_argument("--include-deleted", action="store_true",
+                        help="also migrate soft-deleted entities, deleting them again after lineage is added")
+    parser.add_argument("--retries", type=int, default=3, help="retries on 502-504 or connection errors")
+    parser.add_argument("--timeout", type=float, default=60, help="seconds per HTTP request")
+    args = parser.parse_args(argv)
+    target = args.target.rstrip("/")
+    if urlsplit(target).scheme not in {"http", "https"} or args.retries < 0 or args.timeout <= 0:
+        parser.error("--target must be an http(s) URL, --retries not negative and --timeout positive")
+    failures, failed, counts, aborted = [], set(), defaultdict(int), None
+    try:
+        token = None
+        if args.token_file:
+            token = args.token_file.expanduser().read_text(encoding="utf-8").strip()
+            if not token or not token.isascii() or any(char.isspace() for char in token):
+                raise ValueError(f"{args.token_file} must contain one nonempty ASCII token")
+        catalog = Catalog(target, token, args.timeout, args.retries)
+        requests, _ = catalog_requests(args.db_file, args.include_deleted)
+        for request in requests:
+            kind, fqn = request.get("entityType"), request.get("fullyQualifiedName")
+            label = f"{kind} {fqn}" if kind else "lineage {} -> {}".format(
+                *(request["body"]["edge"][end]["fullyQualifiedName"] for end in ("fromEntity", "toEntity")))
+            try:
+                if request["method"] == "DELETE":
+                    if (kind, fqn) in failed:
+                        continue
+                    reference = catalog.resolve({"type": kind, "fullyQualifiedName": fqn})
+                    catalog.call("DELETE", request["path"].replace("{id}", reference["id"]) + "?" + request["query"])
+                    counts["deleted"] += 1
+                    continue
+                body = copy.deepcopy(request["body"])
+                if kind is None:
+                    edge = body["edge"]
+                    if blocked := {(end["type"], end["fullyQualifiedName"]) for end in (edge["fromEntity"], edge["toEntity"])} & failed:
+                        raise RequestError(424, f"skipped because {' and '.join(' '.join(item) for item in sorted(blocked))} failed")
+                    edge["fromEntity"], edge["toEntity"] = catalog.resolve(edge["fromEntity"]), catalog.resolve(edge["toEntity"])
+                    if isinstance(edge.get("lineageDetails", {}).get("pipeline"), dict):
+                        edge["lineageDetails"]["pipeline"] = catalog.resolve(edge["lineageDetails"]["pipeline"])
+                    catalog.call("PUT", request["path"], body)
+                    counts["lineage"] += 1
+                    continue
+                parent = TYPES[kind].parent_kind, body.get(TYPES[kind].parent_field)
+                if parent in failed:
+                    raise RequestError(424, f"skipped because {' '.join(parent)} failed")
+                owners = []
+                for owner in body.get("owners") or []:
+                    try:
+                        owners.append(catalog.resolve(owner))
+                    except RequestError as error:
+                        failures.append(f"{label}: owner {owner['type']} {owner['fullyQualifiedName']} not found ({error})")
+                if "owners" in body:
+                    body["owners"] = owners
+                entity = catalog.call("PUT", request["path"], body)
+                catalog.ids[kind, fqn] = entity["id"]
+                counts["entities"] += 1
+            except RequestError as error:
+                failures.append(f"{label}: {error}")
+                if kind:
+                    failed.add((kind, fqn))
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
+        aborted = error
+    for failure in failures:
+        print(f"OpenMetadata migrate: {failure}", file=sys.stderr)
+    if aborted is not None:
+        parser.exit(1, f"OpenMetadata migrate failed: {aborted}\n")
+    summary = f"{counts['entities']} entities and {counts['lineage']} lineage edges"
+    if counts["deleted"]:
+        summary += f" (soft-deleted {counts['deleted']} again)"
+    summary += f" at {target}"
+    if failures:
+        parser.exit(1, f"OpenMetadata migrate failed: {len(failures)} failures; migrated {summary}\n")
+    print(f"Migrated {summary}")
+    return 0
+
+
+def serve_main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8585)
     parser.add_argument("--db-file", type=Path, help="SQLite file for catalog entities and lineage")
     parser.add_argument("--password-file", type=Path, help="File containing the bearer token")
     parser.add_argument("--version", default=API_VERSION, help="API version returned to clients")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     token = None
     if args.password_file:
         try:
@@ -753,7 +1101,17 @@ def main():
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["export"]:
+        return export_main(argv[1:])
+    if argv[:1] == ["migrate"]:
+        return migrate_main(argv[1:])
+    return serve_main(argv)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
