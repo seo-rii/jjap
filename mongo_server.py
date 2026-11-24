@@ -6,6 +6,8 @@ URI: mongodb://127.0.0.1:27017
 Add --db-file test.sqlite3 to retain databases between runs. Use a dedicated file.
 Export: python3 mongo_server.py export --db-file test.sqlite3 --out dump
 Add --format dbpath to export a WiredTiger directory using mongod and mongorestore.
+Import: python3 mongo_server.py import --db-file new.sqlite3 --dump dump (or --archive FILE)
+Add --enable-test-commands for configureFailPoint (failCommand) and {"jjapReset": 1}.
 The default listener is loopback. Use --password to prompt for a password,
 --password-file to read one from a file, or set MONGO_TEST_PASSWORD. These enable
 one test account with access to every database. The default username and
@@ -37,6 +39,7 @@ import base64
 import calendar
 import decimal
 import getpass
+import gzip
 import hashlib
 import hmac
 import itertools
@@ -79,7 +82,7 @@ from enum import Enum
 from functools import cmp_to_key, lru_cache
 from pathlib import Path
 from unicodedata import ucd_3_2_0
-from urllib.parse import parse_qsl, quote, quote_plus, unquote, urlsplit
+from urllib.parse import parse_qsl, quote, quote_plus, unquote, unquote_plus, urlsplit
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -816,6 +819,8 @@ class _MongoWireHandler(socketserver.BaseRequestHandler):
             return self.server.dispatch(database, command, state)
         except MongoError as exc:
             return exc.document()
+        except _WireError:
+            raise
         except Exception:
             _WIRE_LOG.exception("Unexpected MongoDB command failure")
             return MongoError("Internal server error", 1).document()
@@ -5241,6 +5246,7 @@ COMMANDS = {
     "bulkWrite": "bulk_write",
     "collMod": "coll_mod",
     "collStats": "coll_stats",
+    "configureFailPoint": "configure_fail_point",
     "connectionStatus": "connection_status",
     "count": "count",
     "create": "create",
@@ -5263,6 +5269,7 @@ COMMANDS = {
     "hostInfo": "host_info",
     "insert": "insert",
     "isMaster": "hello",
+    "jjapReset": "jjap_reset",
     "killCursors": "kill_cursors",
     "killSessions": "end_sessions",
     "listCollections": "list_collections",
@@ -5292,20 +5299,24 @@ WRITE_COMMANDS = {
     "dropindexes",
     "findandmodify",
     "insert",
+    "jjapreset",
     "renamecollection",
     "update",
 }
 ADMIN_COMMANDS = {
     "bulkwrite",
+    "configurefailpoint",
     "getcmdlineopts",
     "getparameter",
     "hostinfo",
+    "jjapreset",
     "listdatabases",
     "renamecollection",
     "serverstatus",
     "setparameter",
 }
 PRE_AUTH_COMMANDS = {"hello", "ismaster", "saslstart", "saslcontinue", "ping", "buildinfo"}
+TEST_COMMANDS = {"configurefailpoint", "jjapreset"}
 API_V1_COMMANDS = {
     "aggregate",
     "bulkwrite",
@@ -5512,6 +5523,7 @@ class MongoEngine:
         self.lock = threading.RLock()
         self.changed = threading.Condition(self.lock)
         self.cursors = {}
+        self.fail_points = {}
         self.started = time.monotonic()
         self.commands_run = 0
         self.settings = dict(settings or {})
@@ -5536,6 +5548,8 @@ class MongoEngine:
             raise MongoError("command is empty", 9)
         name = next(iter(command)).lower()
         methods = COMMAND_LOOKUP.get(name)
+        if name in TEST_COMMANDS and not self.settings.get("enable_test_commands"):
+            methods = None
         if methods is None:
             raise MongoError(f"no such command: {next(iter(command))!r}", 59)
         if self.account and not connection.get("authenticated") and name not in PRE_AUTH_COMMANDS:
@@ -5551,6 +5565,8 @@ class MongoEngine:
             check_write_concern(command)
         timeout = require_integer(command.get("maxTimeMS", 0), "maxTimeMS", 0)
         started = time.monotonic()
+        if self.settings.get("enable_test_commands"):
+            self.check_fail_command(db, command, connection, name)
         with self.changed:
             self.reap_cursors()
             cursor = None
@@ -5584,6 +5600,8 @@ class MongoEngine:
             if timeout and (time.monotonic() - started) * 1000 >= timeout:
                 raise MongoError("operation exceeded time limit", 50)
             response = {"ok": 1.0, **result}
+            if self.fail_points:
+                self.add_write_concern_failure(db, command, connection, name, response)
             if len(encode_bson(response)) + 32 > MAX_MESSAGE_SIZE:
                 raise MongoError("reply exceeds maximum message size", 10334)
             self.catalog.sql.commit()
@@ -5805,6 +5823,7 @@ class MongoEngine:
             "ttlMonitorSleepSecs": self.ttl_interval,
             "logicalSessionRefreshMillis": 300_000,
             "authenticationMechanisms": list(self.account.mechanisms) if self.account else [],
+            "enableTestCommands": bool(self.settings.get("enable_test_commands")),
         }
         if argument(command) == "*":
             return parameters
@@ -5820,6 +5839,8 @@ class MongoEngine:
         for key, value in list(command.items())[1:]:
             if key in COMMAND_METADATA:
                 continue
+            if key == "enableTestCommands":
+                raise MongoError("not allowed to change [enableTestCommands] at runtime", 20)
             if key not in names:
                 raise MongoError(f"unrecognized parameter: {key}")
             values[key] = getattr(self, names[key])
@@ -5897,7 +5918,9 @@ class MongoEngine:
     def cmd_list_commands(self, _db, _command, _connection):
         return {
             "commands": {
-                name: {"adminOnly": name.lower() in ADMIN_COMMANDS, "secondaryOk": True} for name in COMMANDS
+                name: {"adminOnly": name.lower() in ADMIN_COMMANDS, "secondaryOk": True}
+                for name in COMMANDS
+                if self.settings.get("enable_test_commands") or name.lower() not in TEST_COMMANDS
             }
         }
 
@@ -6968,8 +6991,229 @@ class MongoEngine:
                 except sqlite3.Error:
                     LOGGER.exception("TTL pass failed")
 
+    def cmd_configure_fail_point(self, _db, command, _connection):
+        name = require_string(argument(command), "configureFailPoint")
+        if name not in FAIL_POINT_NAMES:
+            raise MongoError(f"{name} not found", 266, codeName="FailPointSetFailed")
+        if "mode" not in command:
+            raise MongoError("When setting a failpoint, you must supply a 'mode'", 20)
+        mode, value = fail_point_mode(command["mode"])
+        data = command.get("data", {})
+        if not isinstance(data, dict):
+            raise MongoError("the 'data' option must be a JSON object", 14)
+        point = self.fail_points.setdefault(name, FailPoint())
+        point.mode, point.value, point.data = mode, value, data
+        return {"count": point.count}
+
+    def check_fail_command(self, db, command, connection, name):
+        """Apply failCommand before execution, outside the engine lock so blocking stalls one connection."""
+        if name in ("hello", "ismaster"):
+            client = command.get("client")
+            application = client.get("application") if isinstance(client, dict) else None
+            if isinstance(application, dict) and isinstance(application.get("name"), str):
+                connection.setdefault("appName", application["name"])
+            if "internalClient" in command:
+                connection["internalClient"] = True
+        with self.lock:
+            point = self.fail_points.get("failCommand")
+            data = point.data if point else {}
+            block, close = data.get("blockConnection") is True, data.get("closeConnection") is True
+            if not (
+                (block or close or "errorCode" in data)
+                and fail_command_applies(data, db, command, connection, name)
+                and point.fire()
+            ):
+                return
+        if block and isinstance(delay := data.get("blockTimeMS", 0), (int, float)) and delay > 0:
+            time.sleep(delay / 1000)
+        if close:
+            raise _WireError("Failing command due to 'failCommand' failpoint")
+        if "errorCode" in data:
+            code = require_integral_number(data["errorCode"], "errorCode", -(1 << 31), (1 << 31) - 1)
+            code_name = ERROR_NAMES.get(code) or FAIL_COMMAND_CODE_NAMES.get(code, f"Location{code}")
+            extra = data.get("errorExtraInfo")
+            if not isinstance(extra, dict):
+                if code in FAIL_COMMAND_EXTRA_INFO_CODES:
+                    raise MongoError(f"Missing required extra info for error code {code_name}", 40671)
+                extra = {}
+            details = {"codeName": code_name, **extra}
+            if labels := fail_command_labels(data, command, name, connection, code=code):
+                details["errorLabels"] = labels
+            raise MongoError("Failing command via 'failCommand' failpoint", code, **details)
+
+    def add_write_concern_failure(self, db, command, connection, name, response):
+        point = self.fail_points.get("failCommand")
+        if point is None or "writeConcernError" not in point.data or not supports_write_concern(name, command):
+            return
+        if not fail_command_applies(point.data, db, command, connection, name) or not point.fire():
+            return
+        failure = point.data["writeConcernError"]
+        response["writeConcernError"] = failure
+        code = failure.get("code") if isinstance(failure, dict) else None
+        if labels := fail_command_labels(point.data, command, name, connection, write_concern_code=code):
+            response["errorLabels"] = labels
+
+    def cmd_jjap_reset(self, _db, _command, _connection):
+        for table in ("mongo_documents", "mongo_indexes", "mongo_collections"):
+            self.catalog.sql.execute(f"DELETE FROM {table}")
+        if self.catalog.sql.execute("SELECT 1 FROM sqlite_master WHERE name='sqlite_sequence'").fetchone():
+            self.catalog.sql.execute("DELETE FROM sqlite_sequence WHERE name='mongo_documents'")
+        self.cursors.clear()
+        self.fail_points.clear()
+        ttl_interval = self.settings.get("ttl_interval", 60)
+        self.ttl_enabled, self.ttl_interval = bool(ttl_interval), ttl_interval or 60
+        self.ttl_changed.set()
+        return {"reset": True}
+
 
 COMMAND_LOOKUP = {name.lower(): f"cmd_{method}" for name, method in COMMANDS.items()}
+
+
+# Test controls: MongoDB's failCommand failpoint (enableTestCommands) and jjapReset
+
+FAIL_POINT_NAMES = {"failCommand"}
+COMMAND_NAMES = {name.lower(): name for name in COMMANDS}
+RETRYABLE_ERROR_CODES = {6, 7, 89, 91, 189, 262, 9001, 10107, 11600, 11602, 13435, 13436}
+TRANSIENT_TRANSACTION_CODES = {24, 63, 112, 150, 239, 241, 246, 249, 267, 13388}
+RETRYABLE_WRITE_COMMANDS = {"insert", "update", "delete", "findandmodify", "bulkwrite"}
+FAIL_COMMAND_EXTRA_INFO_CODES = {169, 249, 287, 11000, 13388}
+FAIL_COMMAND_CODE_NAMES = {
+    6: "HostUnreachable",
+    7: "HostNotFound",
+    8: "UnknownError",
+    11: "UserNotFound",
+    24: "LockTimeout",
+    64: "WriteConcernFailed",
+    79: "UnknownReplWriteConcern",
+    89: "NetworkTimeout",
+    91: "ShutdownInProgress",
+    96: "OperationFailed",
+    112: "WriteConflict",
+    117: "ConflictingOperationInProgress",
+    125: "CommandFailed",
+    133: "FailedToSatisfyReadPreference",
+    134: "ReadConcernMajorityNotAvailableYet",
+    175: "QueryPlanKilled",
+    189: "PrimarySteppedDown",
+    216: "ElectionInProgress",
+    225: "TransactionTooOld",
+    234: "RetryChangeStream",
+    237: "CursorKilled",
+    251: "NoSuchTransaction",
+    256: "TransactionCommitted",
+    262: "ExceededTimeLimit",
+    263: "OperationNotSupportedInTransaction",
+    266: "FailPointSetFailed",
+    280: "ChangeStreamFatalError",
+    9001: "SocketException",
+    10107: "NotWritablePrimary",
+    11600: "InterruptedAtShutdown",
+    11601: "Interrupted",
+    11602: "InterruptedDueToReplStateChange",
+    13388: "StaleConfig",
+    13435: "NotPrimaryNoSecondaryOk",
+    13436: "NotPrimaryOrSecondary",
+}
+
+
+@dataclass
+class FailPoint:
+    mode: str = "off"
+    value: float = 0
+    data: dict | None = None
+    count: int = 0
+
+    def fire(self):
+        """Count one matching evaluation the way mongod's FailPoint modes do."""
+        if self.mode == "off":
+            return False
+        if self.mode == "skip" and self.value > 0:
+            self.value -= 1
+            return False
+        if self.mode == "times":
+            self.value -= 1
+            if self.value <= 0:
+                self.mode = "off"
+        elif self.mode == "activationProbability" and random.random() >= self.value:
+            return False
+        self.count += 1
+        return True
+
+
+def fail_point_mode(spec):
+    if isinstance(spec, str):
+        if spec not in ("off", "alwaysOn"):
+            raise MongoError(f"unknown mode: {spec}")
+        return spec, 0
+    for option in ("times", "skip", "activationProbability") if isinstance(spec, dict) else ():
+        if option not in spec:
+            continue
+        value = spec[option]
+        if not numeric(value) or isinstance(value, Decimal128):
+            raise MongoError(f"'{option}' option to 'mode' must be a number", 14)
+        if option == "activationProbability":
+            if not 0 <= value <= 1:
+                raise MongoError(f"activationProbability must be between 0.0 and 1.0; found {value}")
+            return option, float(value)
+        if value < 0:
+            raise MongoError(f"'{option}' option to 'mode' must be positive")
+        return option, require_integral_number(value, option, 0, (1 << 31) - 1)
+    raise MongoError(
+        "'mode' must be one of 'off', 'alwaysOn', '{times:n}', '{skip:n}' or '{activationProbability:p}'"
+    )
+
+
+def command_namespace(db, command, name):
+    target = command.get("collection") if name == "getmore" else argument(command)
+    if not isinstance(target, str):
+        return f"{db}.$cmd"
+    return target if name == "renamecollection" else f"{db}.{target}"
+
+
+def fail_command_applies(data, db, command, connection, name):
+    canonical, commands = COMMAND_NAMES.get(name, name), data.get("failCommands")
+    if canonical == "configureFailPoint" or not isinstance(commands, list) or canonical not in commands:
+        return False
+    if "appName" in data and data["appName"] != connection.get("appName"):
+        return False
+    if "namespace" in data and data["namespace"] != command_namespace(db, command, name):
+        return False
+    return not connection.get("internalClient") or data.get("failInternalCommands") is True
+
+
+def supports_write_concern(name, command):
+    if name == "aggregate":
+        pipeline = command.get("pipeline")
+        return isinstance(pipeline, list) and bool(pipeline) and isinstance(pipeline[-1], dict) and bool(
+            pipeline[-1].keys() & {"$out", "$merge"}
+        )
+    return name in WRITE_COMMANDS or name in ("committransaction", "aborttransaction")
+
+
+def fail_command_labels(data, command, name, connection, *, code=None, write_concern_code=None):
+    """Return the failpoint's errorLabels, or the labels mongod derives for retryable writes and transactions."""
+    if isinstance(data.get("errorLabels"), list):
+        return data["errorLabels"]
+    if "txnNumber" not in command:
+        return []
+    labels = []
+    in_transaction = "autocommit" in command
+    finishing = name in ("committransaction", "aborttransaction")
+    if in_transaction and code is not None:
+        if finishing:
+            transient = code == 251 and write_concern_code is None
+        else:
+            transient = code in RETRYABLE_ERROR_CODES or code == 251
+        if transient or code in TRANSIENT_TRANSACTION_CODES:
+            labels.append("TransientTransactionError")
+    retryable = finishing if in_transaction else name in RETRYABLE_WRITE_COMMANDS
+    if (
+        retryable
+        and not connection.get("internalClient")
+        and (code in RETRYABLE_ERROR_CODES or write_concern_code in RETRYABLE_ERROR_CODES)
+    ):
+        labels.append("RetryableWriteError")
+    return labels
 
 
 # Extended JSON used by the command-line shell
@@ -7718,7 +7962,8 @@ def serve_main(argv):
     parser = argparse.ArgumentParser(
         description="Run a MongoDB-compatible test server (standard library only).",
         epilog=f"The default URI is mongodb://127.0.0.1:27017. "
-               f"See '{script} shell --help' for the client or '{script} export --help' for snapshot export.",
+               f"See '{script} shell --help' for the client, '{script} export --help' for snapshot export, "
+               f"or '{script} import --help' to load a mongodump.",
     )
     parser.add_argument("--host", default="127.0.0.1", help="listen address (default: %(default)s)")
     parser.add_argument("--port", type=port_number, default=27017, help="listen port (0 selects a free port)")
@@ -7734,6 +7979,8 @@ def serve_main(argv):
     parser.add_argument("--tls-cert", type=Path, help="PEM server certificate, optionally with private key")
     parser.add_argument("--tls-key", type=Path, help="separate PEM private key for --tls-cert")
     parser.add_argument("--verbose", action="store_true", help="show connection and protocol diagnostics")
+    parser.add_argument("--enable-test-commands", action="store_true",
+                        help="enable configureFailPoint (failCommand) and jjapReset, like mongod's enableTestCommands=1")
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
@@ -7749,7 +7996,12 @@ def serve_main(argv):
         if args.tls_cert:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(args.tls_cert, args.tls_key)
-        settings = {"host": args.host, "port": args.port, "ttl_interval": args.ttl_interval}
+        settings = {
+            "host": args.host,
+            "port": args.port,
+            "ttl_interval": args.ttl_interval,
+            "enable_test_commands": args.enable_test_commands,
+        }
         engine = MongoEngine(args.db_file, account=account, settings=settings)
     except (OSError, ValueError, sqlite3.Error, MongoError, EOFError) as exc:
         parser.error(str(exc) or "password input ended")
@@ -7990,6 +8242,413 @@ def export_main(argv):
     return 0
 
 
+# mongodump directory and archive import
+
+_ARCHIVE_MAGIC = struct.pack("<I", 0x8199E26D)
+_DUMP_SUFFIXES = (
+    (".metadata.json.gz", "metadata"),
+    (".metadata.json", "metadata"),
+    (".bson.gz", "data"),
+    (".bson", "data"),
+)
+_DUMP_IGNORED_FILES = {"prelude.json", "prelude.json.gz"}
+_IMPORT_SKIPPED = {
+    "system.users": "users and roles are not imported",
+    "system.roles": "users and roles are not imported",
+    "$admin.system.users": "users and roles are not imported",
+    "$admin.system.roles": "users and roles are not imported",
+    "$admin.system.version": "server version metadata is not imported",
+    "system.views": "views are restored from their metadata files",
+    "system.indexes": "indexes are restored from metadata files",
+    "system.namespaces": "legacy namespace catalogs are not imported",
+    "system.profile": "profiler data is not imported",
+}
+_IMPORT_STORAGE_OPTIONS = {"storageEngine", "indexOptionDefaults"}
+
+
+def _import_warning(message):
+    print(f"MongoDB import warning: {message}", file=sys.stderr)
+
+
+@lru_cache(maxsize=1)
+def _crc64_table():
+    table = []
+    for byte in range(256):
+        crc = byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xC96C5795D7870F42 if crc & 1 else crc >> 1
+        table.append(crc)
+    return table
+
+
+def _crc64(crc, data):
+    """Go's crc64.Update with the ECMA table, which mongodump uses for each archive namespace."""
+    table = _crc64_table()
+    crc ^= 0xFFFFFFFFFFFFFFFF
+    for byte in data:
+        crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    return crc ^ 0xFFFFFFFFFFFFFFFF
+
+
+def _next_bson(stream, label, *, terminators=False):
+    """Read one length-prefixed BSON document: b"" at the end, None for an archive terminator."""
+    prefix = stream.read(4)
+    if len(prefix) < 4:
+        if prefix:
+            raise ValueError(f"{label} is truncated")
+        return b""
+    size = _BSON_I32.unpack(prefix)[0]
+    if size == -1 and terminators:
+        return None
+    if not 5 <= size <= MAX_BSON_SIZE:
+        raise ValueError(f"{label} has an invalid BSON document length {size}")
+    rest = stream.read(size - 4)
+    if len(rest) != size - 4:
+        raise ValueError(f"{label} is truncated")
+    return prefix + rest
+
+
+def _decode_dump_document(raw, label):
+    try:
+        document, end = decode_bson(raw)
+        if end != len(raw):
+            raise BSONError("trailing bytes after the document")
+        return document
+    except BSONError as exc:
+        raise ValueError(f"{label} holds invalid BSON: {exc}") from None
+
+
+def _parse_dump_metadata(text, label):
+    try:
+        metadata = load_shell_json(text)
+    except ValueError as exc:
+        raise ValueError(f"{label} is not valid Extended JSON: {exc}") from None
+    if not isinstance(metadata, dict):
+        raise ValueError(f"{label} must hold a JSON object")
+    return metadata
+
+
+def _namespace_pattern(pattern):
+    """Compile a mongorestore --nsInclude pattern: * matches anything, backslash escapes * and itself."""
+    parts, escaped = [], False
+    for char in pattern:
+        if escaped or char not in "\\*":
+            parts.append(re.escape(char))
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        else:
+            parts.append(".*")
+    if escaped:
+        raise ValueError(f"--nsInclude pattern ends with a backslash: {pattern!r}")
+    return re.compile("".join(parts), re.DOTALL)
+
+
+class DumpImporter:
+    """Load mongodump namespaces through the engine's own create and createIndexes commands."""
+
+    def __init__(self, engine, only_database=None, patterns=(), *, skip_unsupported_indexes=False):
+        self.engine = engine
+        self.skip_unsupported_indexes = skip_unsupported_indexes
+        self.catalog = engine.catalog
+        self.only_database = only_database
+        self.patterns = list(patterns)
+        self.namespaces = {}
+        self.views = []
+        self.uuids = set()
+        self.documents = 0
+
+    def wanted(self, db, name):
+        if self.only_database is not None and db != self.only_database:
+            return False
+        if self.patterns and not any(pattern.fullmatch(f"{db}.{name}") for pattern in self.patterns):
+            return False
+        reason = _IMPORT_SKIPPED.get(name)
+        if (db, name) == ("admin", "system.version"):
+            reason = "server version metadata is not imported"
+        if reason:
+            _import_warning(f"skipped {db}.{name}: {reason}")
+            return False
+        return True
+
+    def create(self, db, name, options):
+        try:
+            self.engine.cmd_create(db, {"create": name, **options}, {})
+        except MongoError as exc:
+            raise ValueError(f"{db}.{name}: {exc}") from None
+        collection = self.catalog.collection(db, name)
+        # Keep the dump's option order; create normalizes values but not order.
+        ordered = {key: collection.options[key] for key in options if key in collection.options}
+        ordered.update(collection.options)
+        if list(ordered) != list(collection.options):
+            self.catalog.set_options(collection, ordered)
+        return collection
+
+    def begin(self, db, name, metadata):
+        ns = f"{db}.{name}"
+        try:
+            database_name(db)
+            collection_name(name)
+        except MongoError as exc:
+            raise ValueError(f"{ns}: {exc}") from None
+        if "$" in name or name.startswith("system.") or len(ns.encode("utf-8")) > 255:
+            raise ValueError(f"{ns} cannot be represented as an ordinary collection or view")
+        if (db, name) in self.namespaces:
+            raise ValueError(f"the dump holds {ns} more than once")
+        options = metadata.get("options", {})
+        indexes = metadata.get("indexes", [])
+        if not isinstance(options, dict) or not isinstance(indexes, list):
+            raise ValueError(f"{ns}: metadata options must be an object and indexes an array")
+        kind = metadata.get("type", "view" if "viewOn" in options else "collection")
+        if kind == "timeseries" or "timeseries" in options:
+            raise ValueError(f"{ns}: time series collections are unsupported")
+        if kind not in ("collection", "view") or (kind == "view") != ("viewOn" in options):
+            raise ValueError(f"{ns}: unsupported or inconsistent collection type {kind!r}")
+        options = dict(options)
+        for option in sorted(_IMPORT_STORAGE_OPTIONS & options.keys()):
+            del options[option]
+            _import_warning(f"{ns}: ignored the {option} collection option")
+        if kind == "view":
+            if indexes:
+                raise ValueError(f"{ns}: a view cannot have indexes")
+            self.namespaces[(db, name)] = None
+            self.views.append((db, name, options))
+            return
+        identifier = metadata.get("uuid")
+        if identifier is not None:
+            if not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-fA-F]{32}", identifier):
+                raise ValueError(f"{ns}: invalid collection UUID {identifier!r}")
+            identifier = bytes.fromhex(identifier)
+            if identifier in self.uuids:
+                raise ValueError(f"{ns}: the dump reuses collection UUID {identifier.hex()}")
+            self.uuids.add(identifier)
+        self.create(db, name, options)
+        if identifier is not None:
+            self.catalog.sql.execute(
+                "UPDATE mongo_collections SET uuid=? WHERE db=? AND name=?", (identifier, db, name)
+            )
+        self.namespaces[(db, name)] = indexes
+
+    def add(self, db, name, raw, label):
+        if self.namespaces[(db, name)] is None:
+            raise ValueError(f"{label}: {db}.{name} is a view but the dump holds documents for it")
+        document = _decode_dump_document(raw, label)
+        try:
+            if next(iter(document), None) == "_id":
+                with_id(document)
+            else:
+                # The server stores _id first, adding one when it is missing, exactly as an insert would.
+                raw = document_size(with_id(document))
+        except MongoError as exc:
+            raise ValueError(f"{label}: {exc}") from None
+        self.catalog.sql.execute("INSERT INTO mongo_documents (db, name, data) VALUES (?, ?, ?)", (db, name, raw))
+        self.documents += 1
+
+    def finish(self):
+        for (db, name), indexes in self.namespaces.items():
+            if indexes is None:
+                continue
+            supported = []
+            for spec in indexes:
+                try:
+                    check_index_spec(spec)
+                    supported.append(spec)
+                except MongoError as exc:
+                    label = f"{db}.{name}: index {spec.get('name') if isinstance(spec, dict) else spec!r} is unsupported"
+                    if not self.skip_unsupported_indexes:
+                        raise ValueError(f"{label}: {exc} (--skip-unsupported-indexes imports without it)") from None
+                    _import_warning(f"skipped {label}: {exc}")
+            indexes = supported
+            try:
+                self.engine.cmd_create_indexes(db, {"createIndexes": name, "indexes": indexes or [id_index()]}, {})
+            except MongoError as exc:
+                raise ValueError(f"{db}.{name}: cannot build its indexes: {exc}") from None
+            collection = self.catalog.collection(db, name)
+            if collection.capped:
+                count, size = self.catalog.data_stats(db, name)
+                maximum = collection.options.get("max", 2_147_483_647)
+                if (count > 1 and size > collection.options["size"]) or count > maximum:
+                    raise ValueError(f"capped collection {db}.{name} holds more data than its size or max allows")
+        for db, name, options in self.views:
+            self.create(db, name, options)
+        return len({db for db, _ in self.namespaces}), len(self.namespaces), self.documents
+
+
+def _open_dump_file(path):
+    return gzip.open(path, "rb") if path.name.endswith(".gz") else path.open("rb")
+
+
+def _dump_database_files(directory):
+    groups = {}
+    for path in sorted(directory.iterdir()):
+        for suffix, kind in _DUMP_SUFFIXES if path.is_file() else ():
+            if path.name.endswith(suffix) and len(path.name) > len(suffix):
+                entry = groups.setdefault(path.name[: -len(suffix)], {})
+                if kind in entry:
+                    raise ValueError(f"{directory} holds both compressed and uncompressed {kind} for {path.name}")
+                entry[kind] = path
+                break
+        else:
+            if path.name not in _DUMP_IGNORED_FILES:
+                _import_warning(f"skipped unrecognized dump entry {path}")
+    return groups
+
+
+def import_dump_directory(importer, root):
+    if not root.is_dir():
+        raise ValueError(f"Dump directory not found: {root}")
+    entries = sorted(root.iterdir())
+    if not any(entry.is_dir() for entry in entries):
+        # A single database directory, as for `mongorestore --db NAME DIR`.
+        databases = [(importer.only_database or root.resolve().name, root)]
+    else:
+        databases = []
+        for entry in entries:
+            if entry.is_dir():
+                databases.append((entry.name, entry))
+            elif entry.name in ("oplog.bson", "oplog.bson.gz"):
+                _import_warning(f"skipped {entry}: oplog replay is unsupported")
+            elif entry.name not in _DUMP_IGNORED_FILES:
+                _import_warning(f"skipped unrecognized dump entry {entry}")
+    for db, directory in databases:
+        if importer.only_database is not None and db != importer.only_database:
+            continue
+        for stem, files in _dump_database_files(directory).items():
+            metadata = {}
+            if "metadata" in files:
+                with _open_dump_file(files["metadata"]) as file:
+                    metadata = _parse_dump_metadata(file.read().decode("utf-8"), files["metadata"])
+            name = metadata.get("collectionName")
+            if not isinstance(name, str) or _dump_collection_basename(name) != stem:
+                # mongorestore takes the name from the file unless mongodump truncated it.
+                name = unquote_plus(stem)
+            if not importer.wanted(db, name):
+                continue
+            importer.begin(db, name, metadata)
+            if "data" in files:
+                with _open_dump_file(files["data"]) as stream:
+                    while raw := _next_bson(stream, files["data"]):
+                        importer.add(db, name, raw, files["data"])
+
+
+def import_archive(importer, stream, label):
+    if stream.read(4) != _ARCHIVE_MAGIC:
+        raise ValueError(f"{label} is not a mongodump archive")
+    if not (header := _next_bson(stream, label)):
+        raise ValueError(f"{label} is truncated")
+    _decode_dump_document(header, label)
+    namespaces = {}
+    while (raw := _next_bson(stream, label, terminators=True)) is not None:
+        if not raw:
+            raise ValueError(f"{label} ends inside its prelude")
+        entry = _decode_dump_document(raw, label)
+        db, name, text = entry.get("db"), entry.get("collection"), entry.get("metadata", "")
+        if not all(isinstance(value, str) for value in (db, name, text)):
+            raise ValueError(f"{label} has an invalid namespace entry in its prelude")
+        if (db, name) in namespaces:
+            raise ValueError(f"{label} lists {db}.{name} more than once")
+        if db == "":
+            _import_warning(f"skipped the archived {name or 'oplog'}: oplog replay is unsupported")
+            wanted = False
+        elif wanted := importer.wanted(db, name):
+            importer.begin(db, name, _parse_dump_metadata(text, f"{label} metadata for {db}.{name}") if text else {})
+        namespaces[(db, name)] = [wanted, 0, False]
+    while raw := _next_bson(stream, label):
+        block = _decode_dump_document(raw, label)
+        key = block.get("db"), block.get("collection")
+        state = namespaces.get(key)
+        if state is None or state[2]:
+            raise ValueError(f"{label} holds data for {key[0]}.{key[1]} outside its prelude entry")
+        if block.get("EOF"):
+            expected = block.get("CRC", 0)
+            if state[0] and isinstance(expected, int) and expected & 0xFFFFFFFFFFFFFFFF != state[1]:
+                raise ValueError(f"{label} checksum mismatch for {key[0]}.{key[1]}")
+            state[2] = True
+            if _next_bson(stream, label, terminators=True) is not None:
+                raise ValueError(f"{label} has no terminator after the end of {key[0]}.{key[1]}")
+            continue
+        while document := _next_bson(stream, label, terminators=True):
+            if state[0]:
+                state[1] = _crc64(state[1], document)
+                importer.add(*key, document, f"{label} ({key[0]}.{key[1]})")
+        if document is not None:
+            raise ValueError(f"{label} is truncated inside {key[0]}.{key[1]}")
+    if unfinished := [f"{db}.{name}" for (db, name), state in namespaces.items() if not state[2]]:
+        raise ValueError(f"{label} is truncated before the end of {unfinished[0]}")
+
+
+def import_archive_file(importer, path):
+    raw = sys.stdin.buffer if path == "-" else open(path, "rb")
+    try:
+        stream = gzip.GzipFile(fileobj=raw, mode="rb") if raw.peek(2)[:2] == b"\x1f\x8b" else raw
+        import_archive(importer, stream, "standard input" if path == "-" else path)
+    finally:
+        if path != "-":
+            raw.close()
+
+
+def _publish_import(staged, destination):
+    try:
+        os.link(staged, destination)
+    except FileExistsError:
+        raise FileExistsError(f"Database file already exists: {destination}") from None
+    except OSError:
+        # Without hard links, rename only while the destination is still absent.
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Database file already exists: {destination}") from None
+        os.rename(staged, destination)
+
+
+def import_main(argv):
+    parser = argparse.ArgumentParser(description="Build a new MongoDB test server SQLite file from mongodump output.")
+    parser.add_argument("--db-file", type=Path, required=True, help="new SQLite persistence file")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--dump", type=Path, metavar="DIR", help="mongodump --out directory, or one database directory")
+    source.add_argument("--archive", metavar="FILE", help="mongodump --archive file, or - for standard input")
+    parser.add_argument("--gzip", action="store_true", help="accepted for mongorestore compatibility; gzip is detected")
+    parser.add_argument("--db", help="import just one database (names a single-database directory)")
+    parser.add_argument("--nsInclude", action="append", default=[], metavar="PATTERN",
+                        help="import only matching db.collection namespaces; * is a wildcard (repeatable)")
+    parser.add_argument("--skip-unsupported-indexes", action="store_true",
+                        help="skip text, geospatial, hashed, and wildcard index definitions with a warning")
+    args = parser.parse_args(argv)
+    destination = args.db_file.expanduser().absolute()
+    staged = None
+    try:
+        if args.db is not None:
+            database_name(args.db)
+        patterns = [_namespace_pattern(pattern) for pattern in args.nsInclude]
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Database file already exists: {destination}")
+        if not destination.parent.is_dir():
+            raise FileNotFoundError(f"Directory not found: {destination.parent}")
+        descriptor, temporary = tempfile.mkstemp(prefix=".mongo-import-", suffix=".sqlite3", dir=destination.parent)
+        os.close(descriptor)
+        staged = Path(temporary)
+        engine = MongoEngine(staged)
+        try:
+            importer = DumpImporter(engine, args.db, patterns, skip_unsupported_indexes=args.skip_unsupported_indexes)
+            engine.catalog.sql.execute("BEGIN IMMEDIATE")
+            if args.dump is not None:
+                import_dump_directory(importer, args.dump.expanduser())
+            else:
+                import_archive_file(importer, args.archive)
+            databases, namespaces, documents = importer.finish()
+            engine.catalog.sql.commit()
+        finally:
+            engine.close()
+        _publish_import(staged, destination)
+    except (OSError, ValueError, EOFError, zlib.error, sqlite3.Error, MongoError) as exc:
+        parser.exit(1, f"MongoDB import failed: {exc}\n")
+    finally:
+        if staged is not None:
+            for leftover in (staged, Path(f"{staged}-journal")):
+                leftover.unlink(missing_ok=True)
+    print(f"Imported {documents} documents across {namespaces} collections/views in {databases} databases "
+          f"into {destination}")
+    return 0
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
     try:
@@ -7997,6 +8656,8 @@ def main(argv=None):
             return shell_main(argv[1:])
         if argv[:1] == ["export"]:
             return export_main(argv[1:])
+        if argv[:1] == ["import"]:
+            return import_main(argv[1:])
         return serve_main(argv[1:] if argv[:1] == ["serve"] else argv)
     except KeyboardInterrupt:
         return 130
