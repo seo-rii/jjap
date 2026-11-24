@@ -70,6 +70,20 @@ python3 mongo_server.py shell --eval '{"ping": 1}'
 
 The servers bind to loopback by default. Use `--port 0` to pick an available port and read it from the startup message. MongoDB, Neo4j, Redis, and Nexus Repository accept `--password-file` for their test accounts. These four servers keep data in memory by default, and the examples use `--db-file` to persist it.
 
+Each server can hand its persisted state to the original product. `export` writes files for the product's own import tool, and `migrate` loads a running instance through its API. Both read the persistence file without changing it, and `export` refuses an existing output path. `migrate` reads credentials only from files and exits with status 1 when any item fails.
+
+| Server | Command | Result |
+| --- | --- | --- |
+| MongoDB | `export` | `mongorestore` dump or WiredTiger `dbPath` |
+| Neo4j | `export` | `cypher-shell` script or `neo4j-admin database import` CSV files |
+| Redis | `export` | RDB file, or RESP commands for `redis-cli --pipe` |
+| Nexus Repository | `export`, `migrate` | REST create requests, native repository layouts, and OCI image layouts |
+| Apache Iceberg and Polaris | `export`, `migrate` | JDBC catalog database, or table registration in a REST catalog |
+| OpenLineage | `export`, `migrate` | NDJSON events replayed to `/api/v1/lineage` |
+| OpenSearch | `export`, `migrate` | Create-index bodies and `_bulk` files |
+| OpenMetadata | `export`, `migrate` | `Create*` and `AddLineage` request bodies in dependency order |
+| Apache Kafka | `migrate` | Record batches and committed group offsets replayed into a cluster |
+
 ### MongoDB
 
 Connect with a MongoDB client or use the built-in `shell` command.
@@ -97,6 +111,25 @@ python3 neo4j_server.py --db-file graph.sqlite3
 
 The server supports Bolt 4.4 and 5.0–5.4. Use `bolt://` for a direct connection or `neo4j://` for routing to the same node. The Cypher subset covers node and relationship operations, parameters, path matching, aggregation, transactions, and selected index and constraint commands. Index definitions are stored as metadata and queries scan the graph. Tests that rely on full Cypher, APOC, or distributed clustering require Neo4j. [Bolt protocol specification](https://neo4j.com/docs/bolt/current/bolt/handshake/)
 
+Run `export` to move a persisted graph into Neo4j 5. The default `cypher` format writes `neo4j.cypher` for `cypher-shell`. Run it against an empty database. It recreates labels, typed properties, relationships, indexes, and constraints, and removes its temporary import key at the end. [cypher-shell](https://neo4j.com/docs/operations-manual/current/cypher-shell/)
+
+```sh
+python3 neo4j_server.py export --db-file graph.sqlite3 --out ./graph-export
+cypher-shell -d neo4j -f ./graph-export/neo4j.cypher
+```
+
+The `csv` format writes typed CSV files for the offline importer, `import.args` with the matching options, and `schema.cypher`. Stop Neo4j and run the import from the export directory, with the database name before `@import.args`. The target database must be new or empty. Run `schema.cypher` with `cypher-shell` after the next start. [Import](https://neo4j.com/docs/operations-manual/current/import/)
+
+```sh
+python3 neo4j_server.py export --db-file graph.sqlite3 --out ./graph-csv --format csv
+cd graph-csv
+neo4j-admin database import full neo4j @import.args
+```
+
+- Byte arrays have no Cypher literal, so graphs that store them need the `csv` format. Empty lists need the `cypher` format.
+- Node key and property existence constraints require Neo4j Enterprise Edition. Both formats create them last.
+- Lists that mix integers and floats are exported as float lists. Points need finite coordinates.
+
 ### Redis
 
 ```sh
@@ -104,6 +137,20 @@ python3 redis_server.py --db-file redis.json
 ```
 
 The server supports RESP2 and RESP3, strings, hashes, lists, sets, sorted sets, streams, key expiration, scans, transactions with `WATCH`, and Pub/Sub. Pass `--cluster` to assign all slots to a single node for Redis Cluster clients. With `--db-file`, `SAVE` and clean shutdown write a JSON snapshot. Tests that rely on replication, Sentinel, Lua, or modules require Redis. [RESP specification](https://redis.io/docs/latest/develop/reference/protocol-spec/)
+
+Run `export` to convert the JSON snapshot into a file that Redis 7.0 or later loads. The default `rdb` format writes an RDB version 10 file for `redis-server` to load at startup. The `resp` format writes commands for `redis-cli --pipe`, which also load as a legacy append-only file. Both keep every data type, streams with consumer groups and pending entries, and absolute expiration times. Keys that have already expired are skipped. [Persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/) · [Bulk loading](https://redis.io/docs/latest/develop/clients/patterns/bulk-loading/)
+
+```sh
+python3 redis_server.py export --db-file redis.json --out ./data/dump.rdb
+redis-server --dir ./data --dbfilename dump.rdb --port 6380
+```
+
+```sh
+python3 redis_server.py export --db-file redis.json --out fixture.resp --format resp
+redis-cli -p 6380 --pipe < fixture.resp
+```
+
+The RESP commands replace keys with the same names, and Redis records stream consumer seen times when it runs them. Redis Cluster nodes accept only database 0, so pass `--db 0` for a cluster target.
 
 ### Nexus Repository
 
@@ -127,6 +174,22 @@ Upload and fetch a local `fixture.bin` with the Raw repository. Specify `--tls-c
 curl --fail --upload-file fixture.bin http://127.0.0.1:8081/repository/raw-hosted/fixture.bin
 curl --fail http://127.0.0.1:8081/repository/raw-hosted/fixture.bin
 ```
+
+Run `export` to write `repositories.json`, with one Nexus REST create request per repository, and each hosted repository's content in its native layout. Raw and Maven files keep their paths, PyPI files get a PEP 503 index, npm tarballs come with packuments, and each Docker image becomes an OCI image layout. Every asset is checked against its recorded checksum. Add `--include-proxy-cache` to include cached proxy content. [Repositories API](https://help.sonatype.com/en/repositories-api.html) · [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md)
+
+```sh
+python3 nexus_server.py export --db-file nexus.sqlite3 --out ./nexus-export
+skopeo copy --all oci:./nexus-export/content/docker-hosted/example/image:latest docker://nexus:8082/example/image:latest
+```
+
+Run `migrate` to copy repositories and content into a running Nexus Repository. It creates missing repositories through the REST API. It uploads raw and Maven files with HTTP PUT, PyPI files through the upload API, and npm versions with npm publish, and pushes Docker images through the registry API. Content that already exists with the same checksum is skipped, and differing content is reported without being overwritten. Docker repositories default to `TARGET/repository/<name>/v2`. Pass `--docker-endpoint NAME=URL` to use an HTTP connector port, which is also configured when the repository is created.
+
+```sh
+python3 nexus_server.py migrate --db-file nexus.sqlite3 --target http://nexus:8081 \
+  --username admin --password-file nexus-password.txt --docker-endpoint docker-hosted=http://nexus:8082
+```
+
+Proxy caches are not migrated. Nexus Repository 3.77 and later accept uploads only after the Community Edition license is accepted. Docker schema 2 manifests in an OCI layout need skopeo 1.19 or later.
 
 ### Apache Iceberg
 
@@ -192,6 +255,15 @@ curl -fsS -H "Authorization: Bearer $POLARIS_TOKEN" \
 
 Configure an Iceberg REST client with the catalog URI from the server list, warehouse `demo`, the OAuth2 token endpoint above, and scope `PRINCIPAL_ROLE:ALL`. [Polaris REST API guide](https://polaris.apache.org/guides/rest-api/)
 
+The Iceberg and Polaris tables are already Iceberg v2 files, so moving them to a real catalog only moves catalog pointers. `export` writes a SQLite database in the [JDBC catalog](https://iceberg.apache.org/docs/latest/jdbc/) schema shared by Iceberg Java's `JdbcCatalog` and [PyIceberg's `SqlCatalog`](https://py.iceberg.apache.org/configuration/#sql-catalog). `migrate` creates the namespaces and registers every table in a running REST catalog. Metadata locations are absolute `file://` URIs, so the target must read the same paths.
+
+```sh
+python3 iceberg_server.py --warehouse ./warehouse export --out catalog.db --catalog-name default
+python3 iceberg_server.py --warehouse ./warehouse migrate --target http://localhost:8181 --token-file catalog.token
+```
+
+For OAuth2 client credentials, pass `--credential-file` with a `client_id:client_secret` line. For a Polaris target, pass the target catalog name as the `migrate` option `--warehouse`. Add `--polaris-catalog NAME` to read one catalog of a `serve-polaris` warehouse. Polaris principals, roles, and grants are not migrated.
+
 ### OpenLineage
 
 | Area | Supported scope |
@@ -207,6 +279,13 @@ python3 openlineage_server.py --db-file lineage.sqlite3
 ```
 
 Point the OpenLineage HTTP transport at `http://127.0.0.1:5000`. Fetch a run at `/api/v1/runs/<run-id>` or query a graph at `GET /api/v1/lineage`. [HTTP transport configuration](https://openlineage.io/docs/client/python/configuration/) · [Marquez lineage API](https://marquezproject.ai/docs/api/get-lineage/)
+
+Run `export` to write the stored events in arrival order, one per line, as NDJSON or as gzip when the name ends in `.gz`. Run `migrate` to post them in order to a running collector such as Marquez. `--batch-size N` posts arrays to `/api/v1/lineage/batch` instead. Marquez does not deduplicate events, so a repeated run adds them again. [OpenLineage API](https://openlineage.io/apidocs/openapi/)
+
+```sh
+python3 openlineage_server.py export --db-file lineage.sqlite3 --out events.ndjson.gz
+python3 openlineage_server.py migrate --db-file lineage.sqlite3 --target http://localhost:5000 --token-file marquez.token
+```
 
 ### LiteLLM
 
@@ -272,6 +351,14 @@ curl -fsS 'http://127.0.0.1:9200/notes/_search'
 
 Use the OpenSearch Python client with the server endpoint above. [Python client](https://docs.opensearch.org/latest/clients/python-low-level/) · [Query DSL](https://docs.opensearch.org/latest/query-dsl/index/)
 
+Run `export` to write one [create index](https://docs.opensearch.org/latest/api-reference/index-apis/create-index/) body and one [`_bulk`](https://docs.opensearch.org/latest/api-reference/document-apis/bulk/) file per index, plus `manifest.json` with the load order. The bulk files hold every live document, including writes that were not yet refreshed. Run `migrate` to load a running cluster. It refuses indexes that already exist unless `--skip-existing` is given, adds aliases after the documents, and refreshes at the end. `--preserve-versions` keeps `_version` through `version_type=external`.
+
+```sh
+python3 opensearch_server.py export --db-file search.sqlite3 --out ./search-export
+python3 opensearch_server.py migrate --db-file search.sqlite3 --target https://localhost:9200 \
+  --username admin --password-file admin.pw --ca-file root-ca.pem
+```
+
 ### Apache Airflow
 
 | Area | Supported scope |
@@ -332,6 +419,13 @@ curl -fsS http://127.0.0.1:8585/api/v1/system/version
 
 Point an OpenMetadata Python SDK client at `http://127.0.0.1:8585/api`. [Python SDK](https://docs.open-metadata.org/v2.0.x/api-reference/sdk/python) · [Lineage API](https://docs.open-metadata.org/v2.0.x/api-reference/lineage/get)
 
+Run `export` to write `Create*` and `AddLineage` request bodies in dependency order, with `manifest.json` listing each request. Owners and lineage refer to entities by type and fully qualified name. Run `migrate` to send them to a running OpenMetadata server, which resolves those references to the target's ids. Soft-deleted entities are skipped unless `--include-deleted` is given. Version history is not migrated.
+
+```sh
+python3 openmetadata_server.py export --db-file metadata.sqlite3 --out ./metadata-export
+python3 openmetadata_server.py migrate --db-file metadata.sqlite3 --target http://localhost:8585/api --token-file bot.jwt
+```
+
 ### Apache Kafka
 
 | Area | Supported scope |
@@ -373,6 +467,14 @@ consumer.close()
 ```
 
 Set `--advertised-host` when clients connect using a hostname different from the listen address. [Kafka protocol](https://kafka.apache.org/42/design/protocol/) · [Record batch format](https://kafka.apache.org/42/implementation/message-format/)
+
+Kafka has no offline import format, so run `migrate` to replay a SQLite snapshot into a running cluster. It produces each partition's record batches in order with `acks=all` and keeps keys, values, headers, tombstones, compression, and CreateTime timestamps. Missing topics are created with the source partition count and the broker's default replication factor, which `--replication-factor` overrides. An existing topic is reused only when its partition count matches and it holds no records. `--allow-non-empty-topics` appends to it instead.
+
+```sh
+python3 kafka_server.py migrate --db-file kafka.sqlite3 --bootstrap-server broker1:9092 --offset-map offsets.json
+```
+
+The target assigns new offsets. `--offset-map` writes the source-to-target mapping as JSON. Committed consumer group offsets are translated through it and committed for groups with no active members on the target. Connections are plaintext. Use `--username` and `--password-file` for SASL/PLAIN.
 
 ### Apache Spark Standalone
 
