@@ -207,9 +207,11 @@ class KafkaServerTests(unittest.TestCase):
             self.assertEqual(hello.i32(), 0)
             hello.tagged_fields()
             hello.finish()
-            self.assertEqual(advertised, {0: (3, 5), 1: (4, 5), 2: (1, 2), 3: (0, 5), 8: (0, 3),
+            self.assertEqual(advertised, {0: (3, 8), 1: (4, 5), 2: (1, 7), 3: (0, 5), 8: (0, 3),
                                          9: (0, 2), 10: (0, 1), 11: (0, 1), 12: (0, 1), 13: (0, 1),
-                                         14: (0, 1), 18: (0, 4), 19: (0, 3)})
+                                         14: (0, 1), 15: (0, 4), 16: (0, 5), 18: (0, 4), 19: (0, 4),
+                                         20: (0, 3), 21: (0, 1), 22: (0, 1), 32: (0, 3), 33: (0, 1),
+                                         37: (0, 1), 42: (0, 1), 44: (0, 0), 47: (0, 0)})
             fallback = client.request(18, 55)
             self.assertEqual(fallback.i16(), 35)
             self.assertEqual(dict(fallback.array(lambda: (fallback.i16(), (fallback.i16(), fallback.i16())))), advertised)

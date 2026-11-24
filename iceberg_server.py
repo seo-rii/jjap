@@ -4,6 +4,10 @@
 Start: python3 iceberg_server.py --warehouse ./warehouse serve
 Use create-table, append, scan, delete and snapshots for local file operations.
 Use serve-polaris for a Polaris-compatible catalog with FILE storage.
+Use export (SQL catalog database) or migrate (any REST catalog) to hand the tables to real catalogs.
+Use export --relocate DIR --location-prefix URI to copy the table files with rewritten locations.
+Use import to build a catalog from a JDBC/SQL catalog database or a running REST catalog.
+POST /_jjap/reset drops every namespace and table (serve) or every catalog and principal (serve-polaris).
 
 Protocol references:
 https://iceberg.apache.org/spec/
@@ -32,6 +36,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import struct
 import sys
@@ -43,11 +48,19 @@ import zlib
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
-from urllib.request import url2pathname
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
+from urllib.request import Request, url2pathname, urlopen
 
 
 # Iceberg v2 table metadata and REST catalog.
+
+
+# Files get the mode a plain open() would give them, so engines running as other users can read them.
+_UMASK = os.umask(0)
+os.umask(_UMASK)
+_FILE_MODE = 0o666 & ~_UMASK
+_DIRECTORY_MODE = 0o777 & ~_UMASK
 
 
 class IcebergCatalogError(ValueError):
@@ -228,6 +241,20 @@ def _catalog_metadata(location):
     }
 
 
+def _catalog_metadata_file(path):
+    try:
+        opener = gzip.open if path.name.endswith((".gz", ".gz.metadata.json")) else open
+        with opener(path, "rb") as source:
+            raw = source.read(32 * 1024 * 1024 + 1)
+        if len(raw) > 32 * 1024 * 1024:
+            raise IcebergCatalogError("Table metadata exceeds the 32 MiB limit")
+        return _catalog_object(json.loads(raw), "Table metadata")
+    except (ValueError, OSError, EOFError) as exc:
+        if isinstance(exc, IcebergCatalogError):
+            raise
+        raise IcebergCatalogError(f"Could not read metadata file {path.name!r}") from exc
+
+
 def _catalog_response(metadata, location):
     return {"metadata": metadata, "metadata-location": location}
 
@@ -358,6 +385,12 @@ class IcebergCatalog:
         parent = self.local_path(properties["location"]) if "location" in properties else self.warehouse.joinpath(*namespace)
         return self.local_path(parent / f"{name}-{uuid.uuid4().hex}").as_uri()
 
+    def reset(self):
+        """Drop every namespace and table pointer; table files stay in the warehouse."""
+        with self._transaction(write=True) as connection:
+            connection.execute("DELETE FROM iceberg_tables")
+            connection.execute("DELETE FROM iceberg_namespaces")
+
     def list_namespaces(self, parent=()):
         parent = _catalog_namespace(parent) if parent else ()
         with self._transaction() as connection:
@@ -435,18 +468,7 @@ class IcebergCatalog:
             ]
 
     def _read_metadata(self, location):
-        path = self.local_path(location)
-        try:
-            opener = gzip.open if path.name.endswith((".gz", ".gz.metadata.json")) else open
-            with opener(path, "rb") as source:
-                raw = source.read(32 * 1024 * 1024 + 1)
-            if len(raw) > 32 * 1024 * 1024:
-                raise IcebergCatalogError("Table metadata exceeds the 32 MiB limit")
-            metadata = _catalog_object(json.loads(raw), "Table metadata")
-        except (ValueError, OSError, EOFError) as exc:
-            if isinstance(exc, IcebergCatalogError):
-                raise
-            raise IcebergCatalogError(f"Could not read metadata file {path.name!r}") from exc
+        metadata = _catalog_metadata_file(self.local_path(location))
         self._validate_metadata(metadata)
         return metadata
 
@@ -533,6 +555,9 @@ class IcebergCatalog:
             try:
                 output.write(payload)
                 output.flush()
+                # NamedTemporaryFile creates mode 0600 files.
+                if hasattr(os, "fchmod"):
+                    os.fchmod(output.fileno(), _FILE_MODE)
                 os.fsync(output.fileno())
             except BaseException:
                 temporary.unlink(missing_ok=True)
@@ -934,7 +959,24 @@ class _IcebergCatalogHandler(BaseHTTPRequestHandler):
             raise IcebergCatalogError("Invalid request URI") from exc
         return parts, query
 
+    def _reset_request(self):
+        """Handle POST /_jjap/reset; return False for other paths."""
+        if self._route()[0] != ["_jjap", "reset"]:
+            return False
+        if self.command != "POST":
+            raise IcebergCatalogError("Use POST to reset the test server", 405, "MethodNotAllowedException")
+        if self.headers.get("Content-Length"):
+            self._read_body()
+        self._reset()
+        self._respond(200, {"reset": True})
+        return True
+
+    def _reset(self):
+        self.server.catalog.reset()
+
     def _dispatch(self):
+        if self._reset_request():
+            return
         parts, query = self._route()
         method = self.command
         catalog = self.server.catalog
@@ -1072,6 +1114,13 @@ class _IcebergCatalogHandler(BaseHTTPRequestHandler):
 
     do_GET = do_HEAD = do_POST = do_DELETE = _handle
 
+    def _other_method(self):
+        if self._route()[0] == ["_jjap", "reset"]:
+            return self._handle()
+        self.send_error(501, f"Unsupported method ({self.command!r})")
+
+    do_PUT = do_PATCH = _other_method
+
 
 def iceberg_serve(warehouse, db_file=None, host="127.0.0.1", port=8181):
     """Serve an Iceberg catalog over HTTP until interrupted."""
@@ -1137,7 +1186,13 @@ class _PolarisHandler(_IcebergCatalogHandler):
             raise IcebergCatalogError("Unknown Polaris realm", 404, "NotFoundException")
         # Keep authorization, catalog deletion, and catalog operations ordered on one node.
         with state.lock:
-            if parts == ["api", "catalog", "v1", "oauth", "tokens"] and self.command == "POST":
+            if parts == ["_jjap", "reset"]:
+                if self.command == "POST":
+                    client, _ = state.authenticate(self.headers.get("Authorization", ""))
+                    if client != "root":
+                        raise _polaris_denied("Resetting the test server requires the root principal")
+                self._reset_request()
+            elif parts == ["api", "catalog", "v1", "oauth", "tokens"] and self.command == "POST":
                 self._token_request(state)
             elif parts[:3] == ["api", "management", "v1"]:
                 client, _ = state.authenticate(self.headers.get("Authorization", ""))
@@ -1301,6 +1356,9 @@ class _PolarisHandler(_IcebergCatalogHandler):
             return 201, None
         self._not_found()
 
+    def _reset(self):
+        self.server.polaris.reset()
+
     do_PUT = _IcebergCatalogHandler._handle
 
 
@@ -1347,6 +1405,18 @@ class _PolarisState:
                     FOREIGN KEY (catalog, role) REFERENCES polaris_catalog_roles(catalog, name) ON DELETE CASCADE
                 );
             """)
+
+    def reset(self):
+        """Return to the startup state: only the root principal, no catalogs. Caller holds the lock."""
+        with _catalog_transaction(self.db_file, True) as connection:
+            for name, payload in connection.execute("SELECT name, payload FROM polaris_catalogs").fetchall():
+                # Clear the catalog's own pointers, or a new catalog at the same location would revive its tables.
+                self._iceberg(name, json.loads(payload)).reset()
+            for table in ("polaris_catalog_grants", "polaris_catalog_assignments", "polaris_principal_assignments",
+                          "polaris_catalog_roles", "polaris_principal_roles", "polaris_principals", "polaris_catalogs"):
+                connection.execute(f"DELETE FROM {table}")
+        self.catalogs.clear()
+        self.tokens = {key: value for key, value in self.tokens.items() if value[1] == "root"}
 
     @staticmethod
     def entity(connection, table, name, catalog=None):
@@ -1569,7 +1639,7 @@ _AVRO_PRIMITIVES = {"null", "boolean", "int", "long", "float", "double", "bytes"
 _AVRO_NAMED = {"record", "enum", "fixed"}
 _AVRO_METADATA = {"type": "map", "values": "bytes"}
 _AVRO_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-_AVRO_CODECS = {"null", "deflate", "snappy", "bzip2", "xz"}
+_AVRO_CODECS = {"null", "deflate", "snappy", "bzip2", "xz", "zstandard"}
 
 
 def _iceberg_snappy_decode(data, max_output=_AVRO_MAX_BLOCK):
@@ -1916,6 +1986,16 @@ def _avro_decompress(codec, data):
         if decoder.unused_data and decoder.unused_data != trailer[:3]:
             raise ValueError("Unexpected data after Avro deflate stream")
         return result
+    if codec == "zstandard":
+        zstd = _avro_zstd()
+        try:
+            decoder = zstd.ZstdDecompressor()
+            result = decoder.decompress(data, max_length=_AVRO_MAX_BLOCK + 1)
+        except zstd.ZstdError as exc:
+            raise ValueError("Corrupt Avro zstandard block") from exc
+        if len(result) > _AVRO_MAX_BLOCK or not decoder.eof or decoder.unused_data:
+            raise ValueError("Invalid or oversized Avro zstandard block")
+        return result
     decoder = bz2.BZ2Decompressor() if codec == "bzip2" else lzma.LZMADecompressor(memlimit=_AVRO_MAX_BLOCK)
     result = decoder.decompress(data, max_length=_AVRO_MAX_BLOCK + 1)
     if len(result) > _AVRO_MAX_BLOCK or not decoder.eof or decoder.unused_data:
@@ -1931,7 +2011,16 @@ def _avro_compress(codec, data):
         return encoder.compress(data) + encoder.flush()
     if codec == "snappy":
         return _avro_snappy_encode(data) + binascii.crc32(data).to_bytes(4, "big")
+    if codec == "zstandard":
+        return _avro_zstd().compress(data)
     return bz2.compress(data) if codec == "bzip2" else lzma.compress(data)
+
+
+def _avro_zstd():
+    try:
+        return importlib.import_module("compression.zstd")
+    except ImportError as exc:
+        raise ValueError("Avro zstandard blocks need Python 3.14 with compression.zstd") from exc
 
 
 def avro_read(path):
@@ -2396,13 +2485,29 @@ def _pq_encode_definition(values):
     return struct.pack("<i", len(body)) + body
 
 
-def _pq_write_rowgroup(output, fields, rows):
+def _pq_compress(data, codec):
+    if codec == 0:
+        return data
+    if codec == 1:
+        return _avro_snappy_encode(data)
+    if codec == 2:
+        return gzip.compress(data, mtime=0)
+    if codec == 6:
+        try:
+            return importlib.import_module("compression.zstd").compress(data)
+        except ImportError as exc:
+            raise ParquetError("Writing ZSTD Parquet needs Python 3.14 with compression.zstd") from exc
+    raise ParquetError(f"Unsupported Parquet compression codec {codec}")
+
+
+def _pq_write_rowgroup(output, fields, rows, codec=0):
     start = len(output)
     columns = []
     for field in fields:
         name, kind = field["name"], field["type"]
         physical, width, decimal_type = _pq_type(kind)
         col_start = len(output)
+        uncompressed = 0
         null_count = 0
         for first in range(0, len(rows), 8192):
             values = [row.get(name) for row in rows[first:first + 8192]]
@@ -2417,18 +2522,21 @@ def _pq_write_rowgroup(output, fields, rows):
                 body = levels + _pq_encode_plain(present, physical)
             except (ValueError, TypeError, OverflowError, struct.error, decimal.DecimalException) as exc:
                 raise ParquetError(f"Invalid value in column {name!r}: {exc}") from exc
-            page_header = {1: (_PQ_I32, 0), 2: (_PQ_I32, len(body)), 3: (_PQ_I32, len(body)),
+            compressed = _pq_compress(body, codec)
+            page_header = {1: (_PQ_I32, 0), 2: (_PQ_I32, len(body)), 3: (_PQ_I32, len(compressed)),
                            5: (_PQ_STRUCT, {1: (_PQ_I32, len(values)), 2: (_PQ_I32, 0),
                                             3: (_PQ_I32, 3), 4: (_PQ_I32, 3),
                                             5: (_PQ_STRUCT, {3: (_PQ_I64, count)})})}
-            output.extend(_pq_compact_struct(page_header))
-            output.extend(body)
+            header = _pq_compact_struct(page_header)
+            output.extend(header)
+            output.extend(compressed)
+            uncompressed += len(header) + len(body)
             if len(output) > _PQ_MAX_SIZE:
                 raise ParquetError("Parquet file exceeds local test size limit")
         size = len(output) - col_start
         metadata = {1: (_PQ_I32, physical), 2: (_PQ_LIST, (_PQ_I32, [0, 3])),
-                    3: (_PQ_LIST, (_PQ_BINARY, [name])), 4: (_PQ_I32, 0),
-                    5: (_PQ_I64, len(rows)), 6: (_PQ_I64, size), 7: (_PQ_I64, size),
+                    3: (_PQ_LIST, (_PQ_BINARY, [name])), 4: (_PQ_I32, codec),
+                    5: (_PQ_I64, len(rows)), 6: (_PQ_I64, uncompressed), 7: (_PQ_I64, size),
                     9: (_PQ_I64, col_start), 12: (_PQ_STRUCT, {3: (_PQ_I64, null_count)})}
         columns.append({2: (_PQ_I64, 0), 3: (_PQ_STRUCT, metadata)})
     size = len(output) - start
@@ -2436,8 +2544,8 @@ def _pq_write_rowgroup(output, fields, rows):
             5: (_PQ_I64, start), 6: (_PQ_I64, size)}
 
 
-def parquet_write(path, fields, rows):
-    """Write an interoperable flat Parquet file with Iceberg field IDs."""
+def parquet_write(path, fields, rows, codec=0, key_value_metadata=None):
+    """Write an interoperable flat Parquet file with Iceberg field IDs and optional footer key-value pairs."""
     if not fields or len(fields) > 1024 or len(rows) > _PQ_MAX_ROWS:
         raise ParquetError("Invalid Parquet column or row count")
     ids, names = set(), set()
@@ -2454,11 +2562,15 @@ def parquet_write(path, fields, rows):
     if any(not isinstance(row, dict) or row.keys() - names for row in rows):
         raise ParquetError("Parquet rows must be objects keyed by schema fields")
     output = bytearray(b"PAR1")
-    groups = [_pq_write_rowgroup(output, fields, rows[start:start + 65_536])
+    groups = [_pq_write_rowgroup(output, fields, rows[start:start + 65_536], codec)
               for start in range(0, len(rows), 65_536)]
-    footer = _pq_compact_struct({1: (_PQ_I32, 1), 2: (_PQ_LIST, (_PQ_STRUCT, elements)), 3: (_PQ_I64, len(rows)),
-                                 4: (_PQ_LIST, (_PQ_STRUCT, groups)),
-                                 6: (_PQ_BINARY, "jjap Iceberg test server")})
+    footer = {1: (_PQ_I32, 1), 2: (_PQ_LIST, (_PQ_STRUCT, elements)), 3: (_PQ_I64, len(rows)),
+              4: (_PQ_LIST, (_PQ_STRUCT, groups)), 6: (_PQ_BINARY, "jjap Iceberg test server")}
+    if key_value_metadata:
+        footer[5] = (_PQ_LIST, (_PQ_STRUCT, [
+            {1: (_PQ_BINARY, key), **({2: (_PQ_BINARY, value)} if value is not None else {})}
+            for key, value in key_value_metadata]))
+    footer = _pq_compact_struct(footer)
     output.extend(footer)
     output.extend(struct.pack("<I", len(footer)))
     output.extend(b"PAR1")
@@ -2810,8 +2922,8 @@ def _pq_read_column(data, meta, field, specification, row_count, footer_start):
     return result
 
 
-def parquet_read(path):
-    """Return (Iceberg fields, rows) from a flat Parquet file."""
+def _pq_file(path):
+    """Read a Parquet file and decode its footer: (data, footer, footer offset)."""
     with Path(path).open("rb") as handle:
         data = handle.read(_PQ_MAX_SIZE + 1)
     if len(data) > _PQ_MAX_SIZE:
@@ -2822,10 +2934,16 @@ def parquet_read(path):
     if not 4 <= metadata_start < len(data) - 8:
         raise ParquetError("Invalid Parquet metadata size")
     raw = _ParquetReader(data, metadata_start, len(data) - 8)
+    metadata = raw.compact_struct()
+    if raw.pos != raw.limit or metadata[1] not in (1, 2) or 8 in metadata:
+        raise ParquetError("Invalid or encrypted Parquet metadata")
+    return data, metadata, metadata_start
+
+
+def parquet_read(path, details=None):
+    """Return (Iceberg fields, rows) from a flat Parquet file; details receives the codec and footer metadata."""
     try:
-        metadata = raw.compact_struct()
-        if raw.pos != raw.limit or metadata[1] not in (1, 2) or 8 in metadata:
-            raise ParquetError("Invalid or encrypted Parquet metadata")
+        data, metadata, metadata_start = _pq_file(path)
         schema = metadata[2]
         if not 2 <= len(schema) <= 1025 or 1 in schema[0] or schema[0].get(5) != len(schema) - 1:
             raise ParquetError("Only flat Parquet schemas are supported")
@@ -2848,6 +2966,10 @@ def parquet_read(path):
             rows.extend(dict(zip(names, row)) for row in zip(*columns))
         if len(rows) != metadata[3]:
             raise ParquetError("Parquet file row count does not match row groups")
+        if details is not None:
+            codecs = {chunk[3][4] for group in metadata[4] for chunk in group[1]}
+            details["codec"] = codecs.pop() if len(codecs) == 1 else 0
+            details["key_value_metadata"] = [(item[1], item.get(2)) for item in metadata.get(5, [])]
     except ParquetError:
         raise
     except (KeyError, IndexError, ValueError, TypeError, OverflowError, zlib.error) as exc:
@@ -3555,6 +3677,768 @@ def _ice_json_rows(stream):
                 raise IcebergFileError(f"Invalid JSON on line {line_number}: {exc}") from exc
 
 
+# SQL catalog export and REST catalog migration.
+
+
+# Schema V1 shared by Iceberg Java JdbcCatalog and PyIceberg SqlCatalog; iceberg_type marks tables vs views.
+_SQL_CATALOG_SCHEMA = (
+    "CREATE TABLE iceberg_tables (catalog_name VARCHAR(255) NOT NULL, table_namespace VARCHAR(255) NOT NULL, "
+    "table_name VARCHAR(255) NOT NULL, metadata_location VARCHAR(1000), previous_metadata_location VARCHAR(1000), "
+    "iceberg_type VARCHAR(5), PRIMARY KEY (catalog_name, table_namespace, table_name))",
+    "CREATE TABLE iceberg_namespace_properties (catalog_name VARCHAR(255) NOT NULL, namespace VARCHAR(255) NOT NULL, "
+    "property_key VARCHAR(255) NOT NULL, property_value VARCHAR(1000) NOT NULL, "
+    "PRIMARY KEY (catalog_name, namespace, property_key))",
+)
+_ICE_CATALOG_COLUMNS = {
+    "iceberg_namespaces": {"namespace", "properties"},
+    "iceberg_tables": {"namespace", "name", "metadata_location", "version"},
+}
+_ICE_REGISTER_ENDPOINT = "POST /v1/{prefix}/namespaces/{namespace}/register"
+
+
+@contextmanager
+def _ice_read_snapshot(db_file, columns, kind, hint=""):
+    """Open an existing SQLite file read-only and keep one read transaction for a consistent snapshot."""
+    path = Path(db_file).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"{kind} not found: {path}{hint}")
+    connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, isolation_level=None)
+    try:
+        try:
+            connection.execute("BEGIN")
+            for table, required in columns.items():
+                if not required <= {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}:
+                    raise ValueError
+        except (ValueError, sqlite3.DatabaseError) as exc:
+            raise ValueError(f"{path} is not {kind}{hint}") from exc
+        yield connection
+    finally:
+        connection.close()
+
+
+def _ice_catalog_source(warehouse, db_file, polaris_catalog=None):
+    """Return the catalog warehouse, namespaces (parents first) and table pointers of a local catalog."""
+    warehouse = _catalog_local_path(warehouse)
+    hint = ""
+    if polaris_catalog is not None:
+        name = _polaris_name(polaris_catalog)
+        state = db_file or warehouse / ".polaris.sqlite3"
+        columns = {"polaris_catalogs": {"name", "payload", "location"}}
+        with _ice_read_snapshot(state, columns, "a Polaris test server SQLite persistence file") as connection:
+            row = connection.execute("SELECT payload FROM polaris_catalogs WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            raise ValueError(f"Polaris catalog {name!r} was not found")
+        warehouse = _catalog_local_path(json.loads(row[0])["properties"]["default-base-location"])
+        db_file = warehouse / ".iceberg-catalog.sqlite3"
+    elif db_file is None and (warehouse / ".polaris.sqlite3").is_file():
+        hint = " (use --polaris-catalog NAME for a serve-polaris warehouse)"
+    db_file = db_file or warehouse / ".iceberg-catalog.sqlite3"
+    with _ice_read_snapshot(db_file, _ICE_CATALOG_COLUMNS, "an Iceberg test server SQLite catalog", hint) as connection:
+        namespaces = [
+            (_catalog_namespace(json.loads(key)), _catalog_properties(json.loads(properties)))
+            for key, properties in connection.execute("SELECT namespace, properties FROM iceberg_namespaces")
+        ]
+        tables = [
+            (_catalog_namespace(json.loads(key)), _catalog_component(name), location)
+            for key, name, location in connection.execute("SELECT namespace, name, metadata_location FROM iceberg_tables")
+        ]
+    if any(not isinstance(location, str) or not location for *_, location in tables):
+        raise ValueError("A table has no metadata location")
+    namespaces.sort(key=lambda item: (len(item[0]), item[0]))
+    return warehouse, namespaces, sorted(tables)
+
+
+def _ice_warn_escaped(command, tables):
+    for namespace, name, location in tables:
+        if location.startswith("file:") and "%" in location:
+            print(f"Iceberg {command}: warning: table {'.'.join((*namespace, name))} has percent-encoded file URIs, "
+                  "which Iceberg Java and PyIceberg open without decoding", file=sys.stderr)
+
+
+def _ice_sql_namespace(namespace):
+    if any("." in part for part in namespace):
+        raise ValueError(f"Namespace {list(namespace)!r} has a level containing '.', which SQL catalogs split into levels")
+    return ".".join(namespace)
+
+
+def _ice_previous_metadata(location):
+    metadata = _catalog_metadata_file(_catalog_local_path(location))
+    log = _catalog_array(metadata.get("metadata-log", []), "metadata-log")
+    if not log:
+        return None
+    previous = _catalog_object(log[-1], "metadata-log entry").get("metadata-file")
+    if not isinstance(previous, str) or not previous:
+        raise IcebergCatalogError("Invalid metadata-log entry")
+    return previous
+
+
+def export_sql_catalog(namespaces, tables, catalog_name, destination, previous=None):
+    """Write a new SQLite database in the JDBC/SQL catalog schema used by Iceberg Java and PyIceberg."""
+    connection = sqlite3.connect(destination, isolation_level=None)
+    try:
+        connection.execute("BEGIN")
+        for statement in _SQL_CATALOG_SCHEMA:
+            connection.execute(statement)
+        for namespace, properties in namespaces:
+            if properties.get("exists", "true") != "true":
+                raise ValueError(f"Namespace {'.'.join(namespace)!r} sets 'exists', which SQL catalogs reserve")
+            # Iceberg Java always stores the exists marker so a namespace survives removing all its properties.
+            rows = {"exists": "true", **properties}
+            connection.executemany(
+                "INSERT INTO iceberg_namespace_properties VALUES (?, ?, ?, ?)",
+                [(catalog_name, _ice_sql_namespace(namespace), key, value) for key, value in rows.items()],
+            )
+        for namespace, name, location in tables:
+            try:
+                before = previous[namespace, name] if previous is not None else _ice_previous_metadata(location)
+            except IcebergCatalogError as exc:
+                raise ValueError(f"Table {'.'.join((*namespace, name))!r}: {exc}") from exc
+            connection.execute(
+                "INSERT INTO iceberg_tables VALUES (?, ?, ?, ?, ?, 'TABLE')",
+                (catalog_name, _ice_sql_namespace(namespace), name, location, before),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _ice_export(args):
+    if (args.relocate is None) != (args.location_prefix is None):
+        raise ValueError("--relocate and --location-prefix must be used together")
+    if args.out is None and args.relocate is None:
+        raise ValueError("export needs --out, or --relocate with --location-prefix")
+    name = args.catalog_name or args.polaris_catalog or "default"
+    if not 0 < len(name) <= 255:
+        raise ValueError("--catalog-name must have 1 to 255 characters")
+    if args.relocate is not None:
+        warehouse, namespaces, tables = _ice_catalog_source(args.warehouse, args.db_file, args.polaris_catalog)
+        return _ice_relocated_export(args, name, _catalog_local_path(args.warehouse), namespaces, tables)
+    destination = args.out.expanduser().absolute()
+    if os.path.lexists(destination):
+        raise FileExistsError(f"Output file already exists: {destination}")
+    warehouse, namespaces, tables = _ice_catalog_source(args.warehouse, args.db_file, args.polaris_catalog)
+    _ice_warn_escaped("export", tables)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".iceberg-export-", dir=destination.parent) as temporary:
+        staged = Path(temporary) / "catalog.sqlite3"
+        export_sql_catalog(namespaces, tables, name, staged)
+        # A hard link publishes the complete file and, unlike rename, refuses an existing destination.
+        (os.rename if os.name == "nt" else os.link)(staged, destination)
+    print(f"Exported {len(tables)} tables in {len(namespaces)} namespaces to {destination} "
+          f"as SQL catalog {name!r} (warehouse {warehouse.as_uri()})")
+    return 0
+
+
+def _ice_secret_file(path, option):
+    value = path.expanduser().read_text(encoding="utf-8").rstrip("\r\n")
+    if not value or "\n" in value or "\r" in value or len(value) > 16384:
+        raise ValueError(f"{option} must contain one nonempty line")
+    return value
+
+
+def _ice_rest_error(status, data):
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict):
+        return f"HTTP {status} {error.get('type', 'error')}: {error.get('message', '')}"
+    if isinstance(error, str):
+        return f"HTTP {status} {error}"
+    return f"HTTP {status}"
+
+
+def _ice_location_key(location):
+    if isinstance(location, str) and location.startswith("file:"):
+        parts = urlsplit(location)
+        if parts.netloc in ("", "localhost") and not parts.query and not parts.fragment:
+            return unquote(parts.path)
+    return location
+
+
+class _IcebergRestTarget:
+    """Minimal Iceberg REST client: every response is returned as (status, JSON or None)."""
+
+    def __init__(self, url, timeout=60, option="--target"):
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.netloc or parts.query or parts.fragment:
+            raise ValueError(f"{option} must be an http:// or https:// REST catalog base URL")
+        self.url = url.rstrip("/")
+        self.timeout = timeout
+        self.headers = {"Accept": "application/json"}
+        self.prefix = ""
+        self.separator = "%1F"
+
+    def path(self, *parts):
+        return "/".join(("/v1", *((self.prefix,) if self.prefix else ()), *parts))
+
+    def namespace(self, namespace):
+        # The separator arrives URL-encoded; each level is encoded on its own, as Iceberg's RESTUtil does.
+        return self.separator.join(quote(part, safe="") for part in namespace)
+
+    def call(self, method, path, body=None, *, form=None, url=None):
+        headers, data = dict(self.headers), None
+        if form is not None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            data = urlencode(form).encode("utf-8")
+        elif body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        target = url or self.url + path
+        try:
+            with urlopen(Request(target, data=data, method=method, headers=headers), timeout=self.timeout) as response:
+                status, payload = response.status, response.read()
+        except HTTPError as exc:
+            with exc:
+                status, payload = exc.code, exc.read()
+        except URLError as exc:
+            raise OSError(f"{method} {target}: {exc.reason}") from exc
+        try:
+            return status, json.loads(payload) if payload else None
+        except ValueError:
+            return status, None
+
+
+def _ice_connect(args, require_register=True, option="--target"):
+    target = _IcebergRestTarget(args.target, option=option)
+    if args.token_file is not None:
+        target.headers["Authorization"] = "Bearer " + _ice_secret_file(args.token_file, "--token-file")
+    elif args.credential_file is not None:
+        client, separator, secret = _ice_secret_file(args.credential_file, "--credential-file").partition(":")
+        if not client or not separator or not secret:
+            raise ValueError("--credential-file must contain client_id:client_secret")
+        status, data = target.call("POST", None, url=args.oauth2_server_uri or target.url + "/v1/oauth/tokens", form={
+            "grant_type": "client_credentials", "client_id": client, "client_secret": secret, "scope": args.scope,
+        })
+        token = data.get("access_token") if isinstance(data, dict) else None
+        if status != 200 or not isinstance(token, str) or not token:
+            raise ValueError(f"OAuth2 token request failed: {_ice_rest_error(status, data)}")
+        target.headers["Authorization"] = "Bearer " + token
+    query = "?" + urlencode({"warehouse": args.target_warehouse}) if args.target_warehouse is not None else ""
+    status, config = target.call("GET", "/v1/config" + query)
+    if status != 200 or not isinstance(config, dict):
+        raise ValueError(f"GET /v1/config failed: {_ice_rest_error(status, config)}")
+    merged = {**(config.get("defaults") or {}), **(config.get("overrides") or {})}
+    prefix = args.prefix if args.prefix is not None else merged.get("prefix") or ""
+    target.prefix = quote(str(prefix).strip("/"), safe="/%:@!$&'()*+,;=")
+    separator = merged.get("namespace-separator")
+    if isinstance(separator, str) and separator:
+        target.separator = separator
+    endpoints = config.get("endpoints")
+    if require_register and isinstance(endpoints, list) and _ICE_REGISTER_ENDPOINT not in endpoints:
+        raise ValueError("The target catalog does not advertise table registration (" + _ICE_REGISTER_ENDPOINT + ")")
+    return target
+
+
+def _ice_migrate(args):
+    _, namespaces, tables = _ice_catalog_source(args.warehouse, args.db_file, args.polaris_catalog)
+    _ice_warn_escaped("migrate", tables)
+    target = _ice_connect(args)
+    counts = dict.fromkeys(("created", "existing", "registered", "present", "failed"), 0)
+    failed = set()
+
+    def fail(kind, label, message):
+        counts["failed"] += 1
+        print(f"Iceberg migrate: {kind} {label}: {message}", file=sys.stderr)
+
+    planned = set()
+    for namespace, properties in namespaces:
+        label = ".".join(namespace)
+        if namespace[:-1] in failed:
+            failed.add(namespace)
+            fail("namespace", label, "skipped because its parent namespace failed")
+            continue
+        path = target.path("namespaces", target.namespace(namespace))
+        status, data = (404, None) if namespace[:-1] in planned else target.call("GET", path)
+        if status == 404 and args.dry_run:
+            print(f"would create namespace {label}")
+            planned.add(namespace)
+            counts["created"] += 1
+            continue
+        if status == 404:
+            status, data = target.call("POST", target.path("namespaces"), {
+                "namespace": list(namespace), "properties": properties,
+            })
+            if 200 <= status < 300:
+                counts["created"] += 1
+                continue
+            if status == 409:
+                status, data = target.call("GET", path)
+        if status != 200:
+            failed.add(namespace)
+            fail("namespace", label, _ice_rest_error(status, data))
+            continue
+        counts["existing"] += 1
+        existing = (data.get("properties") if isinstance(data, dict) else None) or {}
+        differing = sorted(key for key, value in properties.items() if existing.get(key) != value)
+        if differing:
+            print(f"Iceberg migrate: warning: namespace {label} already exists with different properties: "
+                  f"{', '.join(differing)}", file=sys.stderr)
+
+    for namespace, name, location in tables:
+        label = ".".join((*namespace, name))
+        if namespace in failed:
+            fail("table", label, "skipped because its namespace failed")
+            continue
+        encoded = target.namespace(namespace)
+        table_path = target.path("namespaces", encoded, "tables", quote(name, safe=""))
+        status, data = (404, None) if namespace in planned else target.call("GET", table_path + "?snapshots=refs")
+        if status == 404 and args.dry_run:
+            # A dry run still reads every metadata file the target would have to load.
+            try:
+                _catalog_metadata_file(_catalog_local_path(location))
+            except (IcebergCatalogError, OSError) as exc:
+                fail("table", label, str(exc))
+                continue
+            print(f"would register table {label} at {location}")
+            counts["registered"] += 1
+            continue
+        if status == 200:
+            current = data.get("metadata-location") if isinstance(data, dict) else None
+            if _ice_location_key(current) == _ice_location_key(location):
+                counts["present"] += 1
+            else:
+                fail("table", label, f"conflict: the target table points at {current!r}, not {location!r}")
+            continue
+        if status == 404:
+            status, data = target.call("POST", target.path("namespaces", encoded, "register"), {
+                "name": name, "metadata-location": location,
+            })
+            if 200 <= status < 300:
+                counts["registered"] += 1
+                continue
+        fail("table", label, ("conflict: " if status == 409 else "") + _ice_rest_error(status, data))
+
+    verb, suffix = ("Would migrate", " (dry run, nothing was written)") if args.dry_run else ("Migrated", "")
+    print(f"{verb} to {target.url}: created {counts['created']} namespaces and registered {counts['registered']} "
+          f"tables; {counts['existing']} namespaces and {counts['present']} tables were already present; "
+          f"{counts['failed']} failed{suffix}")
+    if counts["failed"]:
+        raise ValueError(f"{counts['failed']} of {len(namespaces) + len(tables)} namespaces and tables failed")
+    return 0
+
+
+# Relocation: copy the files of every table and rewrite their absolute locations.
+
+
+_ICE_PATH_PROPERTIES = ("write.data.path", "write.metadata.path", "write.object-storage.path",
+                        "write.folder-storage.path")
+_ICE_DELETE_PATH_ID = 2147483546
+
+
+def _ice_file_path(location):
+    """The local path of a file location written by this server (percent-encoded) or by Iceberg (raw)."""
+    path = _catalog_local_path(location)
+    if isinstance(location, str) and location.startswith("file:") and "%" in location and not path.exists():
+        raw = Path(urlsplit(location).path)
+        if raw.exists():
+            return raw.resolve()
+    return path
+
+
+def _ice_map_entries(value):
+    """Iceberg integer-keyed maps decode as key/value records and are written from dicts."""
+    if isinstance(value, dict):
+        return dict(value)
+    return {item["key"]: item["value"] for item in value or ()}
+
+
+def _ice_avro_copy(source, target, transform):
+    schema, header, records = avro_read(source)
+    codec = header.get("avro.codec", b"null").decode("ascii")
+    metadata = {key: value for key, value in header.items() if not key.startswith("avro.")}
+    avro_write(target, schema, [transform(record) for record in records], metadata, codec=codec)
+    return target.stat().st_size
+
+
+class _IcebergRelocation:
+    """Copy every file reachable from table metadata below a source root and rewrite locations to a new prefix."""
+
+    def __init__(self, root, prefix, destination):
+        self.root, self.prefix, self.destination = root, prefix.rstrip("/"), destination
+        self.done = {}
+        self.files = 0
+
+    def relative(self, location):
+        if not isinstance(location, str) or not location:
+            raise IcebergFileError(f"Invalid file location {location!r}")
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", location) and not location.startswith("file:"):
+            raise IcebergFileError(f"{location} is not a local file location")
+        path = _ice_file_path(location)
+        try:
+            return path, path.relative_to(self.root)
+        except ValueError:
+            raise IcebergFileError(f"{location} is outside the source warehouse {self.root}") from None
+
+    def location(self, location):
+        # Iceberg Java and PyIceberg open URI paths literally, so the new locations are not percent-encoded.
+        return f"{self.prefix}/{self.relative(location)[1].as_posix()}"
+
+    def target(self, relative):
+        path = self.destination.joinpath(*relative.parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.files += 1
+        return path
+
+    def once(self, location, action, required=True):
+        """Relocate one file once; return (new location, new size or None, extra result)."""
+        path, relative = self.relative(location)
+        if path not in self.done:
+            if not path.is_file():
+                if required:
+                    raise IcebergFileError(f"Missing table file {location}")
+                print(f"Iceberg export: warning: {location} is missing; its location is rewritten without a copy",
+                      file=sys.stderr)
+                self.done[path] = (self.location(location), None, None)
+            else:
+                self.done[path] = (self.location(location), *action(path, self.target(relative)))
+        return self.done[path]
+
+    def copy(self, location, required=True):
+        def action(source, target):
+            with source.open("rb") as reader, target.open("xb") as writer:
+                shutil.copyfileobj(reader, writer)
+            return target.stat().st_size, None
+        return self.once(location, action, required)[0]
+
+    def table(self, metadata_location):
+        path, _ = self.relative(metadata_location)
+        current = _catalog_metadata_file(path)
+        history = [entry.get("metadata-file") for entry in _catalog_array(current.get("metadata-log", []), "metadata-log")]
+        new_location = self.metadata(metadata_location, current, True)
+        for location in history:
+            self.once(location, lambda source, target: (self.write_metadata(
+                target, self.rewrite(_catalog_metadata_file(source), False)), None), required=False)
+        previous = self.location(history[-1]) if history else None
+        return new_location, previous
+
+    def metadata(self, location, document, required):
+        return self.once(location, lambda source, target: (
+            self.write_metadata(target, self.rewrite(document, required)), None), required)[0]
+
+    @staticmethod
+    def write_metadata(target, document):
+        payload = json.dumps(document, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        with (gzip.open if target.name.endswith((".gz", ".gz.metadata.json")) else open)(target, "xb") as output:
+            output.write(payload)
+        return target.stat().st_size
+
+    def rewrite(self, document, required):
+        document = copy.deepcopy(_catalog_object(document, "Table metadata"))
+        document["location"] = self.location(document.get("location"))
+        properties = _catalog_object(document.get("properties", {}), "Table properties")
+        for key in _ICE_PATH_PROPERTIES:
+            if key in properties:
+                properties[key] = self.location(properties[key])
+        for entry in _catalog_array(document.get("metadata-log", []), "metadata-log"):
+            entry["metadata-file"] = self.location(entry.get("metadata-file"))
+        for snapshot in _catalog_array(document.get("snapshots", []), "snapshots"):
+            deltas = {"total": 0, "added": 0, "removed": 0}
+            if "manifest-list" in snapshot:
+                snapshot["manifest-list"], _, changes = self.once(snapshot["manifest-list"], lambda source, target: (
+                    self.manifest_list(source, target, required)), required)
+                for status, owner, delta in changes or ():
+                    deltas["total"] += delta if status != 2 else 0
+                    deltas["added"] += delta if status == 1 and owner == snapshot.get("snapshot-id") else 0
+                    deltas["removed"] += delta if status == 2 and owner == snapshot.get("snapshot-id") else 0
+            if "manifests" in snapshot:
+                snapshot["manifests"] = [self.once(item, lambda source, target: self.manifest(
+                    source, target, None, required), required)[0] for item in snapshot["manifests"]]
+            summary = snapshot.get("summary") or {}
+            for key, name in (("total-files-size", "total"), ("added-files-size", "added"),
+                              ("removed-files-size", "removed")):
+                if deltas[name] and re.fullmatch(r"-?[0-9]+", str(summary.get(key, ""))):
+                    summary[key] = str(int(summary[key]) + deltas[name])
+        for key in ("statistics", "partition-statistics"):
+            for entry in _catalog_array(document.get(key, []), key):
+                entry["statistics-path"] = self.copy(entry.get("statistics-path"), required)
+        return document
+
+    def manifest_list(self, source, target, required):
+        changes = []
+
+        def transform(record):
+            record["manifest_path"], length, entries = self.once(record["manifest_path"], lambda path, output: (
+                self.manifest(path, output, record.get("added_snapshot_id"), required)), required)
+            if length is not None:
+                record["manifest_length"] = length
+            changes.extend(entries or ())
+            return record
+
+        return _ice_avro_copy(source, target, transform), changes
+
+    def manifest(self, source, target, added_snapshot_id, required):
+        changes = []
+
+        def transform(entry):
+            data_file = entry["data_file"]
+            old_size = data_file.get("file_size_in_bytes")
+            data_file["file_path"], size, metrics = self.once(data_file["file_path"], lambda path, output: (
+                self.data_file(path, output, data_file)), required)
+            if data_file.get("referenced_data_file"):
+                data_file["referenced_data_file"] = self.location(data_file["referenced_data_file"])
+            if size is not None and size != old_size:
+                data_file["file_size_in_bytes"] = size
+                owner = entry.get("snapshot_id") or added_snapshot_id
+                changes.append((entry.get("status"), owner, size - (old_size or 0)))
+            for key, values in (metrics or {}).items():
+                if data_file.get(key) is None:
+                    continue
+                if key == "split_offsets":
+                    data_file[key] = values
+                    continue
+                current = _ice_map_entries(data_file[key])
+                current.update({field: value for field, value in values.items() if field in current})
+                data_file[key] = current
+            return entry
+
+        return _ice_avro_copy(source, target, transform), changes
+
+    def data_file(self, source, target, data_file):
+        """Copy a data or delete file. Position delete files name data files, so they are re-encoded."""
+        file_format = str(data_file.get("file_format", "")).upper()
+        if data_file.get("content", 0) != 1:
+            with source.open("rb") as reader, target.open("xb") as writer:
+                shutil.copyfileobj(reader, writer)
+            return target.stat().st_size, None
+        if file_format == "AVRO":
+            paths = []
+
+            def transform(record):
+                record["file_path"] = self.location(record["file_path"])
+                paths.append(record["file_path"])
+                return record
+
+            size = _ice_avro_copy(source, target, transform)
+            return size, self.bounds(paths)
+        if file_format != "PARQUET":
+            raise IcebergFileError(f"{source}: {file_format} position delete files cannot be relocated")
+        details = {}
+        fields, rows = parquet_read(source, details)
+        column = next((field["name"] for field in fields if field["id"] == _ICE_DELETE_PATH_ID), "file_path")
+        for row in rows:
+            row[column] = self.location(row[column])
+        parquet_write(target, fields, rows, details["codec"], details["key_value_metadata"])
+        _, footer, _ = _pq_file(target)
+        ids = [element.get(9) for element in footer[2][1:]]
+        sizes = {}
+        for group in footer[4]:
+            for field_id, chunk in zip(ids, group[1]):
+                sizes[field_id] = sizes.get(field_id, 0) + chunk[3][7]
+        metrics = self.bounds([row[column] for row in rows])
+        metrics["column_sizes"] = sizes
+        metrics["split_offsets"] = [group[5] for group in footer[4]]
+        return target.stat().st_size, metrics
+
+    @staticmethod
+    def bounds(paths):
+        if not paths:
+            return {}
+        return {"lower_bounds": {_ICE_DELETE_PATH_ID: min(paths).encode("utf-8")},
+                "upper_bounds": {_ICE_DELETE_PATH_ID: max(paths).encode("utf-8")}}
+
+
+def _ice_publish_directory(staged, destination):
+    staged.chmod(_DIRECTORY_MODE)
+    if os.name == "nt":
+        staged.rename(destination)
+        return
+    destination.mkdir(mode=0o700)
+    try:
+        staged.replace(destination)
+    except BaseException:
+        destination.rmdir()
+        raise
+
+
+def _ice_relocated_export(args, name, warehouse, namespaces, tables):
+    prefix = args.location_prefix
+    if not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", prefix or "") or "\x00" in prefix:
+        raise ValueError("--location-prefix must be an absolute URI such as s3://bucket/warehouse or file:///path")
+    relocated_root = args.relocate.expanduser().absolute()
+    destination = args.out.expanduser().absolute() if args.out else None
+    for path in (relocated_root, destination):
+        if path is not None and os.path.lexists(path):
+            raise FileExistsError(f"Output already exists: {path}")
+    relocated_root.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".iceberg-relocate-", dir=relocated_root.parent) as temporary:
+        staged = Path(temporary) / "files"
+        staged.mkdir()
+        relocation = _IcebergRelocation(warehouse, prefix, staged)
+        pointers, previous = [], {}
+        for namespace, table, location in tables:
+            label = ".".join((*namespace, table))
+            try:
+                new_location, before = relocation.table(location)
+            except (IcebergFileError, IcebergCatalogError, OSError) as exc:
+                raise ValueError(f"Table {label}: {exc}") from exc
+            pointers.append((namespace, table, new_location))
+            previous[namespace, table] = before
+        moved = []
+        for namespace, properties in namespaces:
+            properties = dict(properties)
+            if "location" in properties:
+                try:
+                    properties["location"] = relocation.location(properties["location"])
+                except IcebergFileError as exc:
+                    print(f"Iceberg export: warning: namespace {'.'.join(namespace)} keeps its location: {exc}",
+                          file=sys.stderr)
+            moved.append((namespace, properties))
+        if destination is not None:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            catalog = Path(temporary) / "catalog.sqlite3"
+            export_sql_catalog(moved, pointers, name, catalog, previous)
+        _ice_publish_directory(staged, relocated_root)
+        if destination is not None:
+            try:
+                (os.rename if os.name == "nt" else os.link)(catalog, destination)
+            except BaseException:
+                shutil.rmtree(relocated_root, ignore_errors=True)
+                raise
+    catalog_note = f" and SQL catalog {name!r} to {destination}" if destination is not None else ""
+    print(f"Relocated {len(tables)} tables ({relocation.files} files) from {warehouse.as_uri()} to {relocated_root} "
+          f"with locations under {relocation.prefix}{catalog_note}")
+    return 0
+
+
+# Import into a new catalog database.
+
+
+def _ice_split_namespace(value, label):
+    parts = tuple(value.split("."))
+    try:
+        return _catalog_namespace(parts)
+    except IcebergCatalogError as exc:
+        raise ValueError(f"{label}: invalid namespace {value!r}") from exc
+
+
+def _ice_sql_catalog_source(path, catalog_name):
+    """Namespaces and tables of a JDBC/SQL catalog database (schema V0 or V1, Iceberg Java or PyIceberg)."""
+    columns = {"iceberg_tables": {"catalog_name", "table_namespace", "table_name", "metadata_location"}}
+    with _ice_read_snapshot(path, columns, "an Iceberg JDBC/SQL catalog database") as connection:
+        names = {row[0] for row in connection.execute("SELECT DISTINCT catalog_name FROM iceberg_tables")}
+        typed = "iceberg_type" in {row[1] for row in connection.execute("PRAGMA table_info(iceberg_tables)")}
+        rows = connection.execute(
+            "SELECT table_namespace, table_name, metadata_location, " + ("iceberg_type" if typed else "NULL") +
+            " FROM iceberg_tables WHERE catalog_name = ? ORDER BY table_namespace, table_name", (catalog_name,),
+        ).fetchall()
+        properties = []
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE name = 'iceberg_namespace_properties'").fetchone():
+            properties = connection.execute(
+                "SELECT namespace, property_key, property_value FROM iceberg_namespace_properties "
+                "WHERE catalog_name = ? ORDER BY namespace, rowid", (catalog_name,)).fetchall()
+            names.update(row[0] for row in connection.execute(
+                "SELECT DISTINCT catalog_name FROM iceberg_namespace_properties"))
+    if catalog_name not in names:
+        raise ValueError(f"Catalog {catalog_name!r} was not found in {path}; it holds {sorted(names) or 'no catalogs'}")
+    namespaces, tables = {}, []
+    for namespace, key, value in properties:
+        namespace = _ice_split_namespace(namespace, "iceberg_namespace_properties")
+        values = namespaces.setdefault(namespace, {})
+        # JDBC catalogs store "exists" only to keep namespaces without properties.
+        if not (key == "exists" and value == "true"):
+            values[key] = value if value is not None else ""
+    for namespace, name, location, kind in rows:
+        label = f"{namespace}.{name}"
+        if kind is not None and str(kind).upper() == "VIEW":
+            print(f"Iceberg import: warning: skipping view {label}; the test server has no views", file=sys.stderr)
+            continue
+        tables.append((_ice_split_namespace(namespace, label), _catalog_component(name), location))
+    return namespaces, tables
+
+
+def _ice_rest_source(args):
+    target = _ice_connect(args, require_register=False, option="--source")
+
+    def pages(path, key, query=None):
+        token, values = None, []
+        for _ in range(100_000):
+            parameters = dict(query or {}, **({"pageToken": token} if token else {}))
+            status, data = target.call("GET", path + ("?" + urlencode(parameters) if parameters else ""))
+            if status != 200 or not isinstance(data, dict) or not isinstance(data.get(key), list):
+                raise ValueError(f"GET {path} failed: {_ice_rest_error(status, data)}")
+            values += data[key]
+            token = data.get("next-page-token")
+            if not token:
+                return values
+        raise ValueError(f"GET {path}: too many result pages")
+
+    separator = unquote(target.separator)
+    namespaces, tables, pending, seen = {}, [], [()], set()
+    while pending:
+        parent = pending.pop()
+        query = {"parent": separator.join(parent)} if parent else None
+        for child in pages(target.path("namespaces"), "namespaces", query):
+            child = _catalog_namespace(child)
+            if child in seen or child[:len(parent)] != parent:
+                continue
+            seen.add(child)
+            status, data = target.call("GET", target.path("namespaces", target.namespace(child)))
+            if status != 200 or not isinstance(data, dict):
+                raise ValueError(f"Loading namespace {'.'.join(child)} failed: {_ice_rest_error(status, data)}")
+            namespaces[child] = _catalog_properties(data.get("properties") or {})
+            pending.append(child)
+            encoded = target.namespace(child)
+            for identifier in pages(target.path("namespaces", encoded, "tables"), "identifiers"):
+                name = _catalog_component(_catalog_object(identifier, "Table identifier").get("name"))
+                status, data = target.call("GET", target.path("namespaces", encoded, "tables", quote(name, safe="")) +
+                                           "?snapshots=refs")
+                location = data.get("metadata-location") if isinstance(data, dict) else None
+                if status != 200 or not isinstance(location, str):
+                    raise ValueError(f"Loading table {'.'.join((*child, name))} failed: {_ice_rest_error(status, data)}")
+                tables.append((child, name, location))
+    return target.url, namespaces, tables
+
+
+def _ice_import(args):
+    warehouse = _catalog_local_path(args.import_warehouse or args.warehouse)
+    if not warehouse.is_dir():
+        raise ValueError(f"The warehouse directory does not exist: {warehouse}")
+    db_file = args.import_db_file or args.db_file
+    destination = Path(db_file).expanduser().absolute() if db_file else warehouse / ".iceberg-catalog.sqlite3"
+    if os.path.lexists(destination):
+        raise FileExistsError(f"The catalog database already exists: {destination}")
+    if args.sql_catalog is not None:
+        origin = Path(args.sql_catalog).expanduser().resolve()
+        namespaces, tables = _ice_sql_catalog_source(origin, args.catalog_name)
+        origin = f"SQL catalog {args.catalog_name!r} in {origin}"
+    else:
+        origin, namespaces, tables = _ice_rest_source(args)
+    for namespace, *_ in tables:
+        namespaces.setdefault(namespace, {})
+    for namespace in list(namespaces):
+        for depth in range(1, len(namespace)):
+            namespaces.setdefault(namespace[:depth], {})
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".iceberg-import-", dir=destination.parent) as temporary:
+        staged = Path(temporary) / "catalog.sqlite3"
+        catalog = IcebergCatalog(warehouse, staged)
+        for namespace in sorted(namespaces, key=lambda item: (len(item), item)):
+            try:
+                catalog.create_namespace(namespace, namespaces[namespace])
+            except IcebergCatalogError as exc:
+                raise ValueError(f"Namespace {'.'.join(namespace)}: {exc}") from exc
+        for namespace, name, location in tables:
+            label = ".".join((*namespace, name))
+            if not isinstance(location, str) or not (location.startswith("file:") or (
+                    not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", location) and Path(location).is_absolute())):
+                raise ValueError(f"Table {label}: {location!r} is not a local file location; the test server reads "
+                                 "only local files (relocate the table files to file:// paths first)")
+            try:
+                path = catalog.local_path(location)
+            except IcebergCatalogError as exc:
+                raise ValueError(f"Table {label}: {exc} ({warehouse} must contain the table files)") from exc
+            try:
+                catalog._read_metadata(location)
+            except IcebergCatalogError as exc:
+                raise ValueError(f"Table {label}: {exc}") from exc
+            version = re.match(r"^([0-9]{1,16})-", path.name)
+            with catalog._transaction(write=True) as connection:
+                # The pointer stays as the source wrote it: Iceberg opens raw paths, the server decodes both.
+                catalog._insert_table(connection, namespace, name, location, int(version[1]) if version else 0)
+        (os.rename if os.name == "nt" else os.link)(staged, destination)
+    print(f"Imported {len(tables)} tables in {len(namespaces)} namespaces from {origin} into {destination} "
+          f"(warehouse {warehouse.as_uri()})")
+    return 0
+
+
 def iceberg_main(argv=None):
     parser = argparse.ArgumentParser(description="Iceberg v2 REST catalog and local Parquet/Avro table tools")
     parser.add_argument("--warehouse", default="iceberg-warehouse", help="local warehouse directory or file URI")
@@ -3594,7 +4478,65 @@ def iceberg_main(argv=None):
     snapshots = commands.add_parser("snapshots", help="list snapshot metadata as JSON")
     snapshots.add_argument("table", type=_ice_identifier)
 
+    export = commands.add_parser("export", help="write the catalog as an Iceberg JDBC / PyIceberg SQL catalog database")
+    export.add_argument("--format", choices=("sql-catalog",), default="sql-catalog",
+                        help="SQLite database for JdbcCatalog and SqlCatalog (default: %(default)s)")
+    export.add_argument("--out", type=Path, help="new SQLite database file")
+    export.add_argument("--catalog-name", help="catalog_name to store (default: the Polaris catalog name or 'default')")
+    export.add_argument("--relocate", type=Path, metavar="DIR",
+                        help="new directory receiving a copy of every table file with rewritten locations")
+    export.add_argument("--location-prefix", metavar="URI",
+                        help="prefix replacing the warehouse in relocated locations, e.g. s3://bucket/warehouse")
+
+    migrate = commands.add_parser("migrate", help="create namespaces and register tables in a running REST catalog")
+    migrate.add_argument("--target", required=True,
+                         help="REST catalog base URL, e.g. http://host:8181 or http://host:8181/api/catalog for Polaris")
+    location = migrate.add_mutually_exclusive_group()
+    location.add_argument("--prefix", help="URL prefix to use instead of the one returned by /v1/config")
+    location.add_argument("--warehouse", dest="target_warehouse",
+                          help="warehouse to request from the target's /v1/config (Polaris: the catalog name)")
+    credentials = migrate.add_mutually_exclusive_group()
+    credentials.add_argument("--token-file", type=Path, help="file containing a bearer token")
+    credentials.add_argument("--credential-file", type=Path,
+                             help="file containing client_id:client_secret for OAuth2 client credentials")
+    migrate.add_argument("--scope", default="PRINCIPAL_ROLE:ALL", help="OAuth2 scope (default: %(default)s)")
+    migrate.add_argument("--oauth2-server-uri", help="OAuth2 token endpoint (default: TARGET/v1/oauth/tokens)")
+    migrate.add_argument("--dry-run", action="store_true",
+                         help="read the source and the target and report what would change, without writing")
+
+    for command in (export, migrate):
+        command.add_argument("--polaris-catalog", metavar="NAME",
+                             help="read this catalog of a serve-polaris warehouse (--db-file is the Polaris database)")
+
+    importer = commands.add_parser("import", help="build a new catalog database from a SQL catalog or a REST catalog")
+    importer.add_argument("--db-file", dest="import_db_file", type=Path,
+                          help="new SQLite catalog to create (default: the warehouse's catalog file)")
+    importer.add_argument("--warehouse", dest="import_warehouse",
+                          help="warehouse directory that contains the table files")
+    source = importer.add_mutually_exclusive_group(required=True)
+    source.add_argument("--sql-catalog", type=Path, metavar="FILE",
+                        help="SQLite database of an Iceberg Java JdbcCatalog or a PyIceberg SqlCatalog")
+    source.add_argument("--source", dest="target", metavar="URL", help="Iceberg REST catalog base URL to read")
+    importer.add_argument("--catalog-name", default="default", help="catalog_name in --sql-catalog (default: %(default)s)")
+    location = importer.add_mutually_exclusive_group()
+    location.add_argument("--prefix", help="URL prefix to use instead of the one returned by /v1/config")
+    location.add_argument("--source-warehouse", dest="target_warehouse",
+                          help="warehouse to request from the source's /v1/config (Polaris: the catalog name)")
+    credentials = importer.add_mutually_exclusive_group()
+    credentials.add_argument("--token-file", type=Path, help="file containing a bearer token")
+    credentials.add_argument("--credential-file", type=Path,
+                             help="file containing client_id:client_secret for OAuth2 client credentials")
+    importer.add_argument("--scope", default="PRINCIPAL_ROLE:ALL", help="OAuth2 scope (default: %(default)s)")
+    importer.add_argument("--oauth2-server-uri", help="OAuth2 token endpoint (default: SOURCE/v1/oauth/tokens)")
+
     args = parser.parse_args(argv)
+    if args.command in ("export", "migrate", "import"):
+        try:
+            return {"export": _ice_export, "migrate": _ice_migrate, "import": _ice_import}[args.command](args)
+        except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
+            parser.exit(1, f"Iceberg {args.command} failed: {exc}\n")
+        except KeyboardInterrupt:
+            return 130
     try:
         if args.command in ("serve", "serve-polaris"):
             if not 0 <= args.port <= 65535:

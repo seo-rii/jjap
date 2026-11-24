@@ -4,22 +4,30 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import fnmatch
 import gzip
+import http.client
 import io
 import json
 import math
+import os
 import re
 import sqlite3
+import ssl
+import sys
+import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 import zlib
 from datetime import datetime, timezone
 from functools import cmp_to_key
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 
 VERSION = "2.19.0"
@@ -248,6 +256,16 @@ def settings_values(source):
     return flat
 
 
+def keep_alive_seconds(value):
+    match = re.fullmatch(r"(\d+)(ms|s|m|h|d)", str(value))
+    if not match:
+        raise invalid("[keep_alive] must be a duration such as 5m")
+    seconds = int(match[1]) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600, "d": 86400}[match[2]]
+    if seconds > 86400:
+        raise invalid("keep alive for point in time cannot exceed point_in_time.max_keep_alive (24h)")
+    return seconds
+
+
 def health_name(status):
     return {"green": 0, "yellow": 1, "red": 2}.get(status, -1)
 
@@ -255,6 +273,7 @@ def health_name(status):
 class Store:
     def __init__(self, db_file):
         self.changed = threading.Condition(threading.RLock())
+        self.pits = {}
         self.db = sqlite3.connect(db_file, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys = ON")
@@ -481,6 +500,37 @@ class Store:
             self.db.execute("UPDATE opensearch_indexes SET visible_seq = next_seq - 1, last_refresh = ? WHERE name = ?",
                             (time.time(), name))
         self.changed.notify_all()
+
+    def reset(self):
+        self.db.execute("DELETE FROM opensearch_indexes")
+        self.pits.clear()
+        self.changed.notify_all()
+
+    def open_pit(self, pattern, keep_alive):
+        """Freeze the refreshed documents and mappings of the targets, as a point in time keeps its readers."""
+        now = time.time()
+        for pit_id in [pit_id for pit_id, pit in self.pits.items() if pit["expires"] <= now]:
+            del self.pits[pit_id]
+        targets = self.resolve(pattern)
+        indexes = {}
+        for name in targets:
+            rows = self.db.execute("SELECT * FROM opensearch_visible WHERE idx = ? ORDER BY id", (name,))
+            indexes[name] = json.loads(self.index(name)["mapping"]), [dict(row) for row in rows]
+        pit_id = base64.urlsafe_b64encode(os.urandom(24)).decode()
+        self.pits[pit_id] = {"id": pit_id, "targets": targets, "indexes": indexes, "created": int(now * 1000),
+                             "keep_alive": keep_alive, "expires": now + keep_alive}
+        shards = {"total": len(targets), "successful": len(targets), "skipped": 0, "failed": 0}
+        return {"pit_id": pit_id, "_shards": shards, "creation_time": int(now * 1000)}
+
+    def pit(self, reference):
+        reference = object_value(reference, "pit")
+        pit = self.pits.get(reference.get("id"))
+        if pit is None or pit["expires"] <= time.time():
+            raise Error(404, "search_context_missing_exception", f"No search context found for id [{reference.get('id')}]")
+        if "keep_alive" in reference:
+            pit["keep_alive"] = keep_alive_seconds(reference["keep_alive"])
+        pit["expires"] = time.time() + pit["keep_alive"]
+        return pit
 
     def periodic_refresh(self):
         with self.changed, self.db:
@@ -840,15 +890,19 @@ def search_aggregations(specifications, documents):
     return result
 
 
-def search(store, targets, body, count_only=False):
+def search(store, targets, body, count_only=False, frozen=None):
     started = time.monotonic()
     query = compile_query(body.get("query", {"match_all": {}}))
     post_filter = compile_query(body["post_filter"]) if "post_filter" in body else None
     documents = []
     for index, filters in targets.items():
-        mapping = json.loads(store.index(index)["mapping"])
+        if frozen is None:
+            mapping = json.loads(store.index(index)["mapping"])
+            rows = store.db.execute("SELECT * FROM opensearch_visible WHERE idx = ? ORDER BY id", (index,))
+        else:
+            mapping, rows = frozen[index]
         alias_filters = [compile_query(item) for item in filters] if filters else []
-        for row in store.db.execute("SELECT * FROM opensearch_visible WHERE idx = ? ORDER BY id", (index,)):
+        for row in rows:
             source = json.loads(row["source"])
             if alias_filters and not any(alias(source, mapping, row["id"]) is not None for alias in alias_filters):
                 continue
@@ -1039,6 +1093,29 @@ class Handler(BaseHTTPRequestHandler):
         read = method in ("GET", "HEAD")
         if not path and read:
             return self.info(), 200, None
+        if path == ["_jjap", "reset"]:
+            if method != "POST":
+                raise Error(405, "illegal_argument_exception",
+                            f"Incorrect HTTP method for uri [{self.path}] and method [{method}], allowed: [POST]")
+            self.store.reset()
+            return {"reset": True}, 200, None
+        if path[-2:] == ["_search", "point_in_time"] and len(path) == 3 and method == "POST":
+            if "keep_alive" not in params:
+                raise invalid("[keep_alive] is required")
+            return self.store.open_pit(path[0], keep_alive_seconds(params["keep_alive"])), 200, None
+        if path[:2] == ["_search", "point_in_time"] and len(path) in (2, 3):
+            everything = path[2:] == ["_all"]
+            if len(path) == 3 and not everything:
+                raise invalid("invalid point in time path")
+            if read and everything:
+                pits = [pit for pit in self.store.pits.values() if pit["expires"] > time.time()]
+                return {"pits": [{"pit_id": pit["id"], "creation_time": pit["created"],
+                                  "keep_alive": int(pit["keep_alive"] * 1000)} for pit in pits]}, 200, None
+            if method == "DELETE":
+                ids = list(self.store.pits) if everything else body.get("pit_id")
+                ids = [ids] if isinstance(ids, str) else list_value(ids, "pit_id")
+                return {"pits": [{"successful": self.store.pits.pop(pit_id, None) is not None, "pit_id": pit_id}
+                                 for pit_id in ids]}, 200, None
         if path[:2] == ["_cluster", "health"] and len(path) in (2, 3) and read:
             return self.health(path[2] if len(path) == 3 else None, params), 200, None
         if path[:2] == ["_cat", "indices"] and len(path) in (2, 3) and read:
@@ -1075,6 +1152,11 @@ class Handler(BaseHTTPRequestHandler):
                     body["sort"] = [{name: order or "asc"} for item in params["sort"].split(",")
                                     for name, _, order in [item.partition(":")]]
                 body["_source"] = source_option(params, body.get("_source"))
+                if "pit" in body:
+                    if target is not None or operation == "_count":
+                        raise invalid("[indices] cannot be used with point in time")
+                    pit = self.store.pit(body.pop("pit"))
+                    return {**search(self.store, pit["targets"], body, frozen=pit["indexes"]), "pit_id": pit["id"]}, 200, None
                 return search(self.store, self.targets(target, params), body, operation == "_count"), 200, None
         if path == ["_aliases"] and method == "POST":
             return self.change_aliases(body), 200, None
@@ -1328,7 +1410,704 @@ class Server(ThreadingHTTPServer):
         self.store.periodic_refresh()
 
 
-def main(argv=None):
+# Export as OpenSearch REST request bodies and replay them into a running cluster
+
+SERVER_SETTINGS = ("uuid", "creation_date", "creation_date_string", "provided_name", "version", "history.uuid",
+                   "resize.source", "routing.allocation.initial_recovery", "verified_before_close")
+ALIAS_OPTIONS = {"filter", "routing", "index_routing", "search_routing", "is_write_index", "is_hidden"}
+
+
+def warn(message):
+    print(f"warning: {message}", file=sys.stderr)
+
+
+def portable_settings(config, prefix=""):
+    result = {}
+    for key, value in config.items():
+        path = prefix + key
+        if any(path == name or path.startswith(name + ".") for name in SERVER_SETTINGS):
+            continue
+        result[key] = portable_settings(value, path + ".") if isinstance(value, dict) else value
+    return result
+
+
+class Snapshot:
+    """One read transaction over a persistence file, opened read-only."""
+
+    def __init__(self, filename):
+        source = Path(filename).expanduser().resolve(strict=True)
+        if not source.is_file():
+            raise ValueError(f"Expected a SQLite persistence file: {source}")
+        self.db = sqlite3.connect(f"{source.as_uri()}?mode=ro", uri=True, isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+        try:
+            self.db.execute("BEGIN")
+            tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if not {"opensearch_indexes", "opensearch_aliases", "opensearch_documents", "opensearch_visible"} <= tables:
+                raise ValueError("Expected an OpenSearch test server SQLite persistence file")
+        except BaseException:
+            self.db.close()
+            raise
+
+    def indexes(self):
+        result = []
+        for row in self.db.execute("SELECT name, settings, mapping FROM opensearch_indexes ORDER BY name").fetchall():
+            name = row["name"]
+            aliases = {}
+            for alias in self.db.execute("SELECT name, options FROM opensearch_aliases WHERE idx = ? ORDER BY name", (name,)):
+                options = json.loads(alias["options"])
+                for key in sorted(set(options) - ALIAS_OPTIONS):
+                    warn(f"alias [{alias['name']}] on [{name}]: option [{key}] is not an OpenSearch alias property; skipped")
+                aliases[alias["name"]] = {key: value for key, value in options.items() if key in ALIAS_OPTIONS}
+            mappings = json.loads(row["mapping"])
+            if isinstance(mappings.get("_routing"), dict) and mappings["_routing"].get("required") in (True, "true"):
+                warn(f"[{name}] requires _routing, but document routing values are not stored; OpenSearch will reject its documents")
+            count, = self.db.execute("SELECT COUNT(*) FROM opensearch_documents WHERE idx = ? AND source IS NOT NULL", (name,)).fetchone()
+            body = {"settings": {"index": portable_settings(json.loads(row["settings"]))}, "mappings": mappings, "aliases": aliases}
+            result.append({"name": name, "body": body, "documents": count})
+        return result
+
+    def bulk_lines(self, index, preserve_versions):
+        """Yield one action and source pair per live document, including writes not yet refreshed."""
+        for doc_id, source, version in self.db.execute("""
+            SELECT id, source, version FROM opensearch_documents WHERE idx = ? AND source IS NOT NULL ORDER BY seq
+        """, (index,)):
+            action = {"_index": index, "_id": doc_id}
+            if preserve_versions:
+                action.update(version=version, version_type="external")
+            yield f"{json_text({'index': action})}\n{source}\n".encode("utf-8")
+
+
+def export_opensearch(filename, destination, preserve_versions):
+    snapshot = Snapshot(filename)
+    try:
+        indexes = snapshot.indexes()
+        destination.mkdir(mode=0o700)
+        manifest = {"format": "jjap-opensearch-export", "formatVersion": 1, "opensearchVersion": VERSION,
+                    "preserveVersions": preserve_versions, "indexes": []}
+        total = 0
+        for position, index in enumerate(indexes, 1):
+            stem = f"{position:04d}-{quote(index['name'], safe='')[:200]}"
+            with (destination / f"{stem}.index.json").open("x", encoding="utf-8") as file:
+                file.write(json.dumps(index["body"], indent=2, ensure_ascii=False, allow_nan=False) + "\n")
+            count = 0
+            with (destination / f"{stem}.bulk.ndjson").open("xb") as file:
+                for lines in snapshot.bulk_lines(index["name"], preserve_versions):
+                    file.write(lines)
+                    count += 1
+            total += count
+            manifest["indexes"].append({"index": index["name"], "create": f"{stem}.index.json", "bulk": f"{stem}.bulk.ndjson",
+                                        "documents": count, "aliases": list(index["body"]["aliases"])})
+        with (destination / "manifest.json").open("x", encoding="utf-8") as file:
+            file.write(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+        return len(indexes), total
+    finally:
+        snapshot.db.close()
+
+
+def publish_directory(staged, destination):
+    if os.name == "nt":
+        staged.rename(destination)
+        return
+    destination.mkdir(mode=0o700)
+    try:
+        staged.replace(destination)
+    except BaseException:
+        destination.rmdir()
+        raise
+
+
+def export_main(argv):
+    parser = argparse.ArgumentParser(prog="opensearch_server.py export",
+                                     description="Write create-index bodies and _bulk files for a real OpenSearch cluster.")
+    parser.add_argument("--db-file", type=Path, required=True, help="existing SQLite persistence file")
+    parser.add_argument("--out", type=Path, required=True, help="new output directory")
+    parser.add_argument("--preserve-versions", action="store_true",
+                        help="carry each _version with version_type=external (the test server itself rejects these)")
+    args = parser.parse_args(argv)
+    destination = args.out.expanduser().absolute()
+    try:
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Output directory already exists: {destination}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".opensearch-export-", dir=destination.parent) as temporary:
+            staged = Path(temporary) / "export"
+            indexes, documents = export_opensearch(args.db_file, staged, args.preserve_versions)
+            publish_directory(staged, destination)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        parser.exit(1, f"OpenSearch export failed: {exc}\n")
+    print(f"Exported {documents} documents across {indexes} indexes to {destination}")
+    return 0
+
+
+def error_text(payload):
+    error = payload.get("error", payload) if isinstance(payload, dict) else payload
+    if isinstance(error, dict):
+        return f"{error.get('type', 'error')}: {error.get('reason', json_text(error)[:300])}"
+    return str(error)[:300]
+
+
+class Cluster:
+    def __init__(self, url, headers, context, timeout, retries):
+        self.url, self.headers, self.context, self.timeout, self.retries = url, headers, context, timeout, retries
+
+    def call(self, method, path, body=None, content_type="application/json", compress=False):
+        data = body if body is None or isinstance(body, bytes) else json_text(body).encode()
+        headers = dict(self.headers)
+        if data is not None:
+            headers["Content-Type"] = content_type
+            if compress:
+                data = gzip.compress(data)
+                headers["Content-Encoding"] = "gzip"
+        for attempt in range(self.retries + 1):
+            request = urllib.request.Request(self.url + path, data=data, method=method, headers=headers)
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout, context=self.context) as response:
+                    status, raw = response.status, response.read()
+            except urllib.error.HTTPError as error:
+                status, raw = error.code, error.read()
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
+                if attempt == self.retries:
+                    raise ConnectionError(f"{method} {self.url + path}: {getattr(error, 'reason', error)}") from None
+                time.sleep(min(0.25 * 2 ** attempt, 4))
+                continue
+            if status in {429, 502, 503, 504} and attempt < self.retries:
+                time.sleep(min(0.25 * 2 ** attempt, 4))
+                continue
+            try:
+                return status, json.loads(raw) if raw else {}
+            except ValueError:
+                return status, {"error": raw[:300].decode("utf-8", "replace")}
+
+    def bulk(self, lines, compress, failures):
+        """Send one chunk; retry only items the cluster rejected with 429, and record every other item failure."""
+        loaded = 0
+        for attempt in range(self.retries + 1):
+            status, payload = self.call("POST", "/_bulk", b"".join(lines), "application/x-ndjson", compress)
+            items = payload.get("items") if isinstance(payload, dict) else None
+            if status != 200 or not isinstance(items, list) or len(items) != len(lines):
+                failures.append(f"bulk request of {len(lines)} documents: HTTP {status} {error_text(payload)}")
+                return loaded
+            retry = []
+            for line, item in zip(lines, items):
+                result = next(iter(item.values())) if isinstance(item, dict) and len(item) == 1 else {}
+                code = result.get("status") if isinstance(result, dict) else None
+                if code == 429 and attempt < self.retries:
+                    retry.append(line)
+                elif type(code) is int and 200 <= code < 300 and "error" not in result:
+                    loaded += 1
+                else:
+                    failures.append(f"document [{result.get('_index')}][{result.get('_id')}]: HTTP {code} {error_text(result)}")
+            if not retry:
+                return loaded
+            lines = retry
+            time.sleep(min(0.25 * 2 ** attempt, 4))
+        return loaded
+
+
+def alias_conflict(cluster, alias, options):
+    """Describe why adding this alias would fail on the target, or return None."""
+    status, payload = cluster.call("GET", "/_alias/" + quote(alias, safe=""))
+    if status == 404:
+        status, _ = cluster.call("HEAD", "/" + quote(alias, safe=""))
+        return f"[{alias}] is an index on the target" if status == 200 else None
+    if status != 200 or not isinstance(payload, dict):
+        return f"checking alias [{alias}] returned HTTP {status} {error_text(payload)}"
+    if options.get("is_write_index") is True:
+        writers = [index for index, value in payload.items()
+                   if isinstance(value, dict) and value.get("aliases", {}).get(alias, {}).get("is_write_index") is True]
+        if writers:
+            return f"alias [{alias}] already has the write index [{writers[0]}] on the target"
+    return None
+
+
+def migrate_main(argv):
+    parser = argparse.ArgumentParser(prog="opensearch_server.py migrate",
+                                     description="Create the stored indexes in a running OpenSearch cluster and bulk-load their documents.")
+    parser.add_argument("--db-file", type=Path, required=True, help="existing SQLite persistence file")
+    parser.add_argument("--target", required=True, help="cluster URL, for example https://localhost:9200")
+    parser.add_argument("--username", help="HTTP basic authentication user")
+    parser.add_argument("--password-file", type=Path, help="file containing the password for --username")
+    parser.add_argument("--ca-file", type=Path, help="PEM CA bundle for verifying an https target")
+    parser.add_argument("--index", action="extend", nargs="+", metavar="NAME", help="migrate only these indexes")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="leave indexes that already exist on the target untouched instead of refusing to start")
+    parser.add_argument("--preserve-versions", action="store_true", help="send each _version with version_type=external")
+    parser.add_argument("--chunk-docs", type=int, default=1000, help="documents per _bulk request (default: %(default)s)")
+    parser.add_argument("--chunk-bytes", type=int, default=5 * 1024 * 1024, help="bytes per _bulk request (default: %(default)s)")
+    parser.add_argument("--gzip", action="store_true", help="gzip _bulk request bodies")
+    parser.add_argument("--retries", type=int, default=3, help="retries on 429, 502-504, or connection errors")
+    parser.add_argument("--timeout", type=float, default=60, help="seconds per HTTP request")
+    parser.add_argument("--dry-run", action="store_true", help="check the target and report the plan without writing")
+    args = parser.parse_args(argv)
+    target = args.target.rstrip("/")
+    if urlsplit(target).scheme not in {"http", "https"}:
+        parser.error("--target must be an http or https URL")
+    if (args.username is None) != (args.password_file is None):
+        parser.error("--username and --password-file must be used together")
+    if args.chunk_docs < 1 or args.chunk_bytes < 1 or args.retries < 0 or args.timeout <= 0:
+        parser.error("--chunk-docs, --chunk-bytes and --timeout must be positive and --retries not negative")
+    failures, created, documents, aliases, aborted = [], [], 0, 0, None
+    try:
+        headers = {"Accept": "application/json"}
+        if args.username is not None:
+            password = args.password_file.expanduser().read_text(encoding="utf-8").rstrip("\r\n")
+            credentials = base64.b64encode(f"{args.username}:{password}".encode()).decode("ascii")
+            headers["Authorization"] = f"Basic {credentials}"
+        context = ssl.create_default_context(cafile=str(args.ca_file.expanduser())) if args.ca_file else None
+        cluster = Cluster(target, headers, context, args.timeout, args.retries)
+        snapshot = Snapshot(args.db_file)
+        try:
+            indexes = snapshot.indexes()
+            if args.index:
+                available = {index["name"] for index in indexes}
+                if missing := sorted(set(args.index) - available):
+                    raise ValueError(f"Index not found in the snapshot: {', '.join(missing)}")
+                indexes = [index for index in indexes if index["name"] in args.index]
+            existing = []
+            for index in indexes:
+                status, payload = cluster.call("HEAD", "/" + quote(index["name"], safe=""))
+                if status not in {200, 404}:
+                    raise ValueError(f"checking [{index['name']}] on the target returned HTTP {status} {error_text(payload)}")
+                if status == 200:
+                    existing.append(index["name"])
+            if existing and not args.skip_existing:
+                raise ValueError(f"the target already has {', '.join(existing)}; use --skip-existing to leave them untouched")
+            for index in indexes:
+                name, path = index["name"], "/" + quote(index["name"], safe="")
+                if name in existing:
+                    warn(f"[{name}] already exists on the target; skipped with its documents and aliases")
+                    continue
+                if args.dry_run:
+                    print(f"would create [{name}] with {index['documents']} documents and "
+                          f"{len(index['body']['aliases'])} aliases")
+                    created.append(name)
+                    documents += index["documents"]
+                    # One _aliases request per index applies all of its actions or none.
+                    problems = [problem for alias, options in index["body"]["aliases"].items()
+                                if (problem := alias_conflict(cluster, alias, options))]
+                    if problems:
+                        failures.append(f"aliases of [{name}]: {'; '.join(problems)}")
+                    else:
+                        aliases += len(index["body"]["aliases"])
+                    continue
+                status, payload = cluster.call("PUT", path, {key: value for key, value in index["body"].items() if key != "aliases"})
+                if status != 200:
+                    failures.append(f"create index [{name}]: HTTP {status} {error_text(payload)}")
+                    continue
+                created.append(name)
+                chunk, size = [], 0
+                for lines in snapshot.bulk_lines(name, args.preserve_versions):
+                    if chunk and (len(chunk) >= args.chunk_docs or size + len(lines) > args.chunk_bytes):
+                        documents += cluster.bulk(chunk, args.gzip, failures)
+                        chunk, size = [], 0
+                    chunk.append(lines)
+                    size += len(lines)
+                if chunk:
+                    documents += cluster.bulk(chunk, args.gzip, failures)
+                if index["body"]["aliases"]:
+                    actions = [{"add": {"index": name, "alias": alias, **options}} for alias, options in index["body"]["aliases"].items()]
+                    status, payload = cluster.call("POST", "/_aliases", {"actions": actions})
+                    if status == 200 and payload.get("acknowledged") is True:
+                        aliases += len(actions)
+                    else:
+                        failures.append(f"aliases of [{name}]: HTTP {status} {error_text(payload)}")
+            for name in [] if args.dry_run else created:
+                status, payload = cluster.call("POST", f"/{quote(name, safe='')}/_refresh")
+                if status != 200:
+                    failures.append(f"refresh [{name}]: HTTP {status} {error_text(payload)}")
+        finally:
+            snapshot.db.close()
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        aborted = exc
+    for failure in failures[:50]:
+        print(f"OpenSearch migrate: {failure}", file=sys.stderr)
+    if len(failures) > 50:
+        print(f"OpenSearch migrate: ... and {len(failures) - 50} more failures", file=sys.stderr)
+    if aborted is not None:
+        parser.exit(1, f"OpenSearch migrate failed: {aborted}\n")
+    summary = f"{documents} documents into {len(created)} indexes with {aliases} aliases at {target}"
+    if args.dry_run:
+        if failures:
+            parser.exit(1, f"OpenSearch migrate failed: dry run found {len(failures)} failures; would migrate {summary}\n")
+        print(f"Dry run: would migrate {summary}")
+        return 0
+    if failures:
+        parser.exit(1, f"OpenSearch migrate failed: {len(failures)} failures; migrated {summary}\n")
+    print(f"Migrated {summary}")
+    return 0
+
+
+# Import export output, _bulk or elasticdump files, or a running cluster into a new persistence file
+
+BULK_ACTIONS = {"index", "create", "update", "delete"}
+
+
+def open_input(path):
+    """Open a file for line reading, decompressing it when it starts with the gzip magic bytes."""
+    path = Path(path).expanduser()
+    with path.open("rb") as raw:
+        compressed = raw.read(2) == b"\x1f\x8b"
+    return gzip.open(path) if compressed else path.open("rb")
+
+
+def creatable(name, details):
+    """Turn an export create body or GET index details into a create-index body; return it with the source uuid."""
+    details = object_value(details, f"[{name}] index body")
+    config = settings_values(details)
+    index_uuid = config.get("uuid")
+    config = portable_settings(config)
+    shards = str(config.get("number_of_shards", "1"))
+    if shards != "1":
+        warn(f"[{name}] has {shards} primary shards; imported as one shard")
+        config["number_of_shards"] = "1"
+        config.pop("number_of_routing_shards", None)
+    body = {"settings": {"index": config}, "mappings": details.get("mappings", {}), "aliases": details.get("aliases", {})}
+    return body, index_uuid if isinstance(index_uuid, str) and re.fullmatch(r"[\w-]{1,64}", index_uuid) else None
+
+
+class Builder:
+    """Fill a new persistence file through the server's Store, as the REST handlers would."""
+
+    def __init__(self, store):
+        self.store, self.routed = store, {}
+
+    def create(self, name, details):
+        body, index_uuid = creatable(name, details)
+        try:
+            self.store.create_index(name, body)
+        except Error as exc:
+            raise ValueError(f"create index [{name}]: HTTP {exc.status} {error_text(exc.body)}") from None
+        if index_uuid:
+            self.store.db.execute("UPDATE opensearch_indexes SET uuid = ? WHERE name = ?", (index_uuid, name))
+
+    def write(self, label, action, target, metadata, source):
+        """Apply one bulk action. External versions become the stored _version, as OpenSearch keeps them."""
+        doc_id = metadata.get("_id")
+        try:
+            if not isinstance(target, str):
+                raise invalid("the action names no index; pass --default-index")
+            if metadata.get("pipeline") is not None:
+                raise invalid("ingest pipelines are not supported")
+            if doc_id is None and action in {"index", "create"}:
+                doc_id = uuid.uuid4().hex
+            if type(doc_id) not in (str, int):
+                raise invalid("bulk action needs a document ID")
+            doc_id = str(doc_id)
+            options = {key: metadata[key] for key in ("if_seq_no", "if_primary_term") if key in metadata}
+            options["require_alias"] = metadata.get("_require_alias", metadata.get("require_alias", False))
+            version, external = metadata.get("version"), metadata.get("version_type") in {"external", "external_gte"}
+            if external:
+                if action == "update":
+                    raise invalid(f"version type [{metadata['version_type']}] is not supported by the update API")
+                version = integer(version, "version", 0)
+            elif "version" in metadata or "version_type" in metadata:
+                options.update(version=version, version_type=metadata.get("version_type"))
+            index = self.store.write_index(target, create=action != "delete",
+                                           require_alias=boolean(options["require_alias"], "require_alias"))
+            if external and (previous := self.store.document(index, doc_id)) is not None:
+                if version < previous["version"] or version == previous["version"] and metadata["version_type"] == "external":
+                    raise Error(409, "version_conflict_engine_exception",
+                                f"[{doc_id}]: version conflict, current version [{previous['version']}] is higher or equal "
+                                f"to the one provided [{version}]")
+            self.store.mutate(target, doc_id, action, source, options)
+        except Error as exc:
+            raise ValueError(f"{label}: [{target}][{doc_id}]: HTTP {exc.status} {error_text(exc.body)}") from None
+        if external:
+            self.store.db.execute("UPDATE opensearch_documents SET version = ? WHERE idx = ? AND id = ?",
+                                  (version, index, doc_id))
+        if metadata.get("routing", metadata.get("_routing")) is not None:
+            self.routed[index] = self.routed.get(index, 0) + 1
+
+    def finish(self):
+        names = [row[0] for row in self.store.db.execute("SELECT name FROM opensearch_indexes ORDER BY name")]
+        with self.store.changed:
+            self.store.refresh(names)
+        for name, count in sorted(self.routed.items()):
+            warn(f"[{name}]: {count} documents carried a custom routing value, which this server does not store; "
+                 "imported without it")
+        live, = self.store.db.execute("SELECT COUNT(*) FROM opensearch_documents WHERE source IS NOT NULL").fetchone()
+        aliases, = self.store.db.execute("SELECT COUNT(*) FROM opensearch_aliases").fetchone()
+        return live, len(names), aliases
+
+
+def bulk_file(path, default_index):
+    """Yield (label, action, metadata, source) from a _bulk NDJSON file or from elasticdump-style hit lines."""
+    with open_input(path) as stream:
+        lines = enumerate(stream, 1)
+        for number, line in lines:
+            if not line.strip():
+                continue
+            label = f"{path} line {number}"
+            try:
+                item = object_value(parse_json(line), "bulk line")
+                if len(item) == 1 and next(iter(item)) in BULK_ACTIONS:
+                    action, metadata = next(iter(item.items()))
+                    metadata = object_value(metadata, "bulk action metadata")
+                    source = None
+                    if action != "delete":
+                        number, source_line = next(lines, (number, None))
+                        if source_line is None:
+                            raise invalid(f"bulk action [{action}] requires a source line")
+                        source = object_value(parse_json(source_line), "bulk source")
+                elif "_source" in item:
+                    action, source = "index", object_value(item["_source"], "_source")
+                    metadata = {key: item[key] for key in ("_id", "_routing") if key in item}
+                    if type(item.get("_version")) is int:
+                        metadata.update(version=item["_version"], version_type="external_gte")
+                else:
+                    raise invalid("expected a bulk action line or a document with _source")
+            except Error as exc:
+                raise ValueError(f"{path} line {number}: {exc.body['reason']}") from None
+            yield label, action, metadata.get("_index", item.get("_index", default_index)), metadata, source
+
+
+def index_bodies(paths):
+    """Read create-index bodies: a bare body, or GET index, _mapping, _settings or elasticdump files keyed by index."""
+    bare, named = None, {}
+    for path in paths or []:
+        try:
+            document = object_value(parse_json(Path(path).expanduser().read_bytes()), "index body")
+        except Error as exc:
+            raise ValueError(f"{path}: {exc.body['reason']}") from None
+        if set(document) <= {"settings", "mappings", "aliases"}:
+            if bare is not None:
+                raise ValueError(f"{path}: only one --index-body may omit the index name")
+            bare = (path, document)
+            continue
+        for name, details in document.items():
+            for section, value in object_value(details, f"[{name}]").items():
+                named.setdefault(name, {}).setdefault(section, {}).update(object_value(value, f"[{name}].{section}"))
+    return bare, named
+
+
+def import_bulk(builder, bulk_paths, body_paths, default_index):
+    bare, named = index_bodies(body_paths)
+    if bare is not None and default_index is not None:
+        named.setdefault(default_index, bare[1])
+        bare = None
+    for name, details in named.items():
+        builder.create(name, details)
+    created = []
+    for path in bulk_paths:
+        for label, action, target, metadata, source in bulk_file(path, default_index):
+            if bare is not None and isinstance(target, str) and builder.store.index(target) is None \
+                    and not builder.store.aliases(name=target) and action != "delete":
+                if created:
+                    raise ValueError(f"{bare[0]} names no index, but the bulk files create both [{created[0]}] and "
+                                     f"[{target}]; pass --default-index or key the body by index name")
+                builder.create(target, bare[1])
+                created.append(target)
+            builder.write(label, action, target, metadata, source)
+    if bare is not None and not created:
+        raise ValueError(f"{bare[0]} names no index and no bulk action creates one; pass --default-index")
+
+
+def selected(names, patterns):
+    """Match index name patterns like a shell does: a leading dot must be matched explicitly."""
+    return [name for name in names if any(fnmatch.fnmatchcase(name, pattern) and
+                                          (not name.startswith(".") or pattern.startswith(".")) for pattern in patterns)]
+
+
+def import_export(builder, directory, patterns):
+    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or manifest.get("format") != "jjap-opensearch-export":
+        raise ValueError(f"{directory / 'manifest.json'} is not opensearch_server.py export output")
+    entries = {entry["index"]: entry for entry in manifest["indexes"]}
+    names = selected(entries, patterns or ["*", ".*"])
+    if missing := [pattern for pattern in patterns or [] if not any(char in pattern for char in "*?[") and pattern not in names]:
+        raise ValueError(f"Index not found in the export: {', '.join(missing)}")
+    for name in names:
+        builder.create(name, json.loads((directory / entries[name]["create"]).read_text(encoding="utf-8")))
+        for label, action, target, metadata, source in bulk_file(directory / entries[name]["bulk"], name):
+            builder.write(label, action, target, metadata, source)
+
+
+def source_hits(cluster, name, shards, page_size, stats):
+    """Yield every hit of one index: a point in time with search_after on single-shard indexes, else a scroll."""
+    path, keep_alive = "/" + quote(name, safe=""), "5m"
+    body = {"size": page_size, "sort": [{"_doc": "asc"}], "version": True, "track_total_hits": True,
+            "query": {"match_all": {}}}
+
+    def page_of(status, payload, request):
+        hits = payload.get("hits", {}).get("hits") if isinstance(payload, dict) else None
+        if status != 200 or not isinstance(hits, list):
+            raise ValueError(f"[{name}]: {request} returned HTTP {status} {error_text(payload)}")
+        if payload.get("_shards", {}).get("failed"):
+            raise ValueError(f"[{name}]: {request} failed on {payload['_shards']['failed']} shards")
+        if body.get("track_total_hits"):
+            stats["total"] = payload["hits"].get("total", {}).get("value")
+            body["track_total_hits"] = False
+        return hits
+
+    status, payload = (cluster.call("POST", f"{path}/_search/point_in_time?keep_alive={keep_alive}")
+                       if shards == 1 else (None, None))
+    if status == 401:
+        raise ValueError(f"[{name}]: creating a point in time returned HTTP 401 {error_text(payload)}")
+    if status == 200 and isinstance(payload.get("pit_id"), str):
+        pit_id = payload["pit_id"]
+        try:
+            while True:
+                request = {**body, "pit": {"id": pit_id, "keep_alive": keep_alive}}
+                status, payload = cluster.call("POST", "/_search", request)
+                hits = page_of(status, payload, "a point in time search")
+                pit_id = payload.get("pit_id", pit_id)
+                yield from hits
+                if len(hits) < page_size:
+                    return
+                body["search_after"] = hits[-1]["sort"]
+        finally:
+            cluster.call("DELETE", "/_search/point_in_time", {"pit_id": [pit_id]})
+    status, payload = cluster.call("POST", f"{path}/_search?scroll={keep_alive}", {**body, "sort": ["_doc"]})
+    scroll_id = payload.get("_scroll_id") if isinstance(payload, dict) else None
+    hits = page_of(status, payload, "a scroll search")
+    if not scroll_id:
+        raise ValueError(f"[{name}]: the source supports neither point in time nor scroll searches")
+    try:
+        while hits:
+            yield from hits
+            status, payload = cluster.call("POST", "/_search/scroll", {"scroll": keep_alive, "scroll_id": scroll_id})
+            hits = page_of(status, payload, "a scroll request")
+            scroll_id = payload.get("_scroll_id", scroll_id)
+    finally:
+        cluster.call("DELETE", "/_search/scroll", {"scroll_id": [scroll_id]})
+
+
+def import_source(builder, cluster, patterns, page_size):
+    status, listing = cluster.call("GET", "/_cat/indices?format=json&h=index,status,pri&expand_wildcards=all")
+    if status != 200 or not isinstance(listing, list):
+        raise ValueError(f"listing the source's indexes returned HTTP {status} {error_text(listing)}")
+    records = {record["index"]: record for record in listing if isinstance(record, dict) and isinstance(record.get("index"), str)}
+    names = selected(sorted(records), patterns or ["*"])
+    if missing := [pattern for pattern in patterns or [] if not any(char in pattern for char in "*?[") and pattern not in names]:
+        raise ValueError(f"Index not found on the source: {', '.join(missing)}")
+    if closed := [name for name in names if records[name].get("status", "open") != "open"]:
+        raise ValueError(f"closed indexes cannot be read: {', '.join(closed)}; open them or leave them out with --index")
+    skipped = len(records) - len(names) if patterns is None else 0
+    for name in names:
+        status, details = cluster.call("GET", "/" + quote(name, safe=""))
+        if status != 200 or not isinstance(details, dict) or name not in details:
+            raise ValueError(f"reading [{name}] returned HTTP {status} {error_text(details)}")
+        details = details[name]
+        if patterns is None and str(settings_values(details).get("hidden", "false")) == "true":
+            skipped += 1
+            continue
+        builder.create(name, details)
+        stats, count = {}, 0
+        for hit in source_hits(cluster, name, int(records[name].get("pri") or 1), page_size, stats):
+            if "_source" not in hit:
+                raise ValueError(f"[{name}][{hit.get('_id')}]: the source returned no _source; is _source disabled in the mapping?")
+            metadata = {"_id": hit.get("_id"), "routing": hit.get("_routing")}
+            if type(hit.get("_version")) is int:
+                metadata.update(version=hit["_version"], version_type="external_gte")
+            builder.write("source document", "index", name, metadata, hit["_source"])
+            count += 1
+        if type(stats.get("total")) is int and stats["total"] != count:
+            raise ValueError(f"[{name}]: read {count} of {stats['total']} documents")
+    if skipped:
+        warn(f"skipped {skipped} hidden or system indexes; name them with --index to import them")
+
+
+def publish_file(staged, destination):
+    """Publish a finished file; a hard link, unlike rename, refuses a destination that appeared meanwhile."""
+    try:
+        os.link(staged, destination)
+    except FileExistsError:
+        raise FileExistsError(f"Database file already exists: {destination}") from None
+    except OSError:
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Database file already exists: {destination}") from None
+        os.rename(staged, destination)
+
+
+def source_headers(parser, args):
+    if (args.username is None) != (args.password_file is None) or args.username is not None and args.token_file:
+        parser.error("--username and --password-file must be used together, and not with --token-file")
+    headers = {"Accept": "application/json"}
+    if args.username is not None:
+        password = args.password_file.expanduser().read_text(encoding="utf-8").rstrip("\r\n")
+        headers["Authorization"] = "Basic " + base64.b64encode(f"{args.username}:{password}".encode()).decode("ascii")
+    elif args.token_file:
+        token = args.token_file.expanduser().read_text(encoding="utf-8").strip()
+        if not token or not token.isascii() or any(char.isspace() for char in token):
+            raise ValueError(f"{args.token_file} must contain one nonempty ASCII token")
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def import_main(argv):
+    parser = argparse.ArgumentParser(prog="opensearch_server.py import",
+                                     description="Build a new SQLite persistence file from export output, _bulk or "
+                                                 "elasticdump files, or a running OpenSearch cluster.")
+    parser.add_argument("--db-file", type=Path, required=True, help="new SQLite persistence file")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--in", dest="input", type=Path, metavar="DIR", help="directory written by export")
+    source.add_argument("--bulk", type=Path, action="append", metavar="FILE",
+                        help="_bulk NDJSON or elasticdump data file, optionally gzip-compressed; repeatable")
+    source.add_argument("--source", help="cluster URL, for example https://localhost:9200")
+    parser.add_argument("--index-body", type=Path, action="append", metavar="FILE",
+                        help="with --bulk: create-index body, or GET index, _mapping, _settings or elasticdump "
+                             "JSON keyed by index")
+    parser.add_argument("--default-index", help="with --bulk: index for actions and bodies that name none")
+    parser.add_argument("--index", action="extend", nargs="+", metavar="PATTERN",
+                        help="with --in or --source: import only matching indexes "
+                             "(names starting with . must be matched explicitly)")
+    parser.add_argument("--username", help="HTTP basic authentication user for --source")
+    parser.add_argument("--password-file", type=Path, help="file containing the password for --username")
+    parser.add_argument("--token-file", type=Path, help="file containing a bearer token for --source")
+    parser.add_argument("--ca-file", type=Path, help="PEM CA bundle for verifying an https source")
+    parser.add_argument("--page-size", type=int, default=1000, help="documents per search request to --source")
+    parser.add_argument("--retries", type=int, default=3, help="retries on 429, 502-504, or connection errors")
+    parser.add_argument("--timeout", type=float, default=60, help="seconds per HTTP request")
+    args = parser.parse_args(argv)
+    source_url = (args.source or "").rstrip("/")
+    if args.source is not None and urlsplit(source_url).scheme not in {"http", "https"}:
+        parser.error("--source must be an http or https URL")
+    if (args.index_body or args.default_index) and not args.bulk or args.index and args.bulk:
+        parser.error("--index-body and --default-index need --bulk; --index needs --in or --source")
+    if (args.username or args.password_file or args.token_file or args.ca_file) and args.source is None:
+        parser.error("credentials and --ca-file need --source")
+    if not 1 <= args.page_size <= 10_000 or args.retries < 0 or args.timeout <= 0:
+        parser.error("--page-size must be between 1 and 10000, --retries not negative and --timeout positive")
+    destination = args.db_file.expanduser().absolute()
+    try:
+        if os.path.lexists(destination) or os.path.lexists(f"{destination}-wal"):
+            raise FileExistsError(f"Database file already exists: {destination}")
+        cluster = None
+        if args.source is not None:
+            context = ssl.create_default_context(cafile=str(args.ca_file.expanduser())) if args.ca_file else None
+            cluster = Cluster(source_url, source_headers(parser, args), context, args.timeout, args.retries)
+            status, payload = cluster.call("GET", "/")
+            if status != 200:
+                raise ValueError(f"GET {source_url}/ returned HTTP {status} {error_text(payload)}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".opensearch-import-", dir=destination.parent) as temporary:
+            staged = Path(temporary) / destination.name
+            store = Store(staged)
+            try:
+                with store.db:
+                    store.db.execute("BEGIN")
+                    builder = Builder(store)
+                    if cluster is not None:
+                        import_source(builder, cluster, args.index, args.page_size)
+                    elif args.bulk:
+                        import_bulk(builder, args.bulk, args.index_body, args.default_index)
+                    else:
+                        import_export(builder, args.input.expanduser(), args.index)
+                    documents, indexes, aliases = builder.finish()
+                store.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                store.db.close()
+            publish_file(staged, destination)
+    except (OSError, ValueError, KeyError, TypeError, EOFError, zlib.error, sqlite3.Error) as exc:
+        parser.exit(1, f"OpenSearch import failed: {exc}\n")
+    except Error as exc:
+        parser.exit(1, f"OpenSearch import failed: HTTP {exc.status} {error_text(exc.body)}\n")
+    print(f"Imported {documents} documents into {indexes} indexes with {aliases} aliases to {destination}")
+    return 0
+
+
+def serve_main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1", help="listen address (default: %(default)s)")
     parser.add_argument("--port", type=int, default=9200, help="listen port, 0 chooses a free port (default: %(default)s)")
@@ -1356,6 +2135,17 @@ def main(argv=None):
     except (OSError, sqlite3.Error) as exc:
         parser.exit(1, f"{parser.prog}: {exc}\n")
     return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["export"]:
+        return export_main(argv[1:])
+    if argv[:1] == ["migrate"]:
+        return migrate_main(argv[1:])
+    if argv[:1] == ["import"]:
+        return import_main(argv[1:])
+    return serve_main(argv)
 
 
 if __name__ == "__main__":
