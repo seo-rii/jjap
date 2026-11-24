@@ -80,9 +80,12 @@ Each server can hand its persisted state to the original product. `export` write
 | Nexus Repository | `export`, `migrate` | REST create requests, native repository layouts, and OCI image layouts |
 | Apache Iceberg and Polaris | `export`, `migrate` | JDBC catalog database, or table registration in a REST catalog |
 | OpenLineage | `export`, `migrate` | NDJSON events replayed to `/api/v1/lineage` |
+| LiteLLM | `export` | Proxy `config.yaml` and SQL for the virtual keys |
 | OpenSearch | `export`, `migrate` | Create-index bodies and `_bulk` files |
+| Apache Airflow | `export` | Airflow 3 DAG files |
 | OpenMetadata | `export`, `migrate` | `Create*` and `AddLineage` request bodies in dependency order |
 | Apache Kafka | `migrate` | Record batches and committed group offsets replayed into a cluster |
+| Apache Spark Standalone | `export` | PySpark scripts and `spark-submit` commands |
 
 ### MongoDB
 
@@ -326,6 +329,16 @@ Pass `--config` with a JSON `model_list` to route an alias to an OpenAI-compatib
 }
 ```
 
+Run `export` to write a LiteLLM proxy `config.yaml`. It keeps `model_list` and the router, LiteLLM, and general settings, and reads the master key from `LITELLM_MASTER_KEY`. With `--db-file`, the export also writes `keys.sql`, which inserts the virtual keys into LiteLLM's PostgreSQL database. Both gateways store SHA-256 digests of the keys, so clients keep their keys. Mock models become `mock_response` deployments. Usage records and stored responses are not exported. [Proxy config](https://docs.litellm.ai/docs/proxy/configs) · [Virtual keys](https://docs.litellm.ai/docs/proxy/virtual_keys)
+
+```sh
+python3 litellm_server.py export --config models.json --db-file gateway.sqlite3 --out ./litellm
+LITELLM_MASTER_KEY="$(cat master.key)" DATABASE_URL=postgresql://litellm@db/litellm litellm --config ./litellm/config.yaml
+psql postgresql://litellm@db/litellm -v ON_ERROR_STOP=1 -f ./litellm/keys.sql
+```
+
+Start the proxy once with `DATABASE_URL` so that LiteLLM creates its schema before `keys.sql` runs.
+
 ### OpenSearch
 
 | Area | Supported scope |
@@ -395,6 +408,15 @@ curl -fsS http://127.0.0.1:8080/api/v2/dags/demo/dagRuns/manual__demo
 ```
 
 Pass `--openlineage-url http://127.0.0.1:5000/api/v1/lineage` to send task events to the collector. [Airflow public REST API](https://airflow.apache.org/docs/apache-airflow/stable/stable-rest-api-ref.html)
+
+Run `export` to write each DAG as an Airflow 3 DAG file. Each task becomes a `BashOperator` that runs the command array through `exec`, so the program receives the same arguments. The files keep dependencies, retries, retry delays, timeouts, tags, the pause state, and `schedule_seconds`. Pass `--db-file` instead of `--dag-file` to export the registered DAGs with their current pause state and next run. Run history is not exported. [DAGs](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dags.html)
+
+```sh
+python3 airflow_server.py export --dag-file dag.json --out ./dags
+AIRFLOW__CORE__DAGS_FOLDER="$PWD/dags" airflow dags test demo
+```
+
+The first scheduled run is due one interval after the export, or at the next run the server had planned. Airflow creates no tasks for a run whose logical date is earlier than `start_date`, so trigger manual runs with a null logical date. Tasks run in a temporary directory unless you pass `--cwd`. Inputs and outputs become OpenLineage inlets and outlets when `apache-airflow-providers-openlineage` is installed.
 
 ### OpenMetadata
 
@@ -535,6 +557,15 @@ curl -fsS -H 'Content-Type: application/json' \
 
 Use the returned `submissionId` in `GET /v1/submissions/status/<id>` to inspect the job or `POST /v1/submissions/kill/<id>` to cancel it. The completed job writes `totals.jsonl`. [Spark Standalone REST API](https://spark.apache.org/docs/latest/spark-standalone.html#rest-api)
 
+Run `export` to write each job as a PySpark script, plus a `submit.sh` with one `spark-submit` command per job. Each script reads the inputs with the configured schema, registers the same table names, runs the SQL with `spark.sql`, and replaces the output file atomically. Iceberg tables are read and written through a REST catalog. Serve the local catalog with `iceberg_server.py serve`, or point `--iceberg-uri` at another catalog. [Submitting applications](https://spark.apache.org/docs/latest/submitting-applications.html)
+
+```sh
+python3 spark_server.py export --config jobs.json --out ./spark-jobs
+./spark-jobs/submit.sh --master 'local[2]'
+```
+
+The scripts use absolute `file://` paths, so the driver and executors must see the same files. Spark SQL differs from SQLite: `5 / 2` returns `2.5`, `LIKE` is case-sensitive, double quotes delimit strings, and division by zero raises an error.
+
 ## Development
 
 Run the network, persistence, and file-format tests with the standard library.
@@ -542,6 +573,8 @@ Run the network, persistence, and file-format tests with the standard library.
 ```sh
 python3 -B -m unittest discover -s tests -v
 ```
+
+Some export tests also load the output into the real product. They are skipped when `redis-server`, `spark-submit`, or `litellm` is not installed.
 
 ## Source and license notices
 
