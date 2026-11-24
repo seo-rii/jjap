@@ -19,6 +19,7 @@ import datetime
 import hmac
 import itertools
 import math
+import os
 import re
 import signal
 import socket
@@ -26,6 +27,8 @@ import socketserver
 import sqlite3
 import ssl
 import struct
+import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -2285,8 +2288,11 @@ class BoltServer(socketserver.ThreadingTCPServer):
         return connection, address
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Single-file Neo4j-compatible graph test server")
+def serve_main(argv):
+    parser = argparse.ArgumentParser(
+        description="Single-file Neo4j-compatible graph test server",
+        epilog="See 'export --help' to write the graph for cypher-shell or neo4j-admin import.",
+    )
     parser.add_argument("--host", default="127.0.0.1", help="listen address (default: %(default)s)")
     parser.add_argument("--port", type=int, default=7687, help="listen port, 0 chooses a free port")
     parser.add_argument("--db-file", type=Path, help="persist the graph in this SQLite file")
@@ -2296,7 +2302,7 @@ def main():
     parser.add_argument("--tls-cert", type=Path, help="PEM certificate, optionally with the private key")
     parser.add_argument("--tls-key", type=Path, help="PEM private key for --tls-cert")
     parser.add_argument("--advertised-address", help="host:port to advertise to routed Bolt clients")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
     if not args.database or args.database.lower() == "system":
@@ -2334,5 +2340,413 @@ def main():
         parser.exit(1, f"{parser.prog}: {exc}\n")
 
 
+# Export for cypher-shell scripts and neo4j-admin database import CSV files
+
+EXPORT_LABEL = "__jjap_export"
+EXPORT_KEY = "__jjap_export_id"
+EXPORT_ROWS = 1000
+EXPORT_STATEMENT_BYTES = 1 << 20
+UNIX_EPOCH = datetime.datetime(1970, 1, 1)
+UTC_EPOCH = UNIX_EPOCH.replace(tzinfo=datetime.timezone.utc)
+CYPHER_ESCAPES = {ord("\\"): "\\\\", ord("'"): "\\'", **{code: f"\\u{code:04x}" for code in (*range(32), 127)}}
+STRUCTURE_TYPES = {0x44: "date", 0x54: "time", 0x74: "localtime", 0x64: "localdatetime", 0x49: "datetime",
+                   0x69: "datetime", 0x45: "duration", 0x58: "point", 0x59: "point"}
+STRUCTURE_ARITY = {0x44: 1, 0x54: 2, 0x74: 1, 0x64: 2, 0x49: 3, 0x69: 3, 0x45: 4, 0x58: 3, 0x59: 4}
+CRS_NAMES = {4326: "wgs-84", 4979: "wgs-84-3d", 7203: "cartesian", 9157: "cartesian-3d"}
+ARRAY_DELIMITERS = ";|\x1f\x1e"
+
+
+def read_graph_snapshot(filename):
+    source = Path(filename).resolve(strict=True)
+    if not source.is_file():
+        raise ValueError(f"Expected a SQLite persistence file: {source}")
+    connection = sqlite3.connect(f"{source.as_uri()}?mode=ro", uri=True)
+    try:
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jjap_neo4j'").fetchone() is None:
+            raise ValueError("Expected a Neo4j test server SQLite persistence file")
+        row = connection.execute("SELECT graph FROM jjap_neo4j WHERE id=1").fetchone()
+    finally:
+        connection.close()
+    graph = Graph() if row is None else Graph.load(row[0])
+    for edge in graph.edges.values():
+        if edge.start not in graph.nodes or edge.end not in graph.nodes:
+            raise ValueError(f"Relationship {edge.id} refers to a missing node")
+    return graph
+
+
+def iso_fraction(nanos):
+    return f".{nanos:09d}".rstrip("0") if nanos else ""
+
+
+def iso_offset(seconds):
+    if not seconds:
+        return "Z"
+    hours, rest = divmod(abs(seconds), 3600)
+    minutes, extra = divmod(rest, 60)
+    return f"{'-' if seconds < 0 else '+'}{hours:02d}:{minutes:02d}" + (f":{extra:02d}" if extra else "")
+
+
+def iso_time(nanos):
+    seconds, fraction = divmod(nanos, 1_000_000_000)
+    hours, rest = divmod(seconds, 3600)
+    return f"{hours:02d}:{rest // 60:02d}:{rest % 60:02d}{iso_fraction(fraction)}"
+
+
+def structure_text(value):
+    """Return the ISO text Neo4j parses for a stored temporal value, or the coordinate map of a point."""
+    tag, fields = value.tag, value.fields
+    if STRUCTURE_ARITY.get(tag) != len(fields):
+        raise ValueError(f"Unsupported property structure 0x{tag:02x} with {len(fields)} fields")
+    try:
+        if tag == 0x44:
+            return (UNIX_EPOCH + datetime.timedelta(days=fields[0])).date().isoformat()
+        if tag == 0x74:
+            return iso_time(fields[0])
+        if tag == 0x54:
+            return iso_time(fields[0]) + iso_offset(fields[1])
+        if tag == 0x64:
+            return (UNIX_EPOCH + datetime.timedelta(seconds=fields[0])).isoformat() + iso_fraction(fields[1])
+        if tag == 0x49:
+            seconds, nanos, offset = fields
+            local = UNIX_EPOCH + datetime.timedelta(seconds=seconds + offset)
+            return local.isoformat() + iso_fraction(nanos) + iso_offset(offset)
+        if tag == 0x69:
+            seconds, nanos, zone = fields
+            local = (UTC_EPOCH + datetime.timedelta(seconds=seconds)).astimezone(ZoneInfo(zone))
+            offset = iso_offset(int(local.utcoffset().total_seconds()))
+            return local.replace(tzinfo=None).isoformat() + iso_fraction(nanos) + offset + f"[{zone}]"
+    except (OverflowError, ValueError, KeyError) as exc:
+        raise ValueError(f"Cannot export {STRUCTURE_TYPES[tag]} value {fields!r}: {exc}") from None
+    if tag == 0x45:
+        months, days, seconds, nanos = fields
+        total = seconds * 1_000_000_000 + nanos
+        whole, fraction = divmod(abs(total), 1_000_000_000)
+        return f"P{months}M{days}DT{'-' if total < 0 else ''}{whole}{iso_fraction(fraction)}S"
+    srid, *coordinates = fields
+    if srid not in CRS_NAMES:
+        raise ValueError(f"Neo4j has no coordinate reference system with SRID {srid}")
+    if not all(math.isfinite(item) for item in coordinates):
+        raise ValueError(f"Neo4j points need finite coordinates, not {coordinates!r}")
+    names = ("longitude", "latitude", "height") if srid in (4326, 4979) else ("x", "y", "z")
+    return [("crs", CRS_NAMES[srid]), *zip(names, map(float, coordinates))]
+
+
+def storable_list(name, values, warnings):
+    """Neo4j stores homogeneous arrays; the test server also accepts ints mixed with floats."""
+    integers = [item for item in values if is_number(item) and isinstance(item, int)]
+    if integers and any(isinstance(item, float) for item in values):
+        if any(float(item) != item for item in integers):
+            raise ValueError(f"Property {name!r} mixes floats with integers that a float list cannot hold exactly")
+        warnings.add(f"Property {name!r} mixes integers and floats; it is exported as a float list")
+        values = [float(item) for item in values]
+    kinds = {STRUCTURE_TYPES.get(item.tag) if isinstance(item, Structure) else type(item) for item in values}
+    if len(kinds) > 1 or bytes in kinds:
+        raise ValueError(f"Property {name!r} holds a list that Neo4j cannot store as an array")
+    return values
+
+
+def cypher_name(name):
+    return "`" + name.replace("`", "``") + "`"
+
+
+def cypher_float(value):
+    if math.isnan(value):
+        return "NaN"
+    if math.isinf(value):
+        return "Infinity" if value > 0 else "-Infinity"
+    text = repr(value)
+    if "e" in text:
+        mantissa, exponent = text.split("e")
+        text = f"{mantissa if '.' in mantissa else mantissa + '.0'}e{int(exponent)}"
+    return text
+
+
+def cypher_literal(value, name, warnings):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value) if value != -(1 << 63) else "(-9223372036854775807 - 1)"
+    if isinstance(value, float):
+        return cypher_float(value)
+    if isinstance(value, str):
+        return "'" + value.translate(CYPHER_ESCAPES) + "'"
+    if isinstance(value, list):
+        items = storable_list(name, value, warnings)
+        return "[" + ", ".join(cypher_literal(item, name, warnings) for item in items) + "]"
+    if isinstance(value, Structure):
+        text = structure_text(value)
+        if value.tag == 0x45:
+            months, days, seconds, nanos = value.fields
+            return f"duration({{months: {months}, days: {days}, seconds: {seconds}, nanoseconds: {nanos}}})"
+        if isinstance(text, list):
+            return "point({" + ", ".join(f"{key}: {cypher_literal(item, name, warnings)}" for key, item in text) + "})"
+        return f"{STRUCTURE_TYPES[value.tag]}('{text}')"
+    if isinstance(value, bytes):
+        raise ValueError(f"Property {name!r} is a byte array, which has no Cypher literal; use --format csv")
+    raise ValueError(f"Property {name!r} has unsupported type {type(value).__name__}")
+
+
+def cypher_map(values, warnings):
+    return "{" + ", ".join(f"{cypher_name(key)}: {cypher_literal(item, key, warnings)}"
+                           for key, item in values.items()) + "}"
+
+
+def schema_statements(graph, warnings):
+    ordinary, enterprise = [], []
+    for item in graph.schema.values():
+        label = cypher_name(item["label"])
+        keys = [f"n.{cypher_name(key)}" for key in item["properties"]]
+        head = f"CREATE {item['kind'].upper()} {cypher_name(item['name'])} IF NOT EXISTS FOR (n:{label})"
+        if item["kind"] == "index":
+            ordinary.append(f"{head} ON ({', '.join(keys)});")
+        elif item["unique"]:
+            target = keys[0] if len(keys) == 1 else f"({', '.join(keys)})"
+            (enterprise if item["required"] else ordinary).append(
+                f"{head} REQUIRE {target} {'IS NODE KEY' if item['required'] else 'IS UNIQUE'};"
+            )
+        else:
+            # Neo4j property existence constraints cover a single property each.
+            for key, target in zip(item["properties"], keys):
+                name = item["name"] if len(keys) == 1 else f"{item['name']}_{key}"
+                enterprise.append(f"CREATE CONSTRAINT {cypher_name(name)} IF NOT EXISTS FOR (n:{label}) "
+                                  f"REQUIRE {target} IS NOT NULL;")
+    if enterprise:
+        warnings.add(f"{len(enterprise)} node key or property existence constraint(s) require Neo4j Enterprise "
+                     "Edition; they are created last")
+        enterprise.insert(0, "// Node key and property existence constraints require Neo4j Enterprise Edition.")
+    return ordinary + enterprise
+
+
+def batched_rows(entities, group, row):
+    """Yield (group key, rows) for consecutive entities that share a group, bounded in count and size."""
+    for key, members in itertools.groupby(entities, group):
+        rows, size = [], 0
+        for entity in members:
+            text = row(entity)
+            if rows and (len(rows) == EXPORT_ROWS or size + len(text) > EXPORT_STATEMENT_BYTES):
+                yield key, rows
+                rows, size = [], 0
+            rows.append(text)
+            size += len(text) + 2
+        if rows:
+            yield key, rows
+
+
+def check_export_names(graph):
+    for node in graph.nodes.values():
+        if EXPORT_LABEL in node.labels or EXPORT_KEY in node.props:
+            raise ValueError(f"Node {node.id} uses the reserved export name {EXPORT_LABEL!r} or {EXPORT_KEY!r}")
+
+
+def write_cypher_export(graph, directory, warnings):
+    check_export_names(graph)
+    nodes = sorted(graph.nodes.values(), key=lambda node: node.id)
+    edges = sorted(graph.edges.values(), key=lambda edge: edge.id)
+    position = {node.id: index for index, node in enumerate(nodes)}
+    label, key = cypher_name(EXPORT_LABEL), cypher_name(EXPORT_KEY)
+    with (directory / "neo4j.cypher").open("x", encoding="utf-8", newline="\n") as script:
+        script.write("// Generated by neo4j_server.py export. Load into an empty database with:\n"
+                     "// cypher-shell -d <database> -f neo4j.cypher\n")
+        if nodes:
+            script.write(f"CREATE CONSTRAINT {key} FOR (n:{label}) REQUIRE n.{key} IS UNIQUE;\n")
+        for labels, rows in batched_rows(
+            nodes, lambda node: tuple(sorted(node.labels)),
+            lambda node: f"{{i: {position[node.id]}, p: {cypher_map(node.props, warnings)}}}",
+        ):
+            names = "".join(f":{cypher_name(name)}" for name in (EXPORT_LABEL, *labels))
+            script.write(f"UNWIND [{', '.join(rows)}] AS row CREATE (n{names} {{{key}: row.i}}) SET n += row.p;\n")
+        for kind, rows in batched_rows(
+            edges, lambda edge: edge.type,
+            lambda edge: f"{{s: {position[edge.start]}, e: {position[edge.end]}, p: {cypher_map(edge.props, warnings)}}}",
+        ):
+            script.write(f"UNWIND [{', '.join(rows)}] AS row MATCH (a:{label} {{{key}: row.s}}) "
+                         f"MATCH (b:{label} {{{key}: row.e}}) CREATE (a)-[r:{cypher_name(kind)}]->(b) SET r += row.p;\n")
+        for start in range(0, len(nodes), EXPORT_ROWS):
+            script.write(f"MATCH (n:{label}) WHERE n.{key} >= {start} AND n.{key} < {start + EXPORT_ROWS} "
+                         f"REMOVE n:{label}, n.{key};\n")
+        if nodes:
+            script.write(f"DROP CONSTRAINT {key};\n")
+        for statement in schema_statements(graph, warnings):
+            script.write(statement + "\n")
+
+
+def csv_float(value):
+    if math.isnan(value):
+        return "NaN"
+    if math.isinf(value):
+        return "Infinity" if value > 0 else "-Infinity"
+    return repr(value)
+
+
+def csv_scalar(value, name):
+    if isinstance(value, bool):
+        return "boolean", "true" if value else "false"
+    if isinstance(value, int):
+        return "long", str(value)
+    if isinstance(value, float):
+        return "double", csv_float(value)
+    if isinstance(value, str):
+        return "string", value
+    if isinstance(value, Structure):
+        text = structure_text(value)
+        if isinstance(text, list):
+            text = "{" + ", ".join(f"{key}: '{item}'" if key == "crs" else f"{key}: {csv_float(item)}"
+                                   for key, item in text) + "}"
+        return STRUCTURE_TYPES[value.tag], text
+    raise ValueError(f"Property {name!r} has unsupported type {type(value).__name__}")
+
+
+def csv_property(name, value, warnings):
+    """Return the neo4j-admin header type and the field text, or a list of array element texts."""
+    if ":" in name:
+        raise ValueError(f"Property {name!r} contains ':', which neo4j-admin reads as a type separator; "
+                         "use --format cypher")
+    if isinstance(value, bytes):
+        return "byte[]", [str(item - 256 if item > 127 else item) for item in value]
+    if not isinstance(value, list):
+        return csv_scalar(value, name)
+    if not value or value == [""]:
+        raise ValueError(f"Property {name!r} holds {value!r}, which neo4j-admin cannot tell apart from a missing "
+                         "value; use --format cypher")
+    items = [csv_scalar(item, name) for item in storable_list(name, value, warnings)]
+    return items[0][0] + "[]", [text for _, text in items]
+
+
+def csv_field(text):
+    return '"' + text.replace('"', '""') + '"'
+
+
+def csv_header(name):
+    return csv_field(name) if any(char in name for char in ',"\r\n') else name
+
+
+def write_csv_files(prefix, entities, fixed, directory, delimiter, warnings):
+    """Group entities whose property types agree, since one header types a whole file.
+
+    Returns the file names and whether any field spans lines."""
+    groups = []
+    for entity in entities:
+        values = {key: csv_property(key, item, warnings) for key, item in entity.props.items()}
+        signature = {key: kind for key, (kind, _) in values.items()}
+        for columns, members in groups:
+            if all(columns.get(key, kind) == kind for key, kind in signature.items()):
+                columns.update(signature)
+                members.append((entity, values))
+                break
+        else:
+            groups.append((dict(signature), [(entity, values)]))
+    if not groups:
+        groups.append(({}, []))
+    names, multiline = [], False
+    for number, (columns, members) in enumerate(groups, 1):
+        keys = sorted(columns)
+        filename = f"{prefix}-{number}.csv"
+        names.append(filename)
+        with (directory / filename).open("x", encoding="utf-8", newline="") as stream:
+            header = [*(name for name, _ in fixed), *(csv_header(f"{key}:{columns[key]}") for key in keys)]
+            stream.write(",".join(header) + "\n")
+            for entity, values in members:
+                fields = [value(entity) for _, value in fixed]
+                for key in keys:
+                    _, text = values.get(key, (None, None))
+                    fields.append("" if text is None else csv_field(
+                        delimiter.join(text) if isinstance(text, list) else text))
+                line = ",".join(fields)
+                multiline = multiline or "\n" in line or "\r" in line
+                stream.write(line + "\n")
+    return names, multiline
+
+
+def array_delimiter(graph):
+    used = set()
+    for node in graph.nodes.values():
+        used.update(*node.labels)
+    for entity in itertools.chain(graph.nodes.values(), graph.edges.values()):
+        for value in entity.props.values():
+            if isinstance(value, list):
+                used.update(*(item for item in value if isinstance(item, str)))
+    for candidate in ARRAY_DELIMITERS:
+        if candidate not in used:
+            return candidate
+    raise ValueError("Every candidate array delimiter occurs in a label or string list")
+
+
+def write_csv_export(graph, directory, warnings):
+    delimiter = array_delimiter(graph)
+    nodes = sorted(graph.nodes.values(), key=lambda node: node.id)
+    edges = sorted(graph.edges.values(), key=lambda edge: edge.id)
+    node_files, multiline = write_csv_files("nodes", nodes, [
+        (":ID", lambda node: str(node.id)),
+        (":LABEL", lambda node: csv_field(delimiter.join(sorted(node.labels))) if node.labels else ""),
+    ], directory, delimiter, warnings)
+    edge_files = []
+    if edges:
+        edge_files, spans = write_csv_files("relationships", edges, [
+            (":START_ID", lambda edge: str(edge.start)),
+            (":END_ID", lambda edge: str(edge.end)),
+            (":TYPE", lambda edge: csv_field(edge.type)),
+        ], directory, delimiter, warnings)
+        multiline = multiline or spans
+    options = [f"--array-delimiter=U+{ord(delimiter):04X}", "--bad-tolerance=0"]
+    if multiline:
+        options.append("--multiline-fields=true")
+    options += [f"--nodes={name}" for name in node_files] + [f"--relationships={name}" for name in edge_files]
+    with (directory / "import.args").open("x", encoding="utf-8", newline="\n") as stream:
+        # The database name goes before @import.args: --relationships would take a trailing name as a file.
+        stream.write("# From this directory: neo4j-admin database import full <database> @import.args\n")
+        stream.write("\n".join(options) + "\n")
+    with (directory / "schema.cypher").open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write("// Run after the first start with: cypher-shell -d <database> -f schema.cypher\n")
+        for statement in schema_statements(graph, warnings):
+            stream.write(statement + "\n")
+
+
+def publish_export(staged, destination):
+    if os.name == "nt":
+        staged.rename(destination)
+        return
+    destination.mkdir(mode=0o700)
+    try:
+        staged.replace(destination)
+    except BaseException:
+        destination.rmdir()
+        raise
+
+
+def export_main(argv):
+    parser = argparse.ArgumentParser(description="Export a Neo4j test server SQLite snapshot for Neo4j 5.")
+    parser.add_argument("--db-file", type=Path, required=True, help="existing SQLite persistence file")
+    parser.add_argument("--out", type=Path, required=True, help="new output directory")
+    parser.add_argument("--format", choices=("cypher", "csv"), default="cypher",
+                        help="cypher-shell script or neo4j-admin import CSV files (default: %(default)s)")
+    args = parser.parse_args(argv)
+    destination = args.out.expanduser().absolute()
+    warnings = set()
+    try:
+        if os.path.lexists(destination):
+            raise FileExistsError(f"Output directory already exists: {destination}")
+        graph = read_graph_snapshot(args.db_file.expanduser())
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".neo4j-export-", dir=destination.parent) as temporary:
+            staged = Path(temporary) / "export"
+            staged.mkdir(mode=0o700)
+            (write_cypher_export if args.format == "cypher" else write_csv_export)(graph, staged, warnings)
+            publish_export(staged, destination)
+    except (OSError, ValueError, sqlite3.Error, ProtocolError) as exc:
+        parser.exit(1, f"Neo4j export failed: {exc}\n")
+    for warning in sorted(warnings):
+        print(f"warning: {warning}", file=sys.stderr)
+    print(f"Exported {len(graph.nodes)} nodes, {len(graph.edges)} relationships, and "
+          f"{len(graph.schema)} indexes/constraints to {destination}")
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["export"]:
+        return export_main(argv[1:])
+    return serve_main(argv[1:] if argv[:1] == ["serve"] else argv)
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
